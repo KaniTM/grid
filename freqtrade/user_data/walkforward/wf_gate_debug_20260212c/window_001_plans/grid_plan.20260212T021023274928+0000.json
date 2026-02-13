@@ -1,0 +1,87 @@
+{
+  "action": "HOLD",
+  "candle_time_utc": "2026-02-08T00:00:00+00:00",
+  "candle_ts": 1770508800,
+  "capital_policy": {
+    "grid_budget_pct": 0.7,
+    "mode": "QUOTE_ONLY",
+    "reserve_pct": 0.3
+  },
+  "exchange": "binance",
+  "grid": {
+    "est_fee_pct": 0.002,
+    "est_spread_pct": 0.0005,
+    "gross_step_min_pct": 0.006500000000000001,
+    "n_levels": 9,
+    "post_only": true,
+    "step_pct_actual": 0.0065657652236035535,
+    "step_price": 13.562375961179972,
+    "target_net_step_pct": 0.004
+  },
+  "notes": {
+    "brain_mode": "deterministic_v1",
+    "expect_0_trades_in_freqtrade": true,
+    "ml": "freqai_placeholders_present"
+  },
+  "price_ref": {
+    "close": 2090.57,
+    "vwap_15m": 2057.2809128104504
+  },
+  "range": {
+    "high": 2126.65069182531,
+    "lookback_bars_used": 48,
+    "low": 2004.5893081746901,
+    "pad": 4.950691825309934,
+    "quartiles": {
+      "q1": 2035.1046540873451,
+      "q2": 2065.62,
+      "q3": 2096.135345912655
+    },
+    "width_pct": 0.05909188701243198
+  },
+  "risk": {
+    "fast_stop_step_multiple": 1.0,
+    "range_shift_stop_pct": 0.007,
+    "stop_confirm_bars": 2,
+    "stop_policy": "DANGER_TO_QUOTE",
+    "stop_reasons": {
+      "close_outside_dn": false,
+      "close_outside_up": false,
+      "fast_outside_dn": false,
+      "fast_outside_up": false,
+      "range_shift_frac": null,
+      "range_shift_stop": false,
+      "two_consecutive_outside_dn": false,
+      "two_consecutive_outside_up": false
+    },
+    "stop_rule_triggered": false
+  },
+  "signals": {
+    "adx_4h": 50.00476342519705,
+    "bb_width_1h": 0.06329409232529591,
+    "bb_width_nonexpanding_1h": true,
+    "ema100_1h": 2098.2253979892766,
+    "ema50_1h": 2048.401407595402,
+    "ema_dist_frac_1h": 0.02383273001806911,
+    "inside_7d": true,
+    "ml_confidence": null,
+    "p_breakout": null,
+    "p_range": null,
+    "rsi_15m": 54.38112006865256,
+    "rule_range_ok": false,
+    "vol_ratio_1h": 0.32145831197488095,
+    "vwap_15m": 2057.2809128104504
+  },
+  "symbol": "ETH/USDT",
+  "timeframes": {
+    "exec": "15m",
+    "regime": "4h",
+    "signal": "1h"
+  },
+  "ts": "2026-02-12T02:10:23.274928+00:00",
+  "update_policy": {
+    "event_driven": true,
+    "exec_candle_check": true,
+    "soft_adjust_max_step_frac": 0.5
+  }
+}

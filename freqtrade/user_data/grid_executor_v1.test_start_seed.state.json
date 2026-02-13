@@ -1,0 +1,91 @@
+{
+  "ts": 1770867072.37016,
+  "exchange": "binance",
+  "symbol": "ETH/USDT",
+  "plan_ts": "2026-02-12T03:24:38.040623+00:00",
+  "mode": "paper",
+  "step": 13.562375961179972,
+  "n_levels": 9,
+  "box_low": 2004.5893081746901,
+  "box_high": 2126.65069182531,
+  "quote_total": 1000.0,
+  "base_total": 0.0,
+  "quote_free": 300.0,
+  "base_free": 0.0,
+  "quote_reserved": 700.0,
+  "base_reserved": 0.0,
+  "runtime": {
+    "last_trade_ms": null,
+    "seen_trade_ids": 0,
+    "use_exchange_balance": true,
+    "mark_price": 2090.57,
+    "tp_price": 2136.822473796195,
+    "sl_price": 1991.0269322135102,
+    "stop_reason": null
+  },
+  "orders": [
+    {
+      "side": "buy",
+      "price": 2004.5893081746901,
+      "qty_base": 0.049835694270496486,
+      "level_index": 0,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2018.15168413587,
+      "qty_base": 0.04950078861038388,
+      "level_index": 1,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2031.7140600970502,
+      "qty_base": 0.0491703541665346,
+      "level_index": 2,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2045.27643605823,
+      "qty_base": 0.048844301992073465,
+      "level_index": 3,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2058.83881201941,
+      "qty_base": 0.048522545483836596,
+      "level_index": 4,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2072.40118798059,
+      "qty_base": 0.04820500030568192,
+      "level_index": 5,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2085.96356394177,
+      "qty_base": 0.04789158431479134,
+      "level_index": 6,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    }
+  ]
+}

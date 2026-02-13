@@ -1,0 +1,27 @@
+{
+  "ts": 1770867069.1531634,
+  "exchange": "binance",
+  "symbol": "ETH/USDT",
+  "plan_ts": "2026-02-12T03:24:38.040623+00:00",
+  "mode": "paper",
+  "step": 13.562375961179972,
+  "n_levels": 9,
+  "box_low": 2004.5893081746901,
+  "box_high": 2126.65069182531,
+  "quote_total": 1000.0,
+  "base_total": 0.0,
+  "quote_free": 1000.0,
+  "base_free": 0.0,
+  "quote_reserved": 0.0,
+  "base_reserved": 0.0,
+  "runtime": {
+    "last_trade_ms": null,
+    "seen_trade_ids": 0,
+    "use_exchange_balance": true,
+    "mark_price": 2090.57,
+    "tp_price": 2089.57,
+    "sl_price": 1991.0269322135102,
+    "stop_reason": "tp_hit"
+  },
+  "orders": []
+}

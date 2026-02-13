@@ -1,0 +1,23 @@
+{
+  "ts": 1770865674.5698686,
+  "exchange": "binance",
+  "symbol": "ETH/USDT",
+  "plan_ts": "2026-02-12T02:10:23.274928+00:00",
+  "mode": "paper",
+  "step": 13.562375961179972,
+  "n_levels": 9,
+  "box_low": 2004.5893081746901,
+  "box_high": 2126.65069182531,
+  "quote_total": 1000.0,
+  "base_total": 0.0,
+  "quote_free": 1000.0,
+  "base_free": 0.0,
+  "quote_reserved": 0.0,
+  "base_reserved": 0.0,
+  "runtime": {
+    "last_trade_ms": null,
+    "seen_trade_ids": 0,
+    "use_exchange_balance": true
+  },
+  "orders": []
+}

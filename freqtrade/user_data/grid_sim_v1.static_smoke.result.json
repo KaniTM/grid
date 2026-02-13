@@ -1,0 +1,36 @@
+{
+  "summary": {
+    "start_quote": 1000.0,
+    "start_base": 0.0,
+    "end_quote": 1000.0,
+    "end_base": 0.0,
+    "first_close": 2017.99,
+    "last_close": 2022.67,
+    "equity": 1000.0,
+    "initial_equity": 1000.0,
+    "pnl_quote": 0.0,
+    "pnl_pct": 0.0,
+    "box_low": 100.0,
+    "box_high": 110.0,
+    "n_levels": 10,
+    "step": 1.0,
+    "maker_fee_pct": 0.1,
+    "stop_out_steps": 1,
+    "touch_fill": true,
+    "tp_price": 110.75,
+    "sl_price": 99.0
+  },
+  "fills": [],
+  "open_orders": [],
+  "curve": [
+    {
+      "ts": "2026-02-10T10:15:00+00:00",
+      "close": 2017.99,
+      "quote": 1000.0,
+      "base": 0.0,
+      "equity": 1000.0,
+      "open_orders": 0,
+      "stop": true
+    }
+  ]
+}

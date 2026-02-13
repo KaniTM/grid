@@ -1,0 +1,2 @@
+index,timerange,start_day,end_day,status,error,result_file,plans_file_count,pnl_quote,pnl_pct,initial_equity,end_equity,fills,stop_events,seed_events,rebuild_events,soft_adjust_events,action_start,action_hold,action_stop
+1,20260208-20260210,20260208,20260210,error,Window 20260208-20260210 has only 1 plan snapshot(s). Expected time-varying replay with >=2 snapshots.,,1,,,,,,,,,,,,

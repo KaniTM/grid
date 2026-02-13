@@ -1,0 +1,3 @@
+index,timerange,start_day,end_day,status,error,result_file,plans_file_count,pnl_quote,pnl_pct,initial_equity,end_equity,fills,stop_events,seed_events,rebuild_events,soft_adjust_events,action_start,action_hold,action_stop
+1,20260207-20260209,20260207,20260209,ok,,/home/kani/grid-ml-system/freqtrade/user_data/walkforward/wf_timevary_20260212_verify/window_001.result.json,192,0.0,0.0,1000.0,1000.0,0,101,0,0,0,0,91,101
+2,20260208-20260210,20260208,20260210,ok,,/home/kani/grid-ml-system/freqtrade/user_data/walkforward/wf_timevary_20260212_verify/window_002.result.json,192,2.668162617880057,0.26681626178801654,1000.0,1002.6681626178801,1,112,1,0,1,1,79,112
