@@ -216,6 +216,7 @@ class GridBrainV1(IStrategy):
     regime_router_switch_cooldown_bars = 6
     regime_router_switch_margin = 1.0
     regime_router_allow_pause = True
+    regime_threshold_profile = "manual"  # manual | research_v1
 
     # Intraday (scalper-ish) mode thresholds.
     intraday_adx_enter_max = 22.0
@@ -446,6 +447,62 @@ class GridBrainV1(IStrategy):
             return "pause"
         return "intraday"
 
+    def _mode_threshold_overrides(self, mode_name: str) -> Dict[str, float]:
+        mode = self._normalize_mode_name(mode_name)
+        profile = str(getattr(self, "regime_threshold_profile", "manual") or "manual").strip().lower()
+        if profile == "research_v1":
+            if mode == "intraday":
+                return {
+                    "adx_enter_max": 24.0,
+                    "adx_exit_min": 30.0,
+                    "adx_exit_max": 30.0,
+                    "adx_rising_bars": 3,
+                    "bbw_1h_pct_max": 30.0,
+                    "ema_dist_max_frac": 0.005,
+                    "vol_spike_mult": 1.2,
+                    "bbwp_s_enter_low": 15.0,
+                    "bbwp_s_enter_high": 45.0,
+                    "bbwp_m_enter_low": 10.0,
+                    "bbwp_m_enter_high": 55.0,
+                    "bbwp_l_enter_low": 10.0,
+                    "bbwp_l_enter_high": 65.0,
+                    "bbwp_s_max": 45.0,
+                    "bbwp_m_max": 55.0,
+                    "bbwp_l_max": 65.0,
+                    "bbwp_stop_high": 90.0,
+                    "atr_source": "1h",
+                    "atr_pct_max": 0.015,
+                    "os_dev_persist_bars": 24,
+                    "os_dev_rvol_max": 1.2,
+                    "router_eligible": True,
+                }
+            if mode == "swing":
+                return {
+                    "adx_enter_max": 30.0,
+                    "adx_exit_min": 35.0,
+                    "adx_exit_max": 35.0,
+                    "adx_rising_bars": 2,
+                    "bbw_1h_pct_max": 40.0,
+                    "ema_dist_max_frac": 0.010,
+                    "vol_spike_mult": 1.5,
+                    "bbwp_s_enter_low": 10.0,
+                    "bbwp_s_enter_high": 65.0,
+                    "bbwp_m_enter_low": 10.0,
+                    "bbwp_m_enter_high": 65.0,
+                    "bbwp_l_enter_low": 10.0,
+                    "bbwp_l_enter_high": 75.0,
+                    "bbwp_s_max": 65.0,
+                    "bbwp_m_max": 65.0,
+                    "bbwp_l_max": 75.0,
+                    "bbwp_stop_high": 93.0,
+                    "atr_source": "4h",
+                    "atr_pct_max": 0.030,
+                    "os_dev_persist_bars": 12,
+                    "os_dev_rvol_max": 1.5,
+                    "router_eligible": True,
+                }
+        return {}
+
     def _mode_threshold_block(self, mode_name: str) -> Dict[str, float]:
         mode = self._normalize_mode_name(mode_name)
         intraday_block = {
@@ -473,8 +530,9 @@ class GridBrainV1(IStrategy):
             "os_dev_rvol_max": float(self.intraday_os_dev_rvol_max),
             "router_eligible": True,
         }
+        intraday_block.update(self._mode_threshold_overrides("intraday"))
         if mode == "swing":
-            return {
+            swing_block = {
                 "mode": "swing",
                 "adx_enter_max": float(self.swing_adx_enter_max),
                 "adx_exit_min": float(self.swing_adx_exit_min),
@@ -499,6 +557,8 @@ class GridBrainV1(IStrategy):
                 "os_dev_rvol_max": float(self.swing_os_dev_rvol_max),
                 "router_eligible": True,
             }
+            swing_block.update(self._mode_threshold_overrides("swing"))
+            return swing_block
         if mode == "pause":
             pause_block = dict(intraday_block)
             pause_block["mode"] = "pause"
@@ -3207,6 +3267,7 @@ class GridBrainV1(IStrategy):
                 "os_dev_rvol_ok": bool(os_dev_rvol_ok),
                 "os_dev_build_ok": bool(os_dev_build_ok),
                 "gate_profile": gate_profile,
+                "regime_threshold_profile": str(getattr(self, "regime_threshold_profile", "manual")),
                 "gate_pass_count": int(gate_pass_count),
                 "gate_total_count": int(gate_total_count),
                 "gate_pass_ratio": float(gate_pass_ratio),
@@ -3290,6 +3351,7 @@ class GridBrainV1(IStrategy):
                 },
                 "gating": {
                     "profile": gate_profile,
+                    "regime_threshold_profile": str(getattr(self, "regime_threshold_profile", "manual")),
                     "active_mode": str(active_mode),
                     "start_min_gate_pass_ratio": float(gate_start_min_pass_ratio),
                     "adx_4h_max": float(gate_adx_4h_max),
@@ -3317,6 +3379,7 @@ class GridBrainV1(IStrategy):
                         if str(self.regime_router_force_mode or "").strip()
                         else None
                     ),
+                    "threshold_profile": str(getattr(self, "regime_threshold_profile", "manual")),
                     "allow_pause": bool(self.regime_router_allow_pause),
                     "switch_persist_bars": int(self.regime_router_switch_persist_bars),
                     "switch_cooldown_bars": int(self.regime_router_switch_cooldown_bars),

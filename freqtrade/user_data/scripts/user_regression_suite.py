@@ -138,6 +138,7 @@ def check_plan_schema_and_feature_outputs(plan: dict) -> None:
     _require("mode" in (plan.get("signals") or {}), "signals.mode missing")
     _require("mode_pause" in (plan.get("signals") or {}), "signals.mode_pause missing")
     _require("mode_desired" in (plan.get("signals") or {}), "signals.mode_desired missing")
+    _require("regime_threshold_profile" in (plan.get("signals") or {}), "signals.regime_threshold_profile missing")
     _require("adx_enter_max_4h" in (plan.get("signals") or {}), "signals.adx_enter_max_4h missing")
     _require("adx_exit_min_4h" in (plan.get("signals") or {}), "signals.adx_exit_min_4h missing")
     _require("adx_exit_max_4h" in (plan.get("signals") or {}), "signals.adx_exit_max_4h missing")
@@ -171,6 +172,10 @@ def check_plan_schema_and_feature_outputs(plan: dict) -> None:
     _require(
         "allow_pause" in (_plan_get(plan, "update_policy", "regime_router", default={}) or {}),
         "update_policy.regime_router.allow_pause missing",
+    )
+    _require(
+        "threshold_profile" in (_plan_get(plan, "update_policy", "regime_router", default={}) or {}),
+        "update_policy.regime_router.threshold_profile missing",
     )
 
     tp_candidates = _plan_get(plan, "exit", "tp_candidates", default={}) or {}
