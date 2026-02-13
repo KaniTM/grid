@@ -67,7 +67,7 @@ class GridBrainV1(IStrategy):
 
     # Regime gate (4h ADX)
     adx_period = 14
-    adx_4h_max = 40
+    adx_4h_max = 22
 
     # 1h gates
     ema_fast = 50
@@ -76,8 +76,8 @@ class GridBrainV1(IStrategy):
 
     bb_window = 20
     bb_stds = 2.0
-    bbw_nonexpand_mult = 1.05
-    bbw_nonexpand_lookback = 3  # check last 3 1h bars
+    bbw_pct_lookback_1h = 252
+    bbw_1h_pct_max = 50.0
 
     vol_sma_window = 20
     vol_spike_mult = 1.5  # 1h volume <= 1.5 * SMA20
@@ -205,8 +205,53 @@ class GridBrainV1(IStrategy):
     min_runtime_hours = 3.0
 
     # Gate tuning profile (START gating debug/tune helper)
-    gate_profile = "balanced"  # strict | balanced | aggressive
+    gate_profile = "strict"  # strict | balanced | aggressive
     start_min_gate_pass_ratio = 1.0  # keep 1.0 for strict all-gates behavior
+
+    # Regime router (intraday / swing / pause).
+    regime_router_enabled = True
+    regime_router_default_mode = "intraday"  # intraday | swing | pause
+    regime_router_force_mode = ""  # empty for auto, else intraday | swing | pause
+    regime_router_switch_persist_bars = 4
+    regime_router_switch_cooldown_bars = 6
+    regime_router_switch_margin = 1.0
+    regime_router_allow_pause = True
+
+    # Intraday (scalper-ish) mode thresholds.
+    intraday_adx_enter_max = 22.0
+    intraday_adx_exit_min = 30.0
+    intraday_adx_rising_bars = 3
+    intraday_bbw_1h_pct_max = 30.0
+    intraday_ema_dist_max_frac = 0.005
+    intraday_vol_spike_mult = 1.2
+    intraday_bbwp_s_enter_low = 15.0
+    intraday_bbwp_s_enter_high = 45.0
+    intraday_bbwp_m_enter_low = 10.0
+    intraday_bbwp_m_enter_high = 55.0
+    intraday_bbwp_l_enter_low = 10.0
+    intraday_bbwp_l_enter_high = 65.0
+    intraday_bbwp_stop_high = 90.0
+    intraday_atr_pct_max = 0.015
+    intraday_os_dev_persist_bars = 24
+    intraday_os_dev_rvol_max = 1.2
+
+    # Swing range mode thresholds.
+    swing_adx_enter_max = 28.0
+    swing_adx_exit_min = 35.0
+    swing_adx_rising_bars = 2
+    swing_bbw_1h_pct_max = 40.0
+    swing_ema_dist_max_frac = 0.010
+    swing_vol_spike_mult = 1.8
+    swing_bbwp_s_enter_low = 10.0
+    swing_bbwp_s_enter_high = 65.0
+    swing_bbwp_m_enter_low = 10.0
+    swing_bbwp_m_enter_high = 65.0
+    swing_bbwp_l_enter_low = 10.0
+    swing_bbwp_l_enter_high = 75.0
+    swing_bbwp_stop_high = 93.0
+    swing_atr_pct_max = 0.030
+    swing_os_dev_persist_bars = 12
+    swing_os_dev_rvol_max = 1.8
 
     # Backtest/walk-forward: write full per-candle plan history for true replay.
     emit_per_candle_history_backtest = True
@@ -235,6 +280,13 @@ class GridBrainV1(IStrategy):
     _os_dev_zero_persist_by_pair: Dict[str, int] = {}
     _mrvd_day_poc_prev_by_pair: Dict[str, float] = {}
     _cvd_freeze_bars_left_by_pair: Dict[str, int] = {}
+    _last_adx_by_pair: Dict[str, float] = {}
+    _adx_rising_count_by_pair: Dict[str, int] = {}
+    _mode_by_pair: Dict[str, str] = {}
+    _mode_candidate_by_pair: Dict[str, str] = {}
+    _mode_candidate_count_by_pair: Dict[str, int] = {}
+    _mode_cooldown_until_ts_by_pair: Dict[str, int] = {}
+    _running_mode_by_pair: Dict[str, str] = {}
     _history_emit_in_progress_by_pair: Dict[str, bool] = {}
     _history_emit_end_ts_by_pair: Dict[str, int] = {}
 
@@ -252,6 +304,9 @@ class GridBrainV1(IStrategy):
     @informative("4h")
     def populate_indicators_4h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["adx_4h"] = ta.ADX(dataframe, timeperiod=self.adx_period)
+        dataframe["plus_di_4h"] = ta.PLUS_DI(dataframe, timeperiod=self.adx_period)
+        dataframe["minus_di_4h"] = ta.MINUS_DI(dataframe, timeperiod=self.adx_period)
+        dataframe["atr_4h"] = ta.ATR(dataframe, timeperiod=self.bb_window)
 
         tp = qtpylib.typical_price(dataframe)
         bb = qtpylib.bollinger_bands(tp, window=self.bb_window, stds=self.bb_stds)
@@ -302,6 +357,40 @@ class GridBrainV1(IStrategy):
         except Exception:
             return None
 
+    @staticmethod
+    def _adx_exit_hysteresis_trigger(
+        adx_value: Optional[float],
+        rising_count: int,
+        exit_min: float,
+        rising_bars_required: int,
+    ) -> bool:
+        adx = GridBrainV1._safe_float(adx_value)
+        if adx is None:
+            return False
+        rb = int(max(int(rising_bars_required), 1))
+        return bool(adx >= float(exit_min) and int(rising_count) >= rb)
+
+    @staticmethod
+    def _adx_di_down_risk_trigger(
+        adx_value: Optional[float],
+        plus_di_value: Optional[float],
+        minus_di_value: Optional[float],
+        rising_count: int,
+        exit_min: float,
+        rising_bars_required: int,
+        early_margin: float = 2.0,
+    ) -> bool:
+        adx = GridBrainV1._safe_float(adx_value)
+        plus_di = GridBrainV1._safe_float(plus_di_value)
+        minus_di = GridBrainV1._safe_float(minus_di_value)
+        if adx is None or plus_di is None or minus_di is None:
+            return False
+        if not bool(minus_di > plus_di):
+            return False
+        rb = int(max(int(rising_bars_required), 1))
+        threshold = max(float(exit_min) - abs(float(early_margin)), 0.0)
+        return bool(adx >= threshold and int(rising_count) >= rb)
+
     def _gate_profile_values(self) -> Dict[str, float]:
         profile = str(getattr(self, "gate_profile", "strict")).strip().lower()
         if profile not in ("strict", "balanced", "aggressive"):
@@ -310,6 +399,7 @@ class GridBrainV1(IStrategy):
         cfg = {
             "profile": profile,
             "adx_4h_max": float(self.adx_4h_max),
+            "bbw_1h_pct_max": float(self.bbw_1h_pct_max),
             "ema_dist_max_frac": float(self.ema_dist_max_frac),
             "vol_spike_mult": float(self.vol_spike_mult),
             "bbwp_s_max": float(self.bbwp_s_max),
@@ -325,7 +415,8 @@ class GridBrainV1(IStrategy):
         }
 
         if profile == "balanced":
-            cfg["adx_4h_max"] = max(cfg["adx_4h_max"], 36.0)
+            cfg["adx_4h_max"] = max(cfg["adx_4h_max"], 25.0)
+            cfg["bbw_1h_pct_max"] = max(cfg["bbw_1h_pct_max"], 60.0)
             cfg["ema_dist_max_frac"] = max(cfg["ema_dist_max_frac"], 0.009)
             cfg["vol_spike_mult"] = max(cfg["vol_spike_mult"], 3.0)
             cfg["bbwp_s_max"] = max(cfg["bbwp_s_max"], 45.0)
@@ -334,7 +425,8 @@ class GridBrainV1(IStrategy):
             cfg["os_dev_persist_bars"] = min(cfg["os_dev_persist_bars"], 24)
             cfg["os_dev_rvol_max"] = max(cfg["os_dev_rvol_max"], 1.5)
         elif profile == "aggressive":
-            cfg["adx_4h_max"] = max(cfg["adx_4h_max"], 45.0)
+            cfg["adx_4h_max"] = max(cfg["adx_4h_max"], 30.0)
+            cfg["bbw_1h_pct_max"] = max(cfg["bbw_1h_pct_max"], 70.0)
             cfg["ema_dist_max_frac"] = max(cfg["ema_dist_max_frac"], 0.015)
             cfg["vol_spike_mult"] = max(cfg["vol_spike_mult"], 4.0)
             cfg["bbwp_s_max"] = max(cfg["bbwp_s_max"], 60.0)
@@ -344,6 +436,291 @@ class GridBrainV1(IStrategy):
             cfg["os_dev_rvol_max"] = max(cfg["os_dev_rvol_max"], 1.8)
 
         return cfg
+
+    @staticmethod
+    def _normalize_mode_name(mode: Optional[str]) -> str:
+        m = str(mode or "").strip().lower()
+        if m == "swing":
+            return "swing"
+        if m == "pause":
+            return "pause"
+        return "intraday"
+
+    def _mode_threshold_block(self, mode_name: str) -> Dict[str, float]:
+        mode = self._normalize_mode_name(mode_name)
+        intraday_block = {
+            "mode": "intraday",
+            "adx_enter_max": float(self.intraday_adx_enter_max),
+            "adx_exit_min": float(self.intraday_adx_exit_min),
+            "adx_exit_max": float(self.intraday_adx_exit_min),
+            "adx_rising_bars": int(self.intraday_adx_rising_bars),
+            "bbw_1h_pct_max": float(self.intraday_bbw_1h_pct_max),
+            "ema_dist_max_frac": float(self.intraday_ema_dist_max_frac),
+            "vol_spike_mult": float(self.intraday_vol_spike_mult),
+            "bbwp_s_enter_low": float(self.intraday_bbwp_s_enter_low),
+            "bbwp_s_enter_high": float(self.intraday_bbwp_s_enter_high),
+            "bbwp_m_enter_low": float(self.intraday_bbwp_m_enter_low),
+            "bbwp_m_enter_high": float(self.intraday_bbwp_m_enter_high),
+            "bbwp_l_enter_low": float(self.intraday_bbwp_l_enter_low),
+            "bbwp_l_enter_high": float(self.intraday_bbwp_l_enter_high),
+            "bbwp_s_max": float(self.intraday_bbwp_s_enter_high),
+            "bbwp_m_max": float(self.intraday_bbwp_m_enter_high),
+            "bbwp_l_max": float(self.intraday_bbwp_l_enter_high),
+            "bbwp_stop_high": float(self.intraday_bbwp_stop_high),
+            "atr_source": "1h",
+            "atr_pct_max": float(self.intraday_atr_pct_max),
+            "os_dev_persist_bars": int(self.intraday_os_dev_persist_bars),
+            "os_dev_rvol_max": float(self.intraday_os_dev_rvol_max),
+            "router_eligible": True,
+        }
+        if mode == "swing":
+            return {
+                "mode": "swing",
+                "adx_enter_max": float(self.swing_adx_enter_max),
+                "adx_exit_min": float(self.swing_adx_exit_min),
+                "adx_exit_max": float(self.swing_adx_exit_min),
+                "adx_rising_bars": int(self.swing_adx_rising_bars),
+                "bbw_1h_pct_max": float(self.swing_bbw_1h_pct_max),
+                "ema_dist_max_frac": float(self.swing_ema_dist_max_frac),
+                "vol_spike_mult": float(self.swing_vol_spike_mult),
+                "bbwp_s_enter_low": float(self.swing_bbwp_s_enter_low),
+                "bbwp_s_enter_high": float(self.swing_bbwp_s_enter_high),
+                "bbwp_m_enter_low": float(self.swing_bbwp_m_enter_low),
+                "bbwp_m_enter_high": float(self.swing_bbwp_m_enter_high),
+                "bbwp_l_enter_low": float(self.swing_bbwp_l_enter_low),
+                "bbwp_l_enter_high": float(self.swing_bbwp_l_enter_high),
+                "bbwp_s_max": float(self.swing_bbwp_s_enter_high),
+                "bbwp_m_max": float(self.swing_bbwp_m_enter_high),
+                "bbwp_l_max": float(self.swing_bbwp_l_enter_high),
+                "bbwp_stop_high": float(self.swing_bbwp_stop_high),
+                "atr_source": "4h",
+                "atr_pct_max": float(self.swing_atr_pct_max),
+                "os_dev_persist_bars": int(self.swing_os_dev_persist_bars),
+                "os_dev_rvol_max": float(self.swing_os_dev_rvol_max),
+                "router_eligible": True,
+            }
+        if mode == "pause":
+            pause_block = dict(intraday_block)
+            pause_block["mode"] = "pause"
+            pause_block["router_eligible"] = False
+            return pause_block
+        return intraday_block
+
+    def _mode_router_score(self, cfg: Dict[str, float], features: Dict[str, Optional[float]]) -> Dict[str, object]:
+        adx = self._safe_float(features.get("adx_4h"))
+        ema_dist = self._safe_float(features.get("ema_dist_frac_1h"))
+        bbw_pct = self._safe_float(features.get("bb_width_1h_pct"))
+        vol_ratio = self._safe_float(features.get("vol_ratio_1h"))
+        bbwp_s = self._safe_float(features.get("bbwp_15m_pct"))
+        bbwp_m = self._safe_float(features.get("bbwp_1h_pct"))
+        bbwp_l = self._safe_float(features.get("bbwp_4h_pct"))
+        rvol_15m = self._safe_float(features.get("rvol_15m"))
+        atr_1h_pct = self._safe_float(features.get("atr_1h_pct"))
+        atr_4h_pct = self._safe_float(features.get("atr_4h_pct"))
+        atr_source = str(cfg.get("atr_source", "1h")).strip().lower()
+        atr_pct = atr_4h_pct if atr_source == "4h" else atr_1h_pct
+
+        checks: Dict[str, Optional[bool]] = {
+            "adx_enter_ok": None if adx is None else bool(adx <= float(cfg["adx_enter_max"])),
+            "ema_dist_ok": None if ema_dist is None else bool(ema_dist <= float(cfg["ema_dist_max_frac"])),
+            "bbw_1h_pct_ok": None if bbw_pct is None else bool(bbw_pct <= float(cfg["bbw_1h_pct_max"])),
+            "vol_ratio_ok": None if vol_ratio is None else bool(vol_ratio <= float(cfg["vol_spike_mult"])),
+            "bbwp_s_ok": None if bbwp_s is None else bool(float(cfg["bbwp_s_enter_low"]) <= bbwp_s <= float(cfg["bbwp_s_enter_high"])),
+            "bbwp_m_ok": None if bbwp_m is None else bool(float(cfg["bbwp_m_enter_low"]) <= bbwp_m <= float(cfg["bbwp_m_enter_high"])),
+            "bbwp_l_ok": None if bbwp_l is None else bool(float(cfg["bbwp_l_enter_low"]) <= bbwp_l <= float(cfg["bbwp_l_enter_high"])),
+            "atr_pct_ok": None if atr_pct is None else bool(atr_pct <= float(cfg["atr_pct_max"])),
+            "rvol_15m_ok": None if rvol_15m is None else bool(rvol_15m <= float(cfg["os_dev_rvol_max"])),
+        }
+        known = [v for v in checks.values() if v is not None]
+        passed = int(sum(1 for v in known if bool(v)))
+        total = int(len(known))
+        ratio = float(passed / total) if total > 0 else 0.0
+        score = float(passed) + ratio
+        required_fields = [
+            "adx_enter_ok",
+            "ema_dist_ok",
+            "bbw_1h_pct_ok",
+            "vol_ratio_ok",
+            "bbwp_s_ok",
+            "bbwp_m_ok",
+            "bbwp_l_ok",
+            "atr_pct_ok",
+            "rvol_15m_ok",
+        ]
+        router_eligible = bool(cfg.get("router_eligible", True))
+        known_required = [checks.get(k) for k in required_fields]
+        eligible = bool(
+            router_eligible
+            and all(v is not None for v in known_required)
+            and all(bool(v) for v in known_required)
+        )
+        return {
+            "checks": checks,
+            "passed": int(passed),
+            "total": int(total),
+            "ratio": float(ratio),
+            "score": float(score),
+            "eligible": bool(eligible),
+            "atr_source": atr_source,
+            "atr_pct": atr_pct,
+        }
+
+    def _regime_router_state(
+        self,
+        pair: str,
+        clock_ts: int,
+        features: Dict[str, Optional[float]],
+    ) -> Dict[str, object]:
+        default_mode = self._normalize_mode_name(getattr(self, "regime_router_default_mode", "intraday"))
+        forced_raw = str(getattr(self, "regime_router_force_mode", "") or "").strip().lower()
+        forced_mode = forced_raw if forced_raw in ("intraday", "swing", "pause") else None
+        enabled = bool(getattr(self, "regime_router_enabled", True))
+        allow_pause = bool(getattr(self, "regime_router_allow_pause", True))
+
+        current_mode = self._normalize_mode_name(self._mode_by_pair.get(pair, default_mode))
+        intraday_cfg = self._mode_threshold_block("intraday")
+        swing_cfg = self._mode_threshold_block("swing")
+        intraday_eval = self._mode_router_score(intraday_cfg, features)
+        swing_eval = self._mode_router_score(swing_cfg, features)
+        running_active = bool(features.get("running_active", False))
+        running_mode_raw = features.get("running_mode")
+        running_mode = None
+        if running_active and str(running_mode_raw or "").strip():
+            running_mode = self._normalize_mode_name(running_mode_raw)
+        calm_flags: List[bool] = []
+        for feat_name, threshold in [
+            ("adx_4h", float(intraday_cfg["adx_enter_max"])),
+            ("ema_dist_frac_1h", float(intraday_cfg["ema_dist_max_frac"])),
+            ("bb_width_1h_pct", float(intraday_cfg["bbw_1h_pct_max"])),
+            ("vol_ratio_1h", float(intraday_cfg["vol_spike_mult"])),
+            ("bbwp_15m_pct", float(intraday_cfg["bbwp_s_max"])),
+            ("bbwp_1h_pct", float(intraday_cfg["bbwp_m_max"])),
+            ("bbwp_4h_pct", float(intraday_cfg["bbwp_l_max"])),
+        ]:
+            val = self._safe_float(features.get(feat_name))
+            if val is None:
+                continue
+            calm_flags.append(bool(val <= threshold))
+        calm_ratio = float(sum(1 for x in calm_flags if x) / len(calm_flags)) if calm_flags else 0.0
+        intraday_score_adj = float(intraday_eval["score"]) + calm_ratio
+        swing_score_adj = float(swing_eval["score"]) - calm_ratio
+
+        margin = max(float(getattr(self, "regime_router_switch_margin", 0.0)), 0.0)
+        if forced_mode is not None:
+            desired_mode = forced_mode
+            desired_reason = "forced_mode"
+        elif not enabled:
+            desired_mode = current_mode
+            desired_reason = "router_disabled"
+        else:
+            intraday_eligible = bool(intraday_eval.get("eligible", False))
+            swing_eligible = bool(swing_eval.get("eligible", False))
+            if intraday_eligible and (not swing_eligible):
+                desired_mode = "intraday"
+                desired_reason = "intraday_eligible_only"
+            elif swing_eligible and (not intraday_eligible):
+                desired_mode = "swing"
+                desired_reason = "swing_eligible_only"
+            elif intraday_eligible and swing_eligible:
+                intraday_score = float(intraday_score_adj)
+                swing_score = float(swing_score_adj)
+                if swing_score >= (intraday_score + margin):
+                    desired_mode = "swing"
+                    desired_reason = "swing_score_advantage"
+                elif intraday_score >= (swing_score + margin):
+                    desired_mode = "intraday"
+                    desired_reason = "intraday_score_advantage"
+                else:
+                    desired_mode = current_mode if current_mode in ("intraday", "swing") else "intraday"
+                    desired_reason = "score_tie_hold_current"
+            else:
+                if allow_pause:
+                    desired_mode = "pause"
+                    desired_reason = "no_mode_eligible_pause"
+                else:
+                    desired_mode = current_mode
+                    desired_reason = "no_mode_eligible_hold_current"
+
+        handoff_blocked_running_inventory = False
+        target_mode = str(desired_mode)
+        target_reason = str(desired_reason)
+        if (
+            forced_mode is None
+            and running_active
+            and (running_mode in ("intraday", "swing"))
+            and (desired_mode in ("intraday", "swing"))
+            and (desired_mode != running_mode)
+        ):
+            handoff_blocked_running_inventory = True
+            target_mode = str(running_mode)
+            target_reason = "handoff_blocked_running_inventory"
+
+        persist_bars = max(int(getattr(self, "regime_router_switch_persist_bars", 1)), 1)
+        cooldown_bars = max(int(getattr(self, "regime_router_switch_cooldown_bars", 0)), 0)
+        tf_secs = 15 * 60
+        cooldown_until_ts = int(self._mode_cooldown_until_ts_by_pair.get(pair, 0) or 0)
+        cooldown_active = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
+
+        candidate_mode = self._normalize_mode_name(self._mode_candidate_by_pair.get(pair, current_mode))
+        candidate_count = int(self._mode_candidate_count_by_pair.get(pair, 0) or 0)
+        switched = False
+
+        if forced_mode is not None:
+            switched = bool(current_mode != forced_mode)
+            current_mode = self._normalize_mode_name(forced_mode)
+            candidate_mode = current_mode
+            candidate_count = 0
+            cooldown_until_ts = 0
+            cooldown_active = False
+        elif target_mode == current_mode:
+            candidate_mode = target_mode
+            candidate_count = 0
+        else:
+            if target_mode == candidate_mode:
+                candidate_count += 1
+            else:
+                candidate_mode = target_mode
+                candidate_count = 1
+            if (not cooldown_active) and (candidate_count >= persist_bars):
+                current_mode = target_mode
+                switched = True
+                candidate_mode = current_mode
+                candidate_count = 0
+                cooldown_until_ts = int(clock_ts) + (cooldown_bars * tf_secs)
+                cooldown_active = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
+
+        self._mode_by_pair[pair] = self._normalize_mode_name(current_mode)
+        self._mode_candidate_by_pair[pair] = self._normalize_mode_name(candidate_mode)
+        self._mode_candidate_count_by_pair[pair] = int(candidate_count)
+        self._mode_cooldown_until_ts_by_pair[pair] = int(cooldown_until_ts)
+
+        active_cfg = self._mode_threshold_block(current_mode)
+        return {
+            "enabled": bool(enabled),
+            "forced_mode": forced_mode,
+            "active_mode": self._normalize_mode_name(current_mode),
+            "active_cfg": active_cfg,
+            "desired_mode": self._normalize_mode_name(desired_mode),
+            "desired_reason": str(desired_reason),
+            "target_mode": self._normalize_mode_name(target_mode),
+            "target_reason": str(target_reason),
+            "candidate_mode": self._normalize_mode_name(candidate_mode),
+            "candidate_count": int(candidate_count),
+            "switch_persist_bars": int(persist_bars),
+            "switch_cooldown_bars": int(cooldown_bars),
+            "switch_margin": float(margin),
+            "switch_cooldown_until_ts": int(cooldown_until_ts) if cooldown_until_ts else None,
+            "switch_cooldown_active": bool(cooldown_active),
+            "switched": bool(switched),
+            "running_active": bool(running_active),
+            "running_mode": running_mode if running_mode in ("intraday", "swing", "pause") else None,
+            "handoff_blocked_running_inventory": bool(handoff_blocked_running_inventory),
+            "scores": {
+                "calm_ratio": float(calm_ratio),
+                "intraday": dict(intraday_eval, **{"score_adjusted": float(intraday_score_adj)}),
+                "swing": dict(swing_eval, **{"score_adjusted": float(swing_score_adj)}),
+            },
+        }
 
     def _runmode_name(self) -> str:
         rm = None
@@ -386,6 +763,13 @@ class GridBrainV1(IStrategy):
             self._os_dev_zero_persist_by_pair,
             self._mrvd_day_poc_prev_by_pair,
             self._cvd_freeze_bars_left_by_pair,
+            self._last_adx_by_pair,
+            self._adx_rising_count_by_pair,
+            self._mode_by_pair,
+            self._mode_candidate_by_pair,
+            self._mode_candidate_count_by_pair,
+            self._mode_cooldown_until_ts_by_pair,
+            self._running_mode_by_pair,
             self._history_emit_end_ts_by_pair,
         ]
         for store in stores:
@@ -493,15 +877,11 @@ class GridBrainV1(IStrategy):
 
         return lo_p, hi_p, w, used, pad
 
-    def _bbw_nonexpanding(self, bbw: float, bbw_hist: np.ndarray) -> bool:
-        if bbw is None or np.isnan(bbw):
+    @staticmethod
+    def _bbw_percentile_ok(pct: Optional[float], max_pct: float) -> bool:
+        if pct is None or not np.isfinite(float(pct)):
             return False
-        if bbw_hist is None or len(bbw_hist) == 0:
-            return False
-        m = float(np.nanmax(bbw_hist))
-        if np.isnan(m):
-            return False
-        return bbw <= (m * self.bbw_nonexpand_mult)
+        return float(pct) <= float(max_pct)
 
     @staticmethod
     def _bbwp_percentile_last(series: pd.Series, lookback: int) -> Optional[float]:
@@ -1668,18 +2048,52 @@ class GridBrainV1(IStrategy):
         gate_cfg = self._gate_profile_values()
         gate_profile = str(gate_cfg.get("profile", "strict"))
         gate_adx_4h_max = float(gate_cfg.get("adx_4h_max", self.adx_4h_max))
+        gate_adx_4h_exit_min = float(gate_adx_4h_max)
+        gate_adx_4h_exit_max = float(gate_adx_4h_exit_min)
+        gate_adx_rising_bars = 1
+        gate_bbw_1h_pct_max = float(gate_cfg.get("bbw_1h_pct_max", self.bbw_1h_pct_max))
         gate_ema_dist_max_frac = float(gate_cfg.get("ema_dist_max_frac", self.ema_dist_max_frac))
         gate_vol_spike_mult = float(gate_cfg.get("vol_spike_mult", self.vol_spike_mult))
-        gate_bbwp_s_max = float(gate_cfg.get("bbwp_s_max", self.bbwp_s_max))
-        gate_bbwp_m_max = float(gate_cfg.get("bbwp_m_max", self.bbwp_m_max))
-        gate_bbwp_l_max = float(gate_cfg.get("bbwp_l_max", self.bbwp_l_max))
+        gate_bbwp_s_enter_low = 0.0
+        gate_bbwp_s_enter_high = float(gate_cfg.get("bbwp_s_max", self.bbwp_s_max))
+        gate_bbwp_m_enter_low = 0.0
+        gate_bbwp_m_enter_high = float(gate_cfg.get("bbwp_m_max", self.bbwp_m_max))
+        gate_bbwp_l_enter_low = 0.0
+        gate_bbwp_l_enter_high = float(gate_cfg.get("bbwp_l_max", self.bbwp_l_max))
+        gate_bbwp_s_max = float(gate_bbwp_s_enter_high)
+        gate_bbwp_m_max = float(gate_bbwp_m_enter_high)
+        gate_bbwp_l_max = float(gate_bbwp_l_enter_high)
+        gate_bbwp_stop_high = float(gate_cfg.get("bbwp_veto_pct", self.bbwp_veto_pct))
         gate_bbwp_veto_pct = float(gate_cfg.get("bbwp_veto_pct", self.bbwp_veto_pct))
         gate_bbwp_cooloff_trigger_pct = float(gate_cfg.get("bbwp_cooloff_trigger_pct", self.bbwp_cooloff_trigger_pct))
         gate_bbwp_cooloff_release_s = float(gate_cfg.get("bbwp_cooloff_release_s", self.bbwp_cooloff_release_s))
         gate_bbwp_cooloff_release_m = float(gate_cfg.get("bbwp_cooloff_release_m", self.bbwp_cooloff_release_m))
+        gate_atr_source = "1h"
+        gate_atr_pct_max = float(self.intraday_atr_pct_max)
         gate_os_dev_persist_bars = int(gate_cfg.get("os_dev_persist_bars", self.os_dev_persist_bars))
         gate_os_dev_rvol_max = float(gate_cfg.get("os_dev_rvol_max", self.os_dev_rvol_max))
         gate_start_min_pass_ratio = float(gate_cfg.get("start_min_gate_pass_ratio", 1.0))
+        active_mode = self._normalize_mode_name(getattr(self, "regime_router_default_mode", "intraday"))
+        mode_cfg: Dict[str, float] = self._mode_threshold_block(active_mode)
+        router_state: Dict[str, object] = {}
+        router_clock_ts = int(datetime.now(timezone.utc).timestamp())
+        try:
+            if "date" in dataframe.columns:
+                router_dt = pd.Timestamp(last["date"])
+                if router_dt.tzinfo is None:
+                    router_dt = router_dt.tz_localize("UTC")
+                else:
+                    router_dt = router_dt.tz_convert("UTC")
+                router_clock_ts = int(router_dt.timestamp())
+            elif isinstance(dataframe.index, pd.DatetimeIndex):
+                router_dt = pd.Timestamp(dataframe.index[-1])
+                if router_dt.tzinfo is None:
+                    router_dt = router_dt.tz_localize("UTC")
+                else:
+                    router_dt = router_dt.tz_convert("UTC")
+                router_clock_ts = int(router_dt.timestamp())
+        except Exception:
+            pass
 
         # ---- pull informative columns (1h / 4h) ----
         adx4h = None
@@ -1694,6 +2108,10 @@ class GridBrainV1(IStrategy):
         bbw4h = None
         ema50 = None
         ema100 = None
+        atr_1h = None
+        atr_4h = None
+        plus_di_4h = None
+        minus_di_4h = None
         vol_1h = None
         vol_sma20 = None
         squeeze_on_1h = None
@@ -1711,6 +2129,14 @@ class GridBrainV1(IStrategy):
                 ema50 = self._safe_float(last.get(c))
             if c.endswith("ema100_1h_1h"):
                 ema100 = self._safe_float(last.get(c))
+            if c.endswith("atr_1h_1h"):
+                atr_1h = self._safe_float(last.get(c))
+            if c.endswith("atr_4h_4h"):
+                atr_4h = self._safe_float(last.get(c))
+            if c.endswith("plus_di_4h_4h") or c == "plus_di_4h":
+                plus_di_4h = self._safe_float(last.get(c))
+            if c.endswith("minus_di_4h_4h") or c == "minus_di_4h":
+                minus_di_4h = self._safe_float(last.get(c))
             if c.endswith("vol_sma20_1h_1h"):
                 vol_sma20 = self._safe_float(last.get(c))
             if squeeze_col is None and (c.endswith("squeeze_on_1h_1h") or c == "squeeze_on_1h"):
@@ -1734,16 +2160,11 @@ class GridBrainV1(IStrategy):
         elif "volume_1h" in dataframe.columns:
             vol_1h = self._safe_float(last.get("volume_1h"))
 
-        # BBW non-expansion check on 1h: compare current bbw to max(previous 3 1h bars)
-        bbw_hist: List[float] = []
-        if bbw1h_col:
-            for i in range(1, self.bbw_nonexpand_lookback + 1):
-                if len(dataframe) > i:
-                    vv = self._safe_float(dataframe[bbw1h_col].iloc[-1 - i])
-                    if vv is not None:
-                        bbw_hist.append(vv)
-        bbw_hist_arr = np.array(bbw_hist, dtype=float) if len(bbw_hist) else np.array([], dtype=float)
-        bbw_nonexp = self._bbw_nonexpanding(bbw1h if bbw1h is not None else np.nan, bbw_hist_arr)
+        atr_1h_pct = (atr_1h / close) if (atr_1h is not None and close > 0.0) else None
+        atr_4h_pct = (atr_4h / close) if (atr_4h is not None and close > 0.0) else None
+
+        # BBW gate on 1h (rolling percentile on pair's own history).
+        bbw1h_pct = self._bbwp_percentile_last(dataframe[bbw1h_col], self.bbw_pct_lookback_1h) if bbw1h_col else None
 
         # EMA distance gate (1h)
         ema_dist_ok = False
@@ -1759,18 +2180,113 @@ class GridBrainV1(IStrategy):
             vol_ratio = vol_1h / vol_sma20
             vol_ok = vol_ratio <= gate_vol_spike_mult
 
-        # 4h ADX gate
-        adx_ok = (adx4h is not None) and (adx4h <= gate_adx_4h_max)
+        adx_rising_count = int(self._adx_rising_count_by_pair.get(pair, 0) or 0)
+        prev_adx = self._safe_float(self._last_adx_by_pair.get(pair))
+        if adx4h is not None:
+            if prev_adx is None:
+                adx_rising_count = 0
+            elif adx4h > (prev_adx + 1e-9):
+                adx_rising_count = int(adx_rising_count + 1)
+            elif adx4h < (prev_adx - 1e-9):
+                adx_rising_count = 0
+            self._last_adx_by_pair[pair] = float(adx4h)
+            self._adx_rising_count_by_pair[pair] = int(adx_rising_count)
 
-        # BBWP gate (S=15m, M=1h, L=4h)
+        # BBWP raw percentiles (S=15m, M=1h, L=4h).
         bbwp_s = self._bbwp_percentile_last(dataframe["bb_width_15m"], self.bbwp_lookback_s)
         bbwp_m = self._bbwp_percentile_last(dataframe[bbw1h_col], self.bbwp_lookback_m) if bbw1h_col else None
         bbwp_l = self._bbwp_percentile_last(dataframe[bbw4h_col], self.bbwp_lookback_l) if bbw4h_col else None
         bbwp_cooloff = bool(self._bbwp_cooloff_by_pair.get(pair, False))
 
+        # Regime router picks intraday/swing mode from raw features, then activates mode thresholds.
+        running_active_hint = bool(self._running_by_pair.get(pair, False))
+        running_mode_hint = None
+        if running_active_hint:
+            running_mode_hint = self._normalize_mode_name(self._running_mode_by_pair.get(pair))
+        router_features = {
+            "adx_4h": adx4h,
+            "bb_width_1h_pct": bbw1h_pct,
+            "ema_dist_frac_1h": ema_dist_frac,
+            "vol_ratio_1h": vol_ratio,
+            "bbwp_15m_pct": bbwp_s,
+            "bbwp_1h_pct": bbwp_m,
+            "bbwp_4h_pct": bbwp_l,
+            "atr_1h_pct": atr_1h_pct,
+            "atr_4h_pct": atr_4h_pct,
+            "rvol_15m": rvol_15m,
+            "running_active": running_active_hint,
+            "running_mode": running_mode_hint,
+        }
+        router_state = self._regime_router_state(pair, router_clock_ts, router_features)
+        active_mode = str(router_state.get("active_mode", active_mode))
+        desired_mode = str(router_state.get("desired_mode", active_mode))
+        mode_cfg_raw = router_state.get("active_cfg")
+        if isinstance(mode_cfg_raw, dict):
+            mode_cfg = dict(mode_cfg_raw)
+        gate_adx_4h_max = float(mode_cfg.get("adx_enter_max", gate_adx_4h_max))
+        gate_adx_4h_exit_min = float(mode_cfg.get("adx_exit_min", gate_adx_4h_exit_min))
+        gate_adx_4h_exit_max = float(mode_cfg.get("adx_exit_max", gate_adx_4h_exit_min))
+        gate_adx_rising_bars = int(mode_cfg.get("adx_rising_bars", gate_adx_rising_bars))
+        gate_bbw_1h_pct_max = float(mode_cfg.get("bbw_1h_pct_max", gate_bbw_1h_pct_max))
+        gate_ema_dist_max_frac = float(mode_cfg.get("ema_dist_max_frac", gate_ema_dist_max_frac))
+        gate_vol_spike_mult = float(mode_cfg.get("vol_spike_mult", gate_vol_spike_mult))
+        gate_bbwp_s_enter_low = float(mode_cfg.get("bbwp_s_enter_low", gate_bbwp_s_enter_low))
+        gate_bbwp_s_enter_high = float(mode_cfg.get("bbwp_s_enter_high", gate_bbwp_s_enter_high))
+        gate_bbwp_m_enter_low = float(mode_cfg.get("bbwp_m_enter_low", gate_bbwp_m_enter_low))
+        gate_bbwp_m_enter_high = float(mode_cfg.get("bbwp_m_enter_high", gate_bbwp_m_enter_high))
+        gate_bbwp_l_enter_low = float(mode_cfg.get("bbwp_l_enter_low", gate_bbwp_l_enter_low))
+        gate_bbwp_l_enter_high = float(mode_cfg.get("bbwp_l_enter_high", gate_bbwp_l_enter_high))
+        gate_bbwp_s_max = float(mode_cfg.get("bbwp_s_max", gate_bbwp_s_enter_high))
+        gate_bbwp_m_max = float(mode_cfg.get("bbwp_m_max", gate_bbwp_m_enter_high))
+        gate_bbwp_l_max = float(mode_cfg.get("bbwp_l_max", gate_bbwp_l_enter_high))
+        gate_bbwp_stop_high = float(mode_cfg.get("bbwp_stop_high", gate_bbwp_stop_high))
+        gate_atr_source = str(mode_cfg.get("atr_source", gate_atr_source)).strip().lower()
+        gate_atr_pct_max = float(mode_cfg.get("atr_pct_max", gate_atr_pct_max))
+        gate_os_dev_persist_bars = int(mode_cfg.get("os_dev_persist_bars", gate_os_dev_persist_bars))
+        gate_os_dev_rvol_max = float(mode_cfg.get("os_dev_rvol_max", gate_os_dev_rvol_max))
+
+        # Apply active mode thresholds.
+        mode_pause = bool(active_mode == "pause")
+        bbw_nonexp = self._bbw_percentile_ok(bbw1h_pct, gate_bbw_1h_pct_max)
+        ema_dist_ok = False
+        if ema_dist_frac is not None:
+            ema_dist_ok = bool(ema_dist_frac <= gate_ema_dist_max_frac)
+        vol_ok = False
+        if vol_ratio is not None:
+            vol_ok = bool(vol_ratio <= gate_vol_spike_mult)
+        atr_mode_pct = atr_4h_pct if gate_atr_source == "4h" else atr_1h_pct
+        atr_ok = bool(atr_mode_pct is not None and atr_mode_pct <= gate_atr_pct_max)
+
+        # 4h ADX gate / hysteresis signal.
+        adx_rising_confirmed = bool(adx_rising_count >= int(max(gate_adx_rising_bars, 1)))
+        adx_ok = (adx4h is not None) and (adx4h <= gate_adx_4h_max)
+        adx_exit_overheat = self._adx_exit_hysteresis_trigger(
+            adx4h,
+            adx_rising_count,
+            gate_adx_4h_exit_min,
+            gate_adx_rising_bars,
+        )
+        adx_di_up = bool(
+            plus_di_4h is not None and minus_di_4h is not None and plus_di_4h > minus_di_4h
+        )
+        adx_di_down = bool(
+            plus_di_4h is not None and minus_di_4h is not None and minus_di_4h > plus_di_4h
+        )
+        adx_di_down_risk_stop = self._adx_di_down_risk_trigger(
+            adx4h,
+            plus_di_4h,
+            minus_di_4h,
+            adx_rising_count,
+            gate_adx_4h_exit_min,
+            gate_adx_rising_bars,
+            early_margin=2.0,
+        )
+
+        # BBWP gate (active mode thresholds + global veto/cooloff).
         if self.bbwp_enabled:
             bbwp_vals = [x for x in [bbwp_s, bbwp_m, bbwp_l] if x is not None]
-            bbwp_veto = any(x >= gate_bbwp_veto_pct for x in bbwp_vals)
+            bbwp_expansion_stop = any(x >= gate_bbwp_stop_high for x in bbwp_vals)
+            bbwp_veto = any(x >= min(gate_bbwp_veto_pct, gate_bbwp_stop_high) for x in bbwp_vals)
             if any(x >= gate_bbwp_cooloff_trigger_pct for x in bbwp_vals):
                 bbwp_cooloff = True
             if (
@@ -1787,15 +2303,16 @@ class GridBrainV1(IStrategy):
                 bbwp_s is not None
                 and bbwp_m is not None
                 and bbwp_l is not None
-                and bbwp_s <= gate_bbwp_s_max
-                and bbwp_m <= gate_bbwp_m_max
-                and bbwp_l <= gate_bbwp_l_max
+                and gate_bbwp_s_enter_low <= bbwp_s <= gate_bbwp_s_enter_high
+                and gate_bbwp_m_enter_low <= bbwp_m <= gate_bbwp_m_enter_high
+                and gate_bbwp_l_enter_low <= bbwp_l <= gate_bbwp_l_enter_high
             )
             bbwp_gate_ok = bool(bbwp_allow and not bbwp_veto and not bbwp_cooloff)
         else:
             bbwp_allow = True
             bbwp_veto = False
             bbwp_cooloff = False
+            bbwp_expansion_stop = False
             bbwp_gate_ok = True
 
         # 7d containment (15m)
@@ -2179,6 +2696,16 @@ class GridBrainV1(IStrategy):
         if prev_mid is not None and prev_mid > 0:
             shift_frac = abs(mid - prev_mid) / prev_mid
             shift_stop = shift_frac >= self.range_shift_stop_pct
+        running_mode_prev = None
+        if running_active_hint:
+            running_mode_prev = self._normalize_mode_name(self._running_mode_by_pair.get(pair))
+        mode_handoff_required_stop = bool(
+            running_active_hint
+            and (running_mode_prev in ("intraday", "swing"))
+            and (desired_mode in ("intraday", "swing"))
+            and (desired_mode != running_mode_prev)
+        )
+        router_pause_stop = bool(running_active_hint and mode_pause)
 
         lvn_corridor_width = max(self.micro_lvn_corridor_steps * step_price, 0.0)
         upper_edge_lvn = any(abs(float(x) - hi_p) <= lvn_corridor_width for x in micro_lvn_levels)
@@ -2202,6 +2729,9 @@ class GridBrainV1(IStrategy):
             "two_consecutive_outside_dn": bool(two_dn),
             "fast_outside_up": bool(flags["fast_outside_up"]),
             "fast_outside_dn": bool(flags["fast_outside_dn"]),
+            "adx_hysteresis_stop": bool(adx_exit_overheat),
+            "adx_di_down_risk_stop": bool(adx_di_down_risk_stop),
+            "bbwp_expansion_stop": bool(bbwp_expansion_stop),
             "squeeze_release_break_stop": bool(squeeze_release_break_stop),
             "os_dev_trend_stop": bool(os_dev_trend_stop),
             "lvn_corridor_stop_override": bool(lvn_corridor_stop_override),
@@ -2210,16 +2740,23 @@ class GridBrainV1(IStrategy):
             "fvg_conflict_stop_override": bool(fvg_conflict_stop_override),
             "fvg_conflict_stop_up": bool(fvg_conflict_stop_up),
             "fvg_conflict_stop_dn": bool(fvg_conflict_stop_dn),
+            "mode_handoff_required_stop": bool(mode_handoff_required_stop),
+            "router_pause_stop": bool(router_pause_stop),
             "range_shift_stop": bool(shift_stop),
         }
 
         hard_stop = bool(
             flags["fast_outside_up"]
             or flags["fast_outside_dn"]
+            or adx_exit_overheat
+            or adx_di_down_risk_stop
+            or bbwp_expansion_stop
             or squeeze_release_break_stop
             or os_dev_trend_stop
             or lvn_corridor_stop_override
             or fvg_conflict_stop_override
+            or mode_handoff_required_stop
+            or router_pause_stop
         )
         raw_stop_rule = bool(two_up or two_dn or hard_stop or shift_stop)
 
@@ -2230,10 +2767,12 @@ class GridBrainV1(IStrategy):
 
         # ---- Regime allow ----
         gate_checks = [
+            ("mode_active_ok", bool(not mode_pause)),
             ("adx_ok", bool(adx_ok)),
             ("bbw_nonexp", bool(bbw_nonexp)),
             ("ema_dist_ok", bool(ema_dist_ok)),
             ("vol_ok", bool(vol_ok)),
+            ("atr_ok", bool(atr_ok)),
             ("inside_7d", bool(inside_7d)),
             ("vrvp_box_ok", bool(vrvp_box_ok)),
             ("bbwp_gate_ok", bool(bbwp_gate_ok)),
@@ -2249,7 +2788,7 @@ class GridBrainV1(IStrategy):
         gate_pass_count = int(sum(1 for _, ok in gate_checks if ok))
         gate_total_count = int(len(gate_checks))
         gate_pass_ratio = float(gate_pass_count / gate_total_count) if gate_total_count > 0 else 0.0
-        core_gate_names = {"adx_ok", "bbw_nonexp", "ema_dist_ok", "vol_ok", "inside_7d", "vrvp_box_ok"}
+        core_gate_names = {"mode_active_ok", "adx_ok", "bbw_nonexp", "ema_dist_ok", "vol_ok", "atr_ok", "inside_7d", "vrvp_box_ok"}
         core_gates_ok = bool(all(ok for name, ok in gate_checks if name in core_gate_names))
         gate_ratio_ok = bool(gate_pass_ratio >= gate_start_min_pass_ratio)
 
@@ -2286,7 +2825,7 @@ class GridBrainV1(IStrategy):
             candle_time_utc = None
 
         # ---- Reclaim / cooldown / min-runtime handling ----
-        clock_ts = candle_ts if candle_ts is not None else int(datetime.now(timezone.utc).timestamp())
+        clock_ts = candle_ts if candle_ts is not None else int(router_clock_ts)
         min_runtime_secs = int(max(float(self.min_runtime_hours), 0.0) * 3600.0)
         reclaim_secs = int(max(float(self.reclaim_hours), 0.0) * 3600.0)
         cooldown_secs = int(max(float(self.cooldown_minutes), 0.0) * 60.0)
@@ -2335,10 +2874,14 @@ class GridBrainV1(IStrategy):
             start_block_reasons.append("price_outside_box")
         if not rsi_ok:
             start_block_reasons.append("rsi_out_of_range")
+        if mode_pause:
+            start_block_reasons.append("router_pause_mode")
         if reclaim_active:
             start_block_reasons.append("reclaim_active")
         if cooldown_active:
             start_block_reasons.append("cooldown_active")
+        if mode_handoff_required_stop:
+            start_block_reasons.append("mode_handoff_required_stop")
         if stop_rule:
             start_block_reasons.append("stop_rule_active")
         if raw_stop_rule and (not stop_rule):
@@ -2359,6 +2902,7 @@ class GridBrainV1(IStrategy):
             self._reclaim_until_ts_by_pair[pair] = reclaim_until_ts
             self._cooldown_until_ts_by_pair[pair] = cooldown_until_ts
             self._running_by_pair[pair] = False
+            self._running_mode_by_pair.pop(pair, None)
             self._active_since_ts_by_pair.pop(pair, None)
             active_since_ts = None
             runtime_secs = None
@@ -2367,6 +2911,7 @@ class GridBrainV1(IStrategy):
                 self._active_since_ts_by_pair[pair] = int(clock_ts)
                 active_since_ts = int(clock_ts)
             self._running_by_pair[pair] = True
+            self._running_mode_by_pair[pair] = self._normalize_mode_name(active_mode)
             runtime_secs = max(int(clock_ts) - int(active_since_ts), 0)
         else:
             # HOLD preserves previous running state.
@@ -2374,6 +2919,7 @@ class GridBrainV1(IStrategy):
             if running_prev and active_since_ts is not None:
                 runtime_secs = max(int(clock_ts) - int(active_since_ts), 0)
             else:
+                self._running_mode_by_pair.pop(pair, None)
                 active_since_ts = None
                 runtime_secs = None
 
@@ -2388,6 +2934,33 @@ class GridBrainV1(IStrategy):
             "exchange": ex_name,
             "symbol": pair,
             "action": action,
+            "mode": str(active_mode),
+            "regime_router": {
+                "enabled": bool(router_state.get("enabled", False)),
+                "forced_mode": router_state.get("forced_mode"),
+                "active_mode": str(active_mode),
+                "desired_mode": router_state.get("desired_mode"),
+                "desired_reason": router_state.get("desired_reason"),
+                "target_mode": router_state.get("target_mode"),
+                "target_reason": router_state.get("target_reason"),
+                "candidate_mode": router_state.get("candidate_mode"),
+                "candidate_count": int(router_state.get("candidate_count", 0) or 0),
+                "switch_persist_bars": int(router_state.get("switch_persist_bars", 0) or 0),
+                "switch_cooldown_bars": int(router_state.get("switch_cooldown_bars", 0) or 0),
+                "switch_margin": float(router_state.get("switch_margin", 0.0) or 0.0),
+                "switch_cooldown_active": bool(router_state.get("switch_cooldown_active", False)),
+                "switch_cooldown_until_ts": router_state.get("switch_cooldown_until_ts"),
+                "switch_cooldown_until_utc": self._ts_to_iso(
+                    int(router_state["switch_cooldown_until_ts"])
+                ) if router_state.get("switch_cooldown_until_ts") is not None else None,
+                "switched": bool(router_state.get("switched", False)),
+                "running_active": bool(router_state.get("running_active", False)),
+                "running_mode": router_state.get("running_mode"),
+                "handoff_blocked_running_inventory": bool(
+                    router_state.get("handoff_blocked_running_inventory", False)
+                ),
+                "scores": router_state.get("scores", {}),
+            },
 
             # NEW: align sims/executor to the candle that produced this plan
             "candle_time_utc": candle_time_utc,
@@ -2525,10 +3098,26 @@ class GridBrainV1(IStrategy):
                 "tp_candidates": tp_candidates,
             },
             "signals": {
+                "mode": str(active_mode),
+                "mode_pause": bool(mode_pause),
+                "mode_desired": str(desired_mode),
                 "adx_4h": adx4h,
+                "adx_enter_max_4h": float(gate_adx_4h_max),
+                "adx_exit_min_4h": float(gate_adx_4h_exit_min),
+                "adx_exit_max_4h": float(gate_adx_4h_exit_max),
+                "adx_rising_bars_4h": int(adx_rising_count),
+                "adx_rising_required_4h": int(gate_adx_rising_bars),
+                "adx_rising_confirmed_4h": bool(adx_rising_confirmed),
+                "adx_exit_overheat": bool(adx_exit_overheat),
+                "plus_di_4h": plus_di_4h,
+                "minus_di_4h": minus_di_4h,
+                "adx_di_up": bool(adx_di_up),
+                "adx_di_down": bool(adx_di_down),
+                "adx_di_down_risk_stop": bool(adx_di_down_risk_stop),
                 "bb_width_15m": bbw15m,
                 "bb_width_1h": bbw1h,
                 "bb_width_4h": bbw4h,
+                "bb_width_1h_pct": bbw1h_pct,
                 "bb_width_nonexpanding_1h": bool(bbw_nonexp),
                 "bbwp_15m_pct": bbwp_s,
                 "bbwp_1h_pct": bbwp_m,
@@ -2536,10 +3125,26 @@ class GridBrainV1(IStrategy):
                 "bbwp_allow": bool(bbwp_allow),
                 "bbwp_veto": bool(bbwp_veto),
                 "bbwp_cooloff": bool(bbwp_cooloff),
+                "bbwp_s_enter_low": float(gate_bbwp_s_enter_low),
+                "bbwp_s_enter_high": float(gate_bbwp_s_enter_high),
+                "bbwp_m_enter_low": float(gate_bbwp_m_enter_low),
+                "bbwp_m_enter_high": float(gate_bbwp_m_enter_high),
+                "bbwp_l_enter_low": float(gate_bbwp_l_enter_low),
+                "bbwp_l_enter_high": float(gate_bbwp_l_enter_high),
+                "bbwp_stop_high": float(gate_bbwp_stop_high),
+                "bbwp_expansion_stop": bool(bbwp_expansion_stop),
                 "bbwp_gate_ok": bool(bbwp_gate_ok),
                 "ema50_1h": ema50,
                 "ema100_1h": ema100,
                 "ema_dist_frac_1h": ema_dist_frac,
+                "atr_1h": atr_1h,
+                "atr_4h": atr_4h,
+                "atr_1h_pct": atr_1h_pct,
+                "atr_4h_pct": atr_4h_pct,
+                "atr_mode_source": str(gate_atr_source),
+                "atr_mode_pct": atr_mode_pct,
+                "atr_mode_max": float(gate_atr_pct_max),
+                "atr_ok": bool(atr_ok),
                 "vol_ratio_1h": vol_ratio,
                 "rvol_15m": rvol_15m,
                 "inside_7d": bool(inside_7d),
@@ -2612,6 +3217,8 @@ class GridBrainV1(IStrategy):
                 "vwap_15m": vwap,
                 "rule_range_ok": bool(rule_range_ok),
                 "rule_range_fail_reasons": rule_range_fail_reasons,
+                "mode_handoff_required_stop": bool(mode_handoff_required_stop),
+                "router_pause_stop": bool(router_pause_stop),
                 "p_range": p_range,
                 "p_breakout": p_breakout,
                 "ml_confidence": ml_confidence,
@@ -2631,6 +3238,9 @@ class GridBrainV1(IStrategy):
                     "two_consecutive_outside_dn": bool(stop_reason_flags_raw["two_consecutive_outside_dn"]),
                     "fast_outside_up": bool(stop_reason_flags_raw["fast_outside_up"]),
                     "fast_outside_dn": bool(stop_reason_flags_raw["fast_outside_dn"]),
+                    "adx_hysteresis_stop": bool(stop_reason_flags_raw["adx_hysteresis_stop"]),
+                    "adx_di_down_risk_stop": bool(stop_reason_flags_raw["adx_di_down_risk_stop"]),
+                    "bbwp_expansion_stop": bool(stop_reason_flags_raw["bbwp_expansion_stop"]),
                     "squeeze_release_break_stop": bool(stop_reason_flags_raw["squeeze_release_break_stop"]),
                     "os_dev_trend_stop": bool(stop_reason_flags_raw["os_dev_trend_stop"]),
                     "lvn_corridor_stop_override": bool(stop_reason_flags_raw["lvn_corridor_stop_override"]),
@@ -2640,6 +3250,8 @@ class GridBrainV1(IStrategy):
                     "fvg_conflict_stop_override": bool(stop_reason_flags_raw["fvg_conflict_stop_override"]),
                     "fvg_conflict_stop_up": bool(stop_reason_flags_raw["fvg_conflict_stop_up"]),
                     "fvg_conflict_stop_dn": bool(stop_reason_flags_raw["fvg_conflict_stop_dn"]),
+                    "mode_handoff_required_stop": bool(stop_reason_flags_raw["mode_handoff_required_stop"]),
+                    "router_pause_stop": bool(stop_reason_flags_raw["router_pause_stop"]),
                     "upper_edge_lvn": bool(upper_edge_lvn),
                     "lower_edge_lvn": bool(lower_edge_lvn),
                     "close_outside_up": bool(flags["close_outside_up"]),
@@ -2678,11 +3290,40 @@ class GridBrainV1(IStrategy):
                 },
                 "gating": {
                     "profile": gate_profile,
+                    "active_mode": str(active_mode),
                     "start_min_gate_pass_ratio": float(gate_start_min_pass_ratio),
                     "adx_4h_max": float(gate_adx_4h_max),
+                    "adx_4h_exit_min": float(gate_adx_4h_exit_min),
+                    "adx_4h_exit_max": float(gate_adx_4h_exit_max),
+                    "adx_rising_bars": int(gate_adx_rising_bars),
+                    "bbw_1h_pct_max": float(gate_bbw_1h_pct_max),
                     "ema_dist_max_frac": float(gate_ema_dist_max_frac),
                     "vol_spike_mult": float(gate_vol_spike_mult),
+                    "atr_source": str(gate_atr_source),
+                    "atr_pct_max": float(gate_atr_pct_max),
+                    "bbwp_s_enter_low": float(gate_bbwp_s_enter_low),
+                    "bbwp_s_enter_high": float(gate_bbwp_s_enter_high),
+                    "bbwp_m_enter_low": float(gate_bbwp_m_enter_low),
+                    "bbwp_m_enter_high": float(gate_bbwp_m_enter_high),
+                    "bbwp_l_enter_low": float(gate_bbwp_l_enter_low),
+                    "bbwp_l_enter_high": float(gate_bbwp_l_enter_high),
+                    "bbwp_stop_high": float(gate_bbwp_stop_high),
                 },
+                "regime_router": {
+                    "enabled": bool(self.regime_router_enabled),
+                    "default_mode": self._normalize_mode_name(self.regime_router_default_mode),
+                    "force_mode": (
+                        self._normalize_mode_name(self.regime_router_force_mode)
+                        if str(self.regime_router_force_mode or "").strip()
+                        else None
+                    ),
+                    "allow_pause": bool(self.regime_router_allow_pause),
+                    "switch_persist_bars": int(self.regime_router_switch_persist_bars),
+                    "switch_cooldown_bars": int(self.regime_router_switch_cooldown_bars),
+                    "switch_margin": float(self.regime_router_switch_margin),
+                },
+                "intraday": self._mode_threshold_block("intraday"),
+                "swing": self._mode_threshold_block("swing"),
                 "plan_history": {
                     "per_candle_backtest_enabled": bool(self.emit_per_candle_history_backtest),
                     "per_candle_active": bool(history_mode),
@@ -2762,7 +3403,13 @@ class GridBrainV1(IStrategy):
             "runtime_state": {
                 "clock_ts": int(clock_ts),
                 "clock_time_utc": self._ts_to_iso(int(clock_ts)),
+                "active_mode": str(active_mode),
                 "running": bool(running_now),
+                "running_mode": (
+                    self._normalize_mode_name(self._running_mode_by_pair.get(pair))
+                    if bool(running_now)
+                    else None
+                ),
                 "active_since_ts": int(active_since_ts) if active_since_ts is not None else None,
                 "active_since_utc": self._ts_to_iso(int(active_since_ts)) if active_since_ts is not None else None,
                 "runtime_secs": int(runtime_secs) if runtime_secs is not None else None,
@@ -2772,6 +3419,11 @@ class GridBrainV1(IStrategy):
                 "cooldown_until_ts": int(cooldown_until_ts) if cooldown_until_ts else None,
                 "cooldown_until_utc": self._ts_to_iso(int(cooldown_until_ts)) if cooldown_until_ts else None,
                 "cooldown_active": bool(cooldown_active_now),
+                "router_target_mode": router_state.get("target_mode"),
+                "router_target_reason": router_state.get("target_reason"),
+                "router_desired_mode": router_state.get("desired_mode"),
+                "router_desired_reason": router_state.get("desired_reason"),
+                "router_switched": bool(router_state.get("switched", False)),
                 "start_signal": bool(start_signal),
                 "start_blocked": bool(start_blocked),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
@@ -2779,6 +3431,8 @@ class GridBrainV1(IStrategy):
                 "stop_reason_flags_applied_active": [str(x) for x in stop_reason_flags_applied_active],
             },
             "diagnostics": {
+                "active_mode": str(active_mode),
+                "mode_pause": bool(mode_pause),
                 "start_gate_ok": bool(start_gate_ok),
                 "price_in_box": bool(price_in_box),
                 "rsi_ok": bool(rsi_ok),
@@ -2789,6 +3443,11 @@ class GridBrainV1(IStrategy):
                 "stop_rule_triggered_raw": bool(raw_stop_rule),
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
                 "stop_reason_flags_applied_active": [str(x) for x in stop_reason_flags_applied_active],
+                "router_target_mode": router_state.get("target_mode"),
+                "router_target_reason": router_state.get("target_reason"),
+                "router_desired_mode": router_state.get("desired_mode"),
+                "router_desired_reason": router_state.get("desired_reason"),
+                "router_switched": bool(router_state.get("switched", False)),
             },
             "capital_policy": {
                 "mode": "QUOTE_ONLY",

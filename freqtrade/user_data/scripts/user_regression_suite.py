@@ -53,6 +53,11 @@ def check_plan_schema_and_feature_outputs(plan: dict) -> None:
     print("[regression] check: plan schema + feature outputs")
 
     _require("range" in plan and "grid" in plan and "risk" in plan and "signals" in plan, "plan base keys missing")
+    _require("mode" in plan, "plan.mode missing")
+    _require("regime_router" in plan, "plan.regime_router missing")
+    rr = plan.get("regime_router", {}) or {}
+    for key in ["active_mode", "desired_mode", "target_mode", "scores"]:
+        _require(key in rr, f"plan.regime_router.{key} missing")
 
     n_levels = int(_plan_get(plan, "grid", "n_levels", default=0) or 0)
     _require(n_levels >= 1, "grid.n_levels must be >= 1")
@@ -114,6 +119,11 @@ def check_plan_schema_and_feature_outputs(plan: dict) -> None:
     stop_reasons = _plan_get(plan, "risk", "stop_reasons", default={}) or {}
     _require("lvn_corridor_stop_override" in stop_reasons, "risk.stop_reasons.lvn_corridor_stop_override missing")
     _require("fvg_conflict_stop_override" in stop_reasons, "risk.stop_reasons.fvg_conflict_stop_override missing")
+    _require("adx_hysteresis_stop" in stop_reasons, "risk.stop_reasons.adx_hysteresis_stop missing")
+    _require("adx_di_down_risk_stop" in stop_reasons, "risk.stop_reasons.adx_di_down_risk_stop missing")
+    _require("bbwp_expansion_stop" in stop_reasons, "risk.stop_reasons.bbwp_expansion_stop missing")
+    _require("mode_handoff_required_stop" in stop_reasons, "risk.stop_reasons.mode_handoff_required_stop missing")
+    _require("router_pause_stop" in stop_reasons, "risk.stop_reasons.router_pause_stop missing")
     _require("micro_vap_ok" in (plan.get("signals") or {}), "signals.micro_vap_ok missing")
     _require("fvg_gate_ok" in (plan.get("signals") or {}), "signals.fvg_gate_ok missing")
     _require("mrvd_gate_ok" in (plan.get("signals") or {}), "signals.mrvd_gate_ok missing")
@@ -124,6 +134,44 @@ def check_plan_schema_and_feature_outputs(plan: dict) -> None:
     _require("ml_gate_ok" in (plan.get("signals") or {}), "signals.ml_gate_ok missing")
     _require("ml_overlay_source" in (plan.get("signals") or {}), "signals.ml_overlay_source missing")
     _require("ml_do_predict" in (plan.get("signals") or {}), "signals.ml_do_predict missing")
+    _require("bb_width_1h_pct" in (plan.get("signals") or {}), "signals.bb_width_1h_pct missing")
+    _require("mode" in (plan.get("signals") or {}), "signals.mode missing")
+    _require("mode_pause" in (plan.get("signals") or {}), "signals.mode_pause missing")
+    _require("mode_desired" in (plan.get("signals") or {}), "signals.mode_desired missing")
+    _require("adx_enter_max_4h" in (plan.get("signals") or {}), "signals.adx_enter_max_4h missing")
+    _require("adx_exit_min_4h" in (plan.get("signals") or {}), "signals.adx_exit_min_4h missing")
+    _require("adx_exit_max_4h" in (plan.get("signals") or {}), "signals.adx_exit_max_4h missing")
+    _require("adx_exit_overheat" in (plan.get("signals") or {}), "signals.adx_exit_overheat missing")
+    _require("adx_rising_bars_4h" in (plan.get("signals") or {}), "signals.adx_rising_bars_4h missing")
+    _require("adx_rising_required_4h" in (plan.get("signals") or {}), "signals.adx_rising_required_4h missing")
+    _require("adx_rising_confirmed_4h" in (plan.get("signals") or {}), "signals.adx_rising_confirmed_4h missing")
+    _require("plus_di_4h" in (plan.get("signals") or {}), "signals.plus_di_4h missing")
+    _require("minus_di_4h" in (plan.get("signals") or {}), "signals.minus_di_4h missing")
+    _require("atr_mode_source" in (plan.get("signals") or {}), "signals.atr_mode_source missing")
+    _require("atr_mode_pct" in (plan.get("signals") or {}), "signals.atr_mode_pct missing")
+    _require("atr_mode_max" in (plan.get("signals") or {}), "signals.atr_mode_max missing")
+    _require("atr_ok" in (plan.get("signals") or {}), "signals.atr_ok missing")
+    _require("bbwp_stop_high" in (plan.get("signals") or {}), "signals.bbwp_stop_high missing")
+    _require("bbwp_expansion_stop" in (plan.get("signals") or {}), "signals.bbwp_expansion_stop missing")
+    _require("mode_handoff_required_stop" in (plan.get("signals") or {}), "signals.mode_handoff_required_stop missing")
+    _require("router_pause_stop" in (plan.get("signals") or {}), "signals.router_pause_stop missing")
+
+    gating = _plan_get(plan, "update_policy", "gating", default={}) or {}
+    _require("adx_4h_max" in gating, "update_policy.gating.adx_4h_max missing")
+    _require("adx_4h_exit_min" in gating, "update_policy.gating.adx_4h_exit_min missing")
+    _require("bbw_1h_pct_max" in gating, "update_policy.gating.bbw_1h_pct_max missing")
+    _require("active_mode" in gating, "update_policy.gating.active_mode missing")
+    _require("adx_4h_exit_max" in gating, "update_policy.gating.adx_4h_exit_max missing")
+    _require("atr_source" in gating, "update_policy.gating.atr_source missing")
+    _require("atr_pct_max" in gating, "update_policy.gating.atr_pct_max missing")
+    _require("bbwp_stop_high" in gating, "update_policy.gating.bbwp_stop_high missing")
+    _require(isinstance(_plan_get(plan, "update_policy", "intraday", default={}), dict), "update_policy.intraday missing")
+    _require(isinstance(_plan_get(plan, "update_policy", "swing", default={}), dict), "update_policy.swing missing")
+    _require(isinstance(_plan_get(plan, "update_policy", "regime_router", default={}), dict), "update_policy.regime_router missing")
+    _require(
+        "allow_pause" in (_plan_get(plan, "update_policy", "regime_router", default={}) or {}),
+        "update_policy.regime_router.allow_pause missing",
+    )
 
     tp_candidates = _plan_get(plan, "exit", "tp_candidates", default={}) or {}
     _require("imfvg_avg_bull" in tp_candidates, "exit.tp_candidates.imfvg_avg_bull missing")
@@ -397,6 +445,173 @@ def check_ml_overlay_behavior() -> None:
     print("[regression] check: ML overlay behavior OK")
 
 
+def check_adx_hysteresis_behavior() -> None:
+    print("[regression] check: ADX hysteresis stop confirmation")
+
+    brain = GridBrainV1(
+        config={
+            "candle_type_def": "spot",
+            "exchange": {"name": "binance"},
+            "runmode": "backtest",
+        }
+    )
+    _require(
+        not brain._adx_exit_hysteresis_trigger(
+            adx_value=31.0,
+            rising_count=2,
+            exit_min=30.0,
+            rising_bars_required=3,
+        ),
+        "ADX stop should not trigger before rising-bars confirmation",
+    )
+    _require(
+        brain._adx_exit_hysteresis_trigger(
+            adx_value=31.0,
+            rising_count=3,
+            exit_min=30.0,
+            rising_bars_required=3,
+        ),
+        "ADX stop should trigger after rising-bars confirmation",
+    )
+    _require(
+        brain._adx_di_down_risk_trigger(
+            adx_value=29.0,
+            plus_di_value=12.0,
+            minus_di_value=24.0,
+            rising_count=3,
+            exit_min=30.0,
+            rising_bars_required=3,
+            early_margin=2.0,
+        ),
+        "Down-DI risk stop should trigger in early-warning band",
+    )
+    _require(
+        not brain._adx_di_down_risk_trigger(
+            adx_value=29.0,
+            plus_di_value=24.0,
+            minus_di_value=12.0,
+            rising_count=3,
+            exit_min=30.0,
+            rising_bars_required=3,
+            early_margin=2.0,
+        ),
+        "Down-DI risk stop should not trigger when +DI dominates",
+    )
+
+    print("[regression] check: ADX hysteresis stop confirmation OK")
+
+
+def check_mode_router_handoff_behavior() -> None:
+    print("[regression] check: regime router mode selection + handoff")
+
+    brain = GridBrainV1(
+        config={
+            "candle_type_def": "spot",
+            "exchange": {"name": "binance"},
+            "runmode": "backtest",
+        }
+    )
+    brain.regime_router_enabled = True
+    brain.regime_router_default_mode = "intraday"
+    brain.regime_router_force_mode = ""
+    brain.regime_router_allow_pause = True
+    brain.regime_router_switch_persist_bars = 2
+    brain.regime_router_switch_cooldown_bars = 2
+    brain.regime_router_switch_margin = 1.0
+
+    pair = "ETH/USDT"
+    brain._reset_pair_runtime_state(pair)
+
+    intraday_features = {
+        "adx_4h": 14.0,
+        "ema_dist_frac_1h": 0.003,
+        "bb_width_1h_pct": 20.0,
+        "vol_ratio_1h": 1.0,
+        "bbwp_15m_pct": 25.0,
+        "bbwp_1h_pct": 30.0,
+        "bbwp_4h_pct": 40.0,
+        "atr_1h_pct": 0.010,
+        "atr_4h_pct": 0.020,
+        "rvol_15m": 1.0,
+        "running_active": False,
+        "running_mode": None,
+    }
+    swing_features = {
+        "adx_4h": 26.0,
+        "ema_dist_frac_1h": 0.008,
+        "bb_width_1h_pct": 35.0,
+        "vol_ratio_1h": 1.4,
+        "bbwp_15m_pct": 50.0,
+        "bbwp_1h_pct": 55.0,
+        "bbwp_4h_pct": 70.0,
+        "atr_1h_pct": 0.020,
+        "atr_4h_pct": 0.020,
+        "rvol_15m": 1.3,
+        "running_active": False,
+        "running_mode": None,
+    }
+    pause_features = {
+        "adx_4h": 44.0,
+        "ema_dist_frac_1h": 0.030,
+        "bb_width_1h_pct": 95.0,
+        "vol_ratio_1h": 3.5,
+        "bbwp_15m_pct": 96.0,
+        "bbwp_1h_pct": 97.0,
+        "bbwp_4h_pct": 98.0,
+        "atr_1h_pct": 0.080,
+        "atr_4h_pct": 0.080,
+        "rvol_15m": 3.0,
+        "running_active": False,
+        "running_mode": None,
+    }
+
+    t0 = 1_700_000_000
+    st0 = brain._regime_router_state(pair, t0, intraday_features)
+    _require(st0.get("active_mode") == "intraday", "router should start in intraday mode")
+    _require(not bool(st0.get("switched")), "router should not report switch on first stable state")
+
+    st1 = brain._regime_router_state(pair, t0 + 900, pause_features)
+    _require(st1.get("active_mode") == "intraday", "router should wait for persistence before switching")
+    _require(st1.get("candidate_mode") == "pause", "router candidate should move to pause")
+    _require(int(st1.get("candidate_count", 0)) == 1, "router candidate count should increment")
+
+    st2 = brain._regime_router_state(pair, t0 + 1800, pause_features)
+    _require(st2.get("active_mode") == "pause", "router should switch to pause when no mode is eligible")
+    _require(bool(st2.get("switched")), "router should report pause handoff")
+
+    brain._reset_pair_runtime_state(pair)
+    running_intraday = dict(intraday_features)
+    running_intraday["running_active"] = True
+    running_intraday["running_mode"] = "intraday"
+    running_swing = dict(swing_features)
+    running_swing["running_active"] = True
+    running_swing["running_mode"] = "intraday"
+
+    st3 = brain._regime_router_state(pair, t0 + 2700, running_intraday)
+    _require(st3.get("active_mode") == "intraday", "running mode should remain intraday on first running tick")
+
+    st4 = brain._regime_router_state(pair, t0 + 3600, running_swing)
+    _require(st4.get("active_mode") == "intraday", "router must not switch mode while running inventory")
+    _require(
+        bool(st4.get("handoff_blocked_running_inventory")),
+        "router should mark handoff blocked while running inventory",
+    )
+    _require(st4.get("desired_mode") == "swing", "router should still report desired swing mode")
+
+    st5 = brain._regime_router_state(pair, t0 + 4500, swing_features)
+    _require(st5.get("active_mode") == "intraday", "router should require persistence before switching to swing")
+    st6 = brain._regime_router_state(pair, t0 + 5400, swing_features)
+    _require(st6.get("active_mode") == "swing", "router should switch to swing after persistence when not running")
+    _require(bool(st6.get("switched")), "router should report swing handoff")
+
+    brain.regime_router_force_mode = "pause"
+    st7 = brain._regime_router_state(pair, t0 + 6300, intraday_features)
+    _require(st7.get("active_mode") == "pause", "forced pause mode should override score-based selection")
+    _require(st7.get("target_reason") == "forced_mode", "forced mode reason should be explicit")
+
+    print("[regression] check: regime router mode selection + handoff OK")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help="Path to latest generated plan json")
@@ -415,6 +630,8 @@ def main() -> None:
     check_recent_plan_history(plan_path)
     check_plan_schema_and_feature_outputs(plan)
     check_ml_overlay_behavior()
+    check_adx_hysteresis_behavior()
+    check_mode_router_handoff_behavior()
     check_executor_action_semantics(plan, args.state_out, args.quote_budget, args.maker_fee_pct)
     check_weighted_ladder_and_simulator(plan, args.quote_budget, args.maker_fee_pct)
 
