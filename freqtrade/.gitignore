@@ -1,2 +1,30 @@
 # Intentionally permissive for full-repo backup portability.
 # Keep nearly everything tracked so this environment can be cloned and used on another machine.
+
+# Python cache / temp
+**/__pycache__/
+*.pyc
+*.pyo
+*.tmp
+
+# Backtest artifacts: keep pointer only
+user_data/backtest_results/**
+!user_data/backtest_results/.last_result.json
+
+# Grid plan snapshots: keep latest only
+user_data/grid_plans/**/grid_plan.*.json
+!user_data/grid_plans/**/grid_plan.latest.json
+
+# Walkforward artifacts: keep compact reports only
+user_data/walkforward/**
+!user_data/walkforward/**/
+!user_data/walkforward/**/summary.json
+!user_data/walkforward/**/windows.csv
+!user_data/walkforward/*AB_compare*.json
+
+# Explicitly ignore heavy per-window replay outputs / plan snapshots
+user_data/walkforward/**/window_*.result.json
+user_data/walkforward/**/window_*.result.events.csv
+user_data/walkforward/**/window_*.result.fills.csv
+user_data/walkforward/**/window_*.result.curve.csv
+user_data/walkforward/**/window_*_plans/**
