@@ -290,6 +290,9 @@ class GridBrainV1(IStrategy):
     _running_mode_by_pair: Dict[str, str] = {}
     _history_emit_in_progress_by_pair: Dict[str, bool] = {}
     _history_emit_end_ts_by_pair: Dict[str, int] = {}
+    _external_mode_thresholds_path_cache: Optional[str] = None
+    _external_mode_thresholds_mtime_cache: float = -1.0
+    _external_mode_thresholds_cache: Dict[str, Dict[str, float]] = {}
 
     # ========== Informative pairs ==========
     def informative_pairs(self):
@@ -447,12 +450,94 @@ class GridBrainV1(IStrategy):
             return "pause"
         return "intraday"
 
+    def _active_threshold_profile(self) -> str:
+        env_profile = str(os.getenv("GRID_REGIME_THRESHOLD_PROFILE", "") or "").strip().lower()
+        if env_profile in ("manual", "research_v1"):
+            return env_profile
+        return str(getattr(self, "regime_threshold_profile", "manual") or "manual").strip().lower()
+
+    def _external_mode_threshold_overrides(self) -> Dict[str, Dict[str, float]]:
+        path = str(os.getenv("GRID_MODE_THRESHOLDS_PATH", "") or "").strip()
+        if not path:
+            self._external_mode_thresholds_path_cache = None
+            self._external_mode_thresholds_mtime_cache = -1.0
+            self._external_mode_thresholds_cache = {}
+            return {}
+
+        try:
+            mtime = float(os.path.getmtime(path))
+        except Exception:
+            mtime = -1.0
+
+        if (
+            self._external_mode_thresholds_path_cache == path
+            and self._external_mode_thresholds_mtime_cache == mtime
+        ):
+            return dict(self._external_mode_thresholds_cache)
+
+        raw: Dict = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+        except Exception:
+            raw = {}
+
+        payload = raw.get("recommended_thresholds", raw)
+        out: Dict[str, Dict[str, float]] = {}
+
+        for mode in ("intraday", "swing"):
+            src = payload.get(mode, {}) if isinstance(payload, dict) else {}
+            if not isinstance(src, dict):
+                continue
+
+            normalized: Dict[str, float] = {}
+            for key_raw, val_raw in src.items():
+                key = str(key_raw).strip()
+                if not key:
+                    continue
+                if key in ("atr_source",):
+                    normalized[key] = str(val_raw).strip().lower()
+                    continue
+                if key in ("router_eligible",):
+                    normalized[key] = bool(val_raw)
+                    continue
+                fv = self._safe_float(val_raw)
+                if fv is None:
+                    continue
+                normalized[key] = float(fv)
+
+            # Optional shorthand compatibility from audit report schema.
+            if "bbwp_s_max" in normalized and "bbwp_s_enter_high" not in normalized:
+                normalized["bbwp_s_enter_high"] = float(normalized["bbwp_s_max"])
+            if "bbwp_m_max" in normalized and "bbwp_m_enter_high" not in normalized:
+                normalized["bbwp_m_enter_high"] = float(normalized["bbwp_m_max"])
+            if "bbwp_l_max" in normalized and "bbwp_l_enter_high" not in normalized:
+                normalized["bbwp_l_enter_high"] = float(normalized["bbwp_l_max"])
+            if "adx_exit_max" in normalized and "adx_exit_min" not in normalized:
+                normalized["adx_exit_min"] = float(normalized["adx_exit_max"])
+            if "adx_exit_min" in normalized and "adx_exit_max" not in normalized:
+                normalized["adx_exit_max"] = float(normalized["adx_exit_min"])
+            if "os_dev_persist_bars" in normalized:
+                normalized["os_dev_persist_bars"] = int(round(float(normalized["os_dev_persist_bars"])))
+            if "adx_rising_bars" in normalized:
+                normalized["adx_rising_bars"] = int(round(float(normalized["adx_rising_bars"])))
+            if "router_eligible" not in normalized:
+                normalized["router_eligible"] = True
+
+            out[mode] = normalized
+
+        self._external_mode_thresholds_path_cache = path
+        self._external_mode_thresholds_mtime_cache = mtime
+        self._external_mode_thresholds_cache = dict(out)
+        return out
+
     def _mode_threshold_overrides(self, mode_name: str) -> Dict[str, float]:
         mode = self._normalize_mode_name(mode_name)
-        profile = str(getattr(self, "regime_threshold_profile", "manual") or "manual").strip().lower()
+        profile = self._active_threshold_profile()
+        overrides: Dict[str, float] = {}
         if profile == "research_v1":
             if mode == "intraday":
-                return {
+                overrides = {
                     "adx_enter_max": 24.0,
                     "adx_exit_min": 30.0,
                     "adx_exit_max": 30.0,
@@ -476,8 +561,8 @@ class GridBrainV1(IStrategy):
                     "os_dev_rvol_max": 1.2,
                     "router_eligible": True,
                 }
-            if mode == "swing":
-                return {
+            elif mode == "swing":
+                overrides = {
                     "adx_enter_max": 30.0,
                     "adx_exit_min": 35.0,
                     "adx_exit_max": 35.0,
@@ -501,7 +586,10 @@ class GridBrainV1(IStrategy):
                     "os_dev_rvol_max": 1.5,
                     "router_eligible": True,
                 }
-        return {}
+        external = self._external_mode_threshold_overrides().get(mode, {})
+        if external:
+            overrides.update(external)
+        return overrides
 
     def _mode_threshold_block(self, mode_name: str) -> Dict[str, float]:
         mode = self._normalize_mode_name(mode_name)
@@ -3267,7 +3355,7 @@ class GridBrainV1(IStrategy):
                 "os_dev_rvol_ok": bool(os_dev_rvol_ok),
                 "os_dev_build_ok": bool(os_dev_build_ok),
                 "gate_profile": gate_profile,
-                "regime_threshold_profile": str(getattr(self, "regime_threshold_profile", "manual")),
+                "regime_threshold_profile": str(self._active_threshold_profile()),
                 "gate_pass_count": int(gate_pass_count),
                 "gate_total_count": int(gate_total_count),
                 "gate_pass_ratio": float(gate_pass_ratio),
@@ -3351,7 +3439,7 @@ class GridBrainV1(IStrategy):
                 },
                 "gating": {
                     "profile": gate_profile,
-                    "regime_threshold_profile": str(getattr(self, "regime_threshold_profile", "manual")),
+                    "regime_threshold_profile": str(self._active_threshold_profile()),
                     "active_mode": str(active_mode),
                     "start_min_gate_pass_ratio": float(gate_start_min_pass_ratio),
                     "adx_4h_max": float(gate_adx_4h_max),
@@ -3379,7 +3467,7 @@ class GridBrainV1(IStrategy):
                         if str(self.regime_router_force_mode or "").strip()
                         else None
                     ),
-                    "threshold_profile": str(getattr(self, "regime_threshold_profile", "manual")),
+                    "threshold_profile": str(self._active_threshold_profile()),
                     "allow_pause": bool(self.regime_router_allow_pause),
                     "switch_persist_bars": int(self.regime_router_switch_persist_bars),
                     "switch_cooldown_bars": int(self.regime_router_switch_cooldown_bars),

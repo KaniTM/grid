@@ -178,8 +178,13 @@ def run_compose_inner(
     root_dir: Path,
     service: str,
     inner_cmd: str,
+    env_exports: Optional[List[str]] = None,
     dry_run: bool = False,
 ) -> None:
+    if env_exports:
+        exports = [str(x).strip() for x in env_exports if str(x).strip()]
+        if exports:
+            inner_cmd = f"{'; '.join(exports)}; {inner_cmd}"
     cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
     print(f"[walkforward] $ {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
     if dry_run:
@@ -441,6 +446,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--run-id", default=None, help="Output subdir under user_data/walkforward")
     ap.add_argument("--service", default="freqtrade", help="docker compose service")
+    ap.add_argument("--regime-threshold-profile", default=None, help="Override profile via GRID_REGIME_THRESHOLD_PROFILE")
+    ap.add_argument("--mode-thresholds-path", default=None, help="Path to mode threshold overrides json (sets GRID_MODE_THRESHOLDS_PATH)")
     ap.add_argument("--skip-backtesting", action="store_true")
     ap.add_argument("--backtesting-extra", default="", help="Extra args appended to freqtrade backtesting command")
     ap.add_argument("--sim-extra", default="", help="Extra args appended to simulator command")
@@ -486,6 +493,22 @@ def main() -> int:
     out_dir = user_data_dir / "walkforward" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    env_exports: List[str] = []
+    if args.regime_threshold_profile:
+        env_exports.append(f"export GRID_REGIME_THRESHOLD_PROFILE={q(str(args.regime_threshold_profile).strip())}")
+    if args.mode_thresholds_path:
+        mode_path_input = str(args.mode_thresholds_path).strip()
+        mode_path_out = mode_path_input
+        mode_path_local = Path(mode_path_input)
+        if not mode_path_local.is_absolute():
+            mode_path_local = (root_dir / mode_path_local).resolve()
+        if mode_path_local.exists():
+            try:
+                mode_path_out = to_container_user_data_path(mode_path_local, user_data_dir)
+            except Exception:
+                mode_path_out = str(mode_path_local)
+        env_exports.append(f"export GRID_MODE_THRESHOLDS_PATH={q(mode_path_out)}")
+
     pair_fs = args.pair.replace("/", "_").replace(":", "_")
     src_plan_dir = user_data_dir / "grid_plans" / args.exchange / pair_fs
 
@@ -528,7 +551,13 @@ def main() -> int:
                 )
                 if args.backtesting_extra.strip():
                     backtesting_inner = f"{backtesting_inner} {args.backtesting_extra.strip()}"
-                run_compose_inner(root_dir, args.service, backtesting_inner, dry_run=args.dry_run)
+                run_compose_inner(
+                    root_dir,
+                    args.service,
+                    backtesting_inner,
+                    env_exports=env_exports,
+                    dry_run=args.dry_run,
+                )
 
             window_plan_dir = out_dir / f"window_{idx:03d}_plans"
             min_mtime_epoch = None if args.skip_backtesting else (window_started_epoch - 5.0)
@@ -578,7 +607,13 @@ def main() -> int:
             )
             if args.sim_extra.strip():
                 sim_inner = f"{sim_inner} {args.sim_extra.strip()}"
-            run_compose_inner(root_dir, args.service, sim_inner, dry_run=args.dry_run)
+            run_compose_inner(
+                root_dir,
+                args.service,
+                sim_inner,
+                env_exports=env_exports,
+                dry_run=args.dry_run,
+            )
 
             row.result_file = str(result_local)
             if not args.dry_run:

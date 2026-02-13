@@ -109,6 +109,13 @@ def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
         return False
 
 
+def _action_signature(action: str, sig: Tuple, stop_reason: Optional[str] = None) -> Tuple:
+    a = str(action or "HOLD").upper()
+    if a == "STOP":
+        return (a, sig, str(stop_reason or "plan_stop"))
+    return (a, sig)
+
+
 def quantize_price(exchange, symbol: str, price: float) -> float:
     if exchange is None:
         return float(price)
@@ -256,6 +263,10 @@ class GridExecutorV1:
         self._last_tp_price: Optional[float] = None
         self._last_sl_price: Optional[float] = None
         self._last_stop_reason: Optional[str] = None
+        self._last_raw_action: Optional[str] = None
+        self._last_effective_action: Optional[str] = None
+        self._last_action_suppression_reason: Optional[str] = None
+        self._last_effective_action_signature: Optional[Tuple] = None
 
         if self.mode == "ccxt":
             if ccxt is None:
@@ -634,7 +645,9 @@ class GridExecutorV1:
         if "range" not in plan or "grid" not in plan:
             raise KeyError("Plan schema mismatch: expected keys ['range','grid'].")
 
-        action = plan.get("action", "HOLD")
+        raw_action = str(plan.get("action", "HOLD")).upper()
+        if raw_action not in ("START", "HOLD", "STOP"):
+            raw_action = "HOLD"
         ex_name = plan.get("exchange", "unknown")
         symbol = plan.get("symbol", "UNKNOWN/UNKNOWN")
         self.symbol = symbol
@@ -668,23 +681,60 @@ class GridExecutorV1:
         self._last_sl_price = _safe_float(sl_price, default=None)
         self._last_stop_reason = None
 
-        if action != "STOP":
+        if raw_action != "STOP":
             if tp_price is not None and ref_price is not None and ref_price >= tp_price:
-                action = "STOP"
+                raw_action = "STOP"
                 self._last_stop_reason = "tp_hit"
             elif sl_price is not None and ref_price is not None and ref_price <= sl_price:
-                action = "STOP"
+                raw_action = "STOP"
                 self._last_stop_reason = "sl_hit"
 
         # Refresh balances (ccxt)
         if self.mode == "ccxt":
             self._sync_balance_ccxt()
             # Ingest fills and replenish before we make plan-adjust decisions
-            if action != "STOP":
+            if raw_action != "STOP":
                 self._ingest_trades_and_replenish(symbol, levels, limits)
 
+        rebuild = False
+        soft_adjust = False
+        if self._prev_plan is None:
+            rebuild = True
+        else:
+            sig_prev = plan_signature(self._prev_plan)
+            sig_new = plan_signature(plan)
+            if sig_prev != sig_new:
+                if soft_adjust_ok(self._prev_plan, plan):
+                    soft_adjust = True
+                else:
+                    rebuild = True
+
+        active_orders = [o for o in self._orders if o.status in ("open", "partial")]
+        has_active_orders = len(active_orders) > 0
+        plan_sig = plan_signature(plan)
+
+        effective_action = raw_action
+        suppression_reason: Optional[str] = None
+
+        if raw_action == "START" and has_active_orders and (not rebuild) and (not soft_adjust):
+            # START is a seed signal only; when a ladder is already live and unchanged, manage as HOLD.
+            effective_action = "HOLD"
+            suppression_reason = "duplicate_start_manage_existing"
+        elif raw_action == "STOP":
+            has_flatten_work = self.close_on_stop and self.base_total > 0.0
+            stop_sig = _action_signature("STOP", plan_sig, self._last_stop_reason or "plan_stop")
+            if (not has_active_orders) and (not has_flatten_work):
+                if self._last_effective_action_signature == stop_sig:
+                    # Duplicate STOP on already-cleared state: suppress churn.
+                    effective_action = "HOLD"
+                    suppression_reason = "duplicate_stop_already_cleared"
+
+        self._last_raw_action = raw_action
+        self._last_effective_action = effective_action
+        self._last_action_suppression_reason = suppression_reason
+
         # STOP: cancel all open orders (and optionally close)
-        if action == "STOP":
+        if effective_action == "STOP":
             if self._last_stop_reason is None:
                 self._last_stop_reason = "plan_stop"
 
@@ -720,33 +770,20 @@ class GridExecutorV1:
             self._orders = []
             self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
             self._prev_plan = plan
+            self._last_effective_action_signature = _action_signature(
+                "STOP", plan_sig, self._last_stop_reason or "plan_stop"
+            )
             return
 
         grid_budget_pct = float(plan.get("capital_policy", {}).get("grid_budget_pct", 1.0))
         grid_budget_pct = float(np.clip(grid_budget_pct, 0.0, 1.0))
 
-        rebuild = False
-        soft_adjust = False
-
-        if self._prev_plan is None:
-            rebuild = True
-        else:
-            sig_prev = plan_signature(self._prev_plan)
-            sig_new = plan_signature(plan)
-            if sig_prev != sig_new:
-                if soft_adjust_ok(self._prev_plan, plan):
-                    soft_adjust = True
-                else:
-                    rebuild = True
-
-        active_orders = [o for o in self._orders if o.status in ("open", "partial")]
-        has_active_orders = len(active_orders) > 0
-
         # HOLD: manage only existing ladder, never seed from empty.
-        if action == "HOLD":
+        if effective_action == "HOLD":
             if not has_active_orders:
                 self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
                 self._prev_plan = plan
+                self._last_effective_action_signature = _action_signature("HOLD", plan_sig)
                 return
 
             # Reprice existing orders when plan drift is soft-adjust eligible.
@@ -766,6 +803,7 @@ class GridExecutorV1:
 
             self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
             self._prev_plan = plan
+            self._last_effective_action_signature = _action_signature("HOLD", plan_sig)
             return
 
         # START: seed/rebuild/soft-adjust.
@@ -803,6 +841,7 @@ class GridExecutorV1:
 
         self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
         self._prev_plan = plan
+        self._last_effective_action_signature = _action_signature("START", plan_sig)
 
     def _write_state(self, plan: Dict, exchange_name: str, symbol: str, step: float, n_levels: int, box_low: float, box_high: float) -> None:
         q_res, b_res = self._reserved_balances_intent()
@@ -816,6 +855,9 @@ class GridExecutorV1:
             "tp_price": self._last_tp_price,
             "sl_price": self._last_sl_price,
             "stop_reason": self._last_stop_reason,
+            "raw_action": self._last_raw_action,
+            "effective_action": self._last_effective_action,
+            "action_suppression_reason": self._last_action_suppression_reason,
         }
 
         payload = ExecutorState(

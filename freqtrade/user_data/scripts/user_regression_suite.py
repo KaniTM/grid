@@ -276,12 +276,34 @@ def check_executor_action_semantics(plan: dict, state_out: str, quote_budget: fl
     start_orders = [o for o in ex._orders if o.status in ("open", "partial")]
     _require(len(start_orders) > 0, "START must seed orders")
 
+    ex.step(start_plan)
+    dup_start_orders = [o for o in ex._orders if o.status in ("open", "partial")]
+    _require(
+        len(dup_start_orders) == len(start_orders),
+        "duplicate START on unchanged live ladder must not reseed/rebuild",
+    )
+    _require(ex._last_raw_action == "START", "duplicate START should preserve raw action context")
+    _require(ex._last_effective_action == "HOLD", "duplicate START should be suppressed to HOLD")
+    _require(
+        ex._last_action_suppression_reason == "duplicate_start_manage_existing",
+        "duplicate START suppression reason mismatch",
+    )
+
     ex.step(hold_plan)
     hold_orders = [o for o in ex._orders if o.status in ("open", "partial")]
     _require(len(hold_orders) == len(start_orders), "HOLD with active ladder should manage existing orders")
 
     ex.step(stop_plan)
     _require(len(ex._orders) == 0, "STOP must clear all orders")
+    _require(ex._last_effective_action == "STOP", "first STOP should execute STOP semantics")
+
+    ex.step(stop_plan)
+    _require(ex._last_raw_action == "STOP", "duplicate STOP should preserve raw action context")
+    _require(ex._last_effective_action == "HOLD", "duplicate STOP on cleared ladder should suppress to HOLD")
+    _require(
+        ex._last_action_suppression_reason == "duplicate_stop_already_cleared",
+        "duplicate STOP suppression reason mismatch",
+    )
 
     # HOLD from cold start should not seed.
     ex2 = _base_paper_executor(state_out, quote_budget, maker_fee_pct)
@@ -324,25 +346,34 @@ def check_weighted_ladder_and_simulator(plan: dict, quote_budget: float, maker_f
             {"date": t0 + pd.Timedelta(minutes=15), "open": ref_price, "high": ref_price * 1.001, "low": ref_price * 0.995, "close": ref_price * 0.997, "volume": 1.0},
             {"date": t0 + pd.Timedelta(minutes=30), "open": ref_price * 0.997, "high": ref_price * 1.000, "low": ref_price * 0.994, "close": ref_price * 0.996, "volume": 1.0},
             {"date": t0 + pd.Timedelta(minutes=45), "open": ref_price * 0.996, "high": ref_price * 0.998, "low": ref_price * 0.990, "close": ref_price * 0.992, "volume": 1.0},
+            {"date": t0 + pd.Timedelta(minutes=60), "open": ref_price * 0.992, "high": ref_price * 0.995, "low": ref_price * 0.989, "close": ref_price * 0.991, "volume": 1.0},
         ]
     )
 
     p_start = _force_ref_inside_box(plan)
+    p_start_dup = _force_ref_inside_box(plan)
     p_hold = _force_ref_inside_box(plan)
     p_stop = _force_ref_inside_box(plan)
+    p_stop_dup = _force_ref_inside_box(plan)
     p_start["action"] = "START"
+    p_start_dup["action"] = "START"
     p_hold["action"] = "HOLD"
     p_stop["action"] = "STOP"
+    p_stop_dup["action"] = "STOP"
     p_start["_plan_time"] = t0
+    p_start_dup["_plan_time"] = t0 + pd.Timedelta(minutes=15)
     p_hold["_plan_time"] = t0 + pd.Timedelta(minutes=30)
     p_stop["_plan_time"] = t0 + pd.Timedelta(minutes=45)
+    p_stop_dup["_plan_time"] = t0 + pd.Timedelta(minutes=60)
     p_start["_plan_path"] = "regression_start"
+    p_start_dup["_plan_path"] = "regression_start_dup"
     p_hold["_plan_path"] = "regression_hold"
     p_stop["_plan_path"] = "regression_stop"
+    p_stop_dup["_plan_path"] = "regression_stop_dup"
 
     res = simulate_grid_replay(
         df=df,
-        plans=[p_start, p_hold, p_stop],
+        plans=[p_start, p_start_dup, p_hold, p_stop, p_stop_dup],
         start_quote=float(quote_budget),
         start_base=0.0,
         maker_fee_pct=float(maker_fee_pct),
@@ -353,11 +384,24 @@ def check_weighted_ladder_and_simulator(plan: dict, quote_budget: float, maker_f
     )
     summary = res.get("summary", {})
     _require(int(summary.get("seed_events", 0)) >= 1, "replay should seed on START")
-    _require(int(summary.get("stop_events", 0)) >= 1, "replay should stop on STOP")
+    _require(int(summary.get("stop_events", 0)) >= 1, "replay should stop on first STOP")
+    _require(int(summary.get("stop_events", 0)) == 1, "duplicate STOP on cleared ladder should be suppressed")
     acts = summary.get("actions", {}) or {}
     _require(int(acts.get("START", 0)) >= 1, "replay should process START action")
     _require(int(acts.get("HOLD", 0)) >= 1, "replay should process HOLD action")
     _require(int(acts.get("STOP", 0)) >= 1, "replay should process STOP action")
+    raw_acts = summary.get("raw_actions", {}) or {}
+    _require(int(raw_acts.get("START", 0)) >= 2, "raw replay stream should contain duplicate START signal")
+    _require(int(raw_acts.get("STOP", 0)) >= 2, "raw replay stream should contain duplicate STOP signal")
+    suppress = summary.get("action_suppression_counts", {}) or {}
+    _require(
+        int(suppress.get("duplicate_start_manage_existing", 0)) >= 1,
+        "replay should suppress duplicate START on unchanged live ladder",
+    )
+    _require(
+        int(suppress.get("duplicate_stop_already_cleared", 0)) >= 1,
+        "replay should suppress duplicate STOP on cleared ladder",
+    )
     _require(isinstance(summary.get("start_blocker_counts", {}), dict), "summary.start_blocker_counts must be a dict")
     _require(
         isinstance(summary.get("start_counterfactual_single_counts", {}), dict),
@@ -382,6 +426,9 @@ def check_weighted_ladder_and_simulator(plan: dict, quote_budget: float, maker_f
         "curve rows must include start_counterfactual_required_count",
     )
     _require("start_counterfactual_combo" in first_curve, "curve rows must include start_counterfactual_combo")
+    _require("raw_action" in first_curve, "curve rows must include raw_action")
+    _require("effective_action" in first_curve, "curve rows must include effective_action")
+    _require("action_suppression_reason" in first_curve, "curve rows must include action_suppression_reason")
 
     print("[regression] check: weighted ladder + simulator behavior OK")
 

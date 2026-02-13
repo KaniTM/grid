@@ -11,7 +11,7 @@ import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 
 def q(text: str) -> str:
@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out-dir", default=None, help="Local directory under user_data for outputs")
     ap.add_argument("--service", default="freqtrade")
     ap.add_argument("--emit-features-csv", action="store_true")
+    ap.add_argument("--emit-verbose", action="store_true", help="Emit per-candle verbose and transition event artifacts")
     ap.add_argument("--dry-run", action="store_true")
     return ap
 
@@ -67,9 +68,22 @@ def main() -> int:
     report_container = to_container_user_data_path(report_local, user_data_dir)
     features_local: Optional[Path] = None
     features_container: Optional[str] = None
+    verbose_local: Optional[Path] = None
+    verbose_container: Optional[str] = None
+    transitions_csv_local: Optional[Path] = None
+    transitions_csv_container: Optional[str] = None
+    transitions_json_local: Optional[Path] = None
+    transitions_json_container: Optional[str] = None
     if args.emit_features_csv:
         features_local = out_dir / "features.csv"
         features_container = to_container_user_data_path(features_local, user_data_dir)
+    if args.emit_verbose:
+        verbose_local = out_dir / "per_candle_verbose.csv"
+        verbose_container = to_container_user_data_path(verbose_local, user_data_dir)
+        transitions_csv_local = out_dir / "transition_events.csv"
+        transitions_csv_container = to_container_user_data_path(transitions_csv_local, user_data_dir)
+        transitions_json_local = out_dir / "transition_events.json"
+        transitions_json_container = to_container_user_data_path(transitions_json_local, user_data_dir)
 
     inner = (
         f"python /freqtrade/user_data/scripts/regime_audit_v1.py "
@@ -83,6 +97,12 @@ def main() -> int:
         inner = f"{inner} --timerange {q(args.timerange)}"
     if features_container:
         inner = f"{inner} --emit-features-csv {q(features_container)}"
+    if verbose_container:
+        inner = f"{inner} --emit-verbose-csv {q(verbose_container)}"
+    if transitions_csv_container:
+        inner = f"{inner} --emit-transitions-csv {q(transitions_csv_container)}"
+    if transitions_json_container:
+        inner = f"{inner} --emit-transitions-json {q(transitions_json_container)}"
 
     run_compose_inner(root_dir, args.service, inner, dry_run=args.dry_run)
     if args.dry_run:
@@ -107,12 +127,66 @@ def main() -> int:
     )
     print("[regime-audit] label_counts:", labels, flush=True)
     print("[regime-audit] recommended_thresholds:", json.dumps(rec, indent=2), flush=True)
+
+    mode_overrides: Dict[str, Dict[str, object]] = {}
+    for mode_name in ("intraday", "swing"):
+        src = rec.get(mode_name, {}) if isinstance(rec, dict) else {}
+        if not isinstance(src, dict):
+            continue
+        ov: Dict[str, object] = {}
+        if src.get("adx_enter_max") is not None:
+            ov["adx_enter_max"] = float(src["adx_enter_max"])
+        if src.get("adx_exit_max") is not None:
+            ov["adx_exit_min"] = float(src["adx_exit_max"])
+            ov["adx_exit_max"] = float(src["adx_exit_max"])
+        if src.get("bbw_1h_pct_max") is not None:
+            ov["bbw_1h_pct_max"] = float(src["bbw_1h_pct_max"])
+        if src.get("ema_dist_max_frac") is not None:
+            ov["ema_dist_max_frac"] = float(src["ema_dist_max_frac"])
+        if src.get("vol_spike_mult") is not None:
+            ov["vol_spike_mult"] = float(src["vol_spike_mult"])
+        if src.get("bbwp_s_max") is not None:
+            ov["bbwp_s_max"] = float(src["bbwp_s_max"])
+            ov["bbwp_s_enter_high"] = float(src["bbwp_s_max"])
+        if src.get("bbwp_m_max") is not None:
+            ov["bbwp_m_max"] = float(src["bbwp_m_max"])
+            ov["bbwp_m_enter_high"] = float(src["bbwp_m_max"])
+        if src.get("bbwp_l_max") is not None:
+            ov["bbwp_l_max"] = float(src["bbwp_l_max"])
+            ov["bbwp_l_enter_high"] = float(src["bbwp_l_max"])
+        if src.get("os_dev_rvol_max") is not None:
+            ov["os_dev_rvol_max"] = float(src["os_dev_rvol_max"])
+        if src.get("os_dev_persist_bars") is not None:
+            ov["os_dev_persist_bars"] = int(src["os_dev_persist_bars"])
+        ov["router_eligible"] = True
+        mode_overrides[mode_name] = ov
+
+    overrides_local = out_dir / "mode_threshold_overrides.json"
+    with overrides_local.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "source_report": str(report_local),
+                "recommended_thresholds": rec,
+                "intraday": mode_overrides.get("intraday", {}),
+                "swing": mode_overrides.get("swing", {}),
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+
     print(f"[regime-audit] wrote {report_local}", flush=True)
+    print(f"[regime-audit] wrote {overrides_local}", flush=True)
     if features_local:
         print(f"[regime-audit] wrote {features_local}", flush=True)
+    if verbose_local:
+        print(f"[regime-audit] wrote {verbose_local}", flush=True)
+    if transitions_csv_local:
+        print(f"[regime-audit] wrote {transitions_csv_local}", flush=True)
+    if transitions_json_local:
+        print(f"[regime-audit] wrote {transitions_json_local}", flush=True)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

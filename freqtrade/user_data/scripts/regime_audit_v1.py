@@ -298,6 +298,103 @@ def label_counts(df: pd.DataFrame, prefix: str) -> Dict[str, int]:
     }
 
 
+def add_verbose_states(feat: pd.DataFrame, prefixes: List[str]) -> pd.DataFrame:
+    out = feat.copy()
+    for prefix in prefixes:
+        f_abs = f"{prefix}_fwd_abs_ret"
+        f_span = f"{prefix}_fwd_span"
+        f_eff = f"{prefix}_fwd_eff"
+        range_col = f"{prefix}_range_label"
+        trend_col = f"{prefix}_trend_label"
+
+        valid_col = f"{prefix}_label_valid"
+        state_col = f"{prefix}_state"
+        transition_col = f"{prefix}_transition"
+        run_len_col = f"{prefix}_state_run_len"
+
+        out[valid_col] = (
+            pd.to_numeric(out[f_abs], errors="coerce").notna()
+            & pd.to_numeric(out[f_span], errors="coerce").notna()
+            & pd.to_numeric(out[f_eff], errors="coerce").notna()
+        )
+
+        state = np.where(
+            ~out[valid_col],
+            "unlabeled",
+            np.where(
+                out[trend_col] == 1,
+                "trend",
+                np.where(out[range_col] == 1, "range", "neutral"),
+            ),
+        )
+        out[state_col] = state
+
+        state_change = out[state_col] != out[state_col].shift(1)
+        valid_now = out[valid_col].astype(bool)
+        valid_prev = out[valid_col].shift(1)
+        valid_prev = valid_prev.where(valid_prev.notna(), False).astype(bool)
+        valid_change = valid_now & valid_prev
+        out[transition_col] = (state_change & valid_change).astype(int)
+
+        group_id = state_change.cumsum()
+        out[run_len_col] = out.groupby(group_id).cumcount() + 1
+    return out
+
+
+def extract_transition_events(
+    df: pd.DataFrame,
+    prefix: str,
+    feature_cols: List[str],
+) -> List[Dict[str, object]]:
+    state_col = f"{prefix}_state"
+    valid_col = f"{prefix}_label_valid"
+    run_len_col = f"{prefix}_state_run_len"
+    prev_state = df[state_col].shift(1)
+    prev_run_len = pd.to_numeric(df[run_len_col].shift(1), errors="coerce")
+    valid_now = df[valid_col].astype(bool)
+    valid_prev = df[valid_col].shift(1)
+    valid_prev = valid_prev.where(valid_prev.notna(), False).astype(bool)
+    changed = valid_now & valid_prev & (df[state_col] != prev_state)
+
+    events: List[Dict[str, object]] = []
+    for idx in df.index[changed]:
+        row = df.loc[idx]
+        from_state = str(prev_state.loc[idx])
+        to_state = str(row[state_col])
+        ev: Dict[str, object] = {
+            "date": pd.to_datetime(row["date"], utc=True),
+            "mode": str(prefix),
+            "from_state": from_state,
+            "to_state": to_state,
+            "from_to": f"{from_state}->{to_state}",
+            "prev_state_run_len_bars": int(prev_run_len.loc[idx]) if pd.notna(prev_run_len.loc[idx]) else None,
+            "to_state_run_len_bars": int(row[run_len_col]) if pd.notna(row[run_len_col]) else None,
+            f"{prefix}_fwd_abs_ret": float(row[f"{prefix}_fwd_abs_ret"]) if pd.notna(row[f"{prefix}_fwd_abs_ret"]) else None,
+            f"{prefix}_fwd_span": float(row[f"{prefix}_fwd_span"]) if pd.notna(row[f"{prefix}_fwd_span"]) else None,
+            f"{prefix}_fwd_eff": float(row[f"{prefix}_fwd_eff"]) if pd.notna(row[f"{prefix}_fwd_eff"]) else None,
+            f"{prefix}_range_label": int(row[f"{prefix}_range_label"]) if pd.notna(row[f"{prefix}_range_label"]) else None,
+            f"{prefix}_trend_label": int(row[f"{prefix}_trend_label"]) if pd.notna(row[f"{prefix}_trend_label"]) else None,
+        }
+        for col in feature_cols:
+            val = row[col] if col in row else None
+            if val is None or pd.isna(val):
+                ev[col] = None
+            else:
+                ev[col] = float(val)
+        events.append(ev)
+    return events
+
+
+def transition_counts(events: List[Dict[str, object]]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for ev in events:
+        key = str(ev.get("from_to") or "").strip()
+        if not key:
+            continue
+        out[key] = int(out.get(key, 0)) + 1
+    return {k: int(v) for k, v in sorted(out.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pair", required=True, help="e.g. ETH/USDT")
@@ -307,6 +404,9 @@ def main() -> None:
     ap.add_argument("--bbwp-lookback", type=int, default=252)
     ap.add_argument("--out", required=True, help="output json path")
     ap.add_argument("--emit-features-csv", default=None, help="optional feature dump csv path")
+    ap.add_argument("--emit-verbose-csv", default=None, help="optional per-candle verbose audit csv path")
+    ap.add_argument("--emit-transitions-csv", default=None, help="optional transition events csv path")
+    ap.add_argument("--emit-transitions-json", default=None, help="optional transition events json path")
     args = ap.parse_args()
 
     ohlcv_path = find_ohlcv_file(args.data_dir, args.pair, args.timeframe)
@@ -353,6 +453,8 @@ def main() -> None:
     if len(valid) == 0:
         raise ValueError("No valid rows after feature construction.")
 
+    verbose = add_verbose_states(valid, prefixes=["intraday", "swing"])
+
     intraday_defaults = {
         "adx_enter_max": 22.0,
         "adx_exit_max": 26.0,
@@ -382,6 +484,12 @@ def main() -> None:
     intraday_trend_mask = valid["intraday_trend_label"] == 1
     swing_range_mask = valid["swing_range_label"] == 1
     swing_trend_mask = valid["swing_trend_label"] == 1
+    intraday_events = extract_transition_events(verbose, "intraday", feature_cols)
+    swing_events = extract_transition_events(verbose, "swing", feature_cols)
+    all_events = sorted(
+        [*intraday_events, *swing_events],
+        key=lambda x: pd.Timestamp(x["date"]).value if x.get("date") is not None else 0,
+    )
 
     report = {
         "meta": {
@@ -419,6 +527,25 @@ def main() -> None:
             "intraday": label_counts(valid, "intraday"),
             "swing": label_counts(valid, "swing"),
         },
+        "state_counts": {
+            "intraday": {
+                "range": int((verbose["intraday_state"] == "range").sum()),
+                "trend": int((verbose["intraday_state"] == "trend").sum()),
+                "neutral": int((verbose["intraday_state"] == "neutral").sum()),
+                "unlabeled": int((verbose["intraday_state"] == "unlabeled").sum()),
+            },
+            "swing": {
+                "range": int((verbose["swing_state"] == "range").sum()),
+                "trend": int((verbose["swing_state"] == "trend").sum()),
+                "neutral": int((verbose["swing_state"] == "neutral").sum()),
+                "unlabeled": int((verbose["swing_state"] == "unlabeled").sum()),
+            },
+        },
+        "transition_counts": {
+            "intraday": transition_counts(intraday_events),
+            "swing": transition_counts(swing_events),
+            "total_events": int(len(all_events)),
+        },
         "feature_quantiles": {
             "intraday_range": feature_quantiles(valid, intraday_range_mask, feature_cols),
             "intraday_trend": feature_quantiles(valid, intraday_trend_mask, feature_cols),
@@ -449,18 +576,52 @@ def main() -> None:
             "rvol_15m",
             "intraday_range_label",
             "intraday_trend_label",
+            "intraday_fwd_abs_ret",
+            "intraday_fwd_span",
+            "intraday_fwd_eff",
+            "intraday_state",
+            "intraday_transition",
             "swing_range_label",
             "swing_trend_label",
+            "swing_fwd_abs_ret",
+            "swing_fwd_span",
+            "swing_fwd_eff",
+            "swing_state",
+            "swing_transition",
         ]
         os.makedirs(os.path.dirname(args.emit_features_csv), exist_ok=True)
-        valid[keep].to_csv(args.emit_features_csv, index=False)
+        verbose[keep].to_csv(args.emit_features_csv, index=False)
+
+    if args.emit_verbose_csv:
+        os.makedirs(os.path.dirname(args.emit_verbose_csv), exist_ok=True)
+        verbose.to_csv(args.emit_verbose_csv, index=False)
+
+    if args.emit_transitions_csv:
+        os.makedirs(os.path.dirname(args.emit_transitions_csv), exist_ok=True)
+        pd.DataFrame(all_events).to_csv(args.emit_transitions_csv, index=False)
+
+    if args.emit_transitions_json:
+        os.makedirs(os.path.dirname(args.emit_transitions_json), exist_ok=True)
+        payload: List[Dict[str, object]] = []
+        for ev in all_events:
+            item = dict(ev)
+            if isinstance(item.get("date"), pd.Timestamp):
+                item["date"] = item["date"].isoformat()
+            payload.append(item)
+        with open(args.emit_transitions_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
 
     print(f"Wrote regime audit report: {args.out}", flush=True)
     if args.emit_features_csv:
         print(f"Wrote feature dump: {args.emit_features_csv}", flush=True)
+    if args.emit_verbose_csv:
+        print(f"Wrote verbose per-candle dump: {args.emit_verbose_csv}", flush=True)
+    if args.emit_transitions_csv:
+        print(f"Wrote transition events csv: {args.emit_transitions_csv}", flush=True)
+    if args.emit_transitions_json:
+        print(f"Wrote transition events json: {args.emit_transitions_json}", flush=True)
     print("Recommended thresholds:", json.dumps(report["recommended_thresholds"], indent=2), flush=True)
 
 
 if __name__ == "__main__":
     main()
-

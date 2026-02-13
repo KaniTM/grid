@@ -226,6 +226,13 @@ def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
         return False
 
 
+def action_signature(action: str, sig: Tuple, stop_reason: Optional[str] = None) -> Tuple:
+    a = str(action or "HOLD").upper()
+    if a == "STOP":
+        return (a, sig, str(stop_reason or "PLAN_STOP"))
+    return (a, sig)
+
+
 def extract_exit_levels(plan: Dict) -> Tuple[Optional[float], Optional[float]]:
     tp = None
     sl = None
@@ -803,7 +810,9 @@ def simulate_grid_replay(
     active_plan: Optional[Dict] = None
     prev_plan: Optional[Dict] = None
 
-    action_counts: Dict[str, int] = {"START": 0, "HOLD": 0, "STOP": 0, "NO_PLAN": 0}
+    raw_action_counts: Dict[str, int] = {"START": 0, "HOLD": 0, "STOP": 0, "NO_PLAN": 0}
+    effective_action_counts: Dict[str, int] = {"START": 0, "HOLD": 0, "STOP": 0, "NO_PLAN": 0}
+    action_suppression_counts: Dict[str, int] = {}
     stop_count = 0
     seed_count = 0
     rebuild_count = 0
@@ -816,6 +825,7 @@ def simulate_grid_replay(
     hold_reason_counts: Dict[str, int] = {}
     stop_reason_counts: Dict[str, int] = {}
     stop_event_reason_counts: Dict[str, int] = {}
+    last_effective_action_signature: Optional[Tuple] = None
 
     for _, row in df.iterrows():
         dt = pd.Timestamp(row["date"])
@@ -849,7 +859,8 @@ def simulate_grid_replay(
             )
 
         if active_plan is None:
-            action_counts["NO_PLAN"] += 1
+            raw_action_counts["NO_PLAN"] += 1
+            effective_action_counts["NO_PLAN"] += 1
             curve.append(
                 {
                     "ts": ts,
@@ -860,6 +871,9 @@ def simulate_grid_replay(
                     "open_orders": len([x for x in open_orders if x.status == "open"]),
                     "stop": False,
                     "action": "NO_PLAN",
+                    "raw_action": "NO_PLAN",
+                    "effective_action": "NO_PLAN",
+                    "action_suppression_reason": None,
                     "plan_index": None,
                     "plan_time_utc": None,
                     "start_counterfactual_required_count": 0,
@@ -886,56 +900,31 @@ def simulate_grid_replay(
             ref_price = c
 
         tp_price, sl_price = extract_exit_levels(active_plan)
-        action = str(active_plan.get("action", "HOLD")).upper()
-        if action not in ("START", "HOLD", "STOP"):
-            action = "HOLD"
+        raw_action = str(active_plan.get("action", "HOLD")).upper()
+        if raw_action not in ("START", "HOLD", "STOP"):
+            raw_action = "HOLD"
 
         stop_reason: Optional[str] = None
-        if action != "STOP":
+        if raw_action != "STOP":
             if tp_price is not None and c >= tp_price:
-                action = "STOP"
+                raw_action = "STOP"
                 stop_reason = "STOP_OUT_TP"
             elif sl_price is not None and c <= sl_price:
-                action = "STOP"
+                raw_action = "STOP"
                 stop_reason = "STOP_OUT_SL"
             elif tp_price is None and sl_price is None:
                 if c > box_high + stop_out_steps * step or c < box_low - stop_out_steps * step:
-                    action = "STOP"
+                    raw_action = "STOP"
                     stop_reason = "STOP_OUT_BOX_BREAK"
 
-        action_counts[action] += 1
-        plan_start_block_reasons = extract_start_block_reasons(active_plan)
-        start_counterfactual = extract_start_counterfactual(
-            active_plan,
-            action=action,
-            start_block_reasons=plan_start_block_reasons,
-        )
-        cf_required = [str(x) for x in (start_counterfactual.get("required_blockers", []) or [])]
-        cf_required_count = int(start_counterfactual.get("required_count", 0) or 0)
-        cf_single = start_counterfactual.get("single_blocker")
-        cf_combo = start_counterfactual.get("combo_key")
-        cf_required_text = "|".join(cf_required)
-        if action != "START":
-            _increment_reasons(start_blocker_counts, plan_start_block_reasons)
-        if action == "HOLD":
-            _increment_reasons(hold_reason_counts, plan_start_block_reasons)
-            if cf_required:
-                _increment_reason(start_counterfactual_combo_counts, cf_combo, 1)
-                if len(cf_required) == 1:
-                    _increment_reason(start_counterfactual_single_counts, cf_single, 1)
-        plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=True)
-        if action == "STOP":
-            if not plan_stop_reason_flags:
-                plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=False)
-            _increment_reasons(stop_reason_counts, plan_stop_reason_flags)
-
+        plan_sig = plan_signature(active_plan)
         rebuild = False
         soft_adjust = False
         if prev_plan is None:
             rebuild = True
         else:
             sig_prev = plan_signature(prev_plan)
-            sig_new = plan_signature(active_plan)
+            sig_new = plan_sig
             if sig_prev != sig_new:
                 if soft_adjust_ok(prev_plan, active_plan):
                     soft_adjust = True
@@ -943,8 +932,65 @@ def simulate_grid_replay(
                     rebuild = True
 
         has_active_orders = any(o.status in ("open", "partial") for o in open_orders)
+        effective_action = raw_action
+        suppression_reason: Optional[str] = None
 
-        if action == "STOP":
+        if raw_action == "START" and has_active_orders and (not rebuild) and (not soft_adjust):
+            # START is seed-only; unchanged live ladders are managed under HOLD semantics.
+            effective_action = "HOLD"
+            suppression_reason = "duplicate_start_manage_existing"
+        elif raw_action == "STOP":
+            has_flatten_work = close_on_stop and base > 0.0
+            stop_sig = action_signature("STOP", plan_sig, stop_reason or "PLAN_STOP")
+            if (not has_active_orders) and (not has_flatten_work):
+                if last_effective_action_signature == stop_sig:
+                    # Duplicate STOP on already-cleared state: suppress churn.
+                    effective_action = "HOLD"
+                    suppression_reason = "duplicate_stop_already_cleared"
+
+        raw_action_counts[raw_action] += 1
+        effective_action_counts[effective_action] += 1
+        if suppression_reason is not None:
+            _increment_reason(action_suppression_counts, suppression_reason, 1)
+            events.append(
+                {
+                    "ts": ts,
+                    "type": "ACTION_SUPPRESS",
+                    "raw_action": raw_action,
+                    "effective_action": effective_action,
+                    "reason": suppression_reason,
+                    "plan_index": int(plan_idx),
+                    "plan_time_utc": str(active_plan.get("_plan_time")),
+                }
+            )
+
+        plan_start_block_reasons = extract_start_block_reasons(active_plan)
+        start_counterfactual = extract_start_counterfactual(
+            active_plan,
+            action=raw_action,
+            start_block_reasons=plan_start_block_reasons,
+        )
+        cf_required = [str(x) for x in (start_counterfactual.get("required_blockers", []) or [])]
+        cf_required_count = int(start_counterfactual.get("required_count", 0) or 0)
+        cf_single = start_counterfactual.get("single_blocker")
+        cf_combo = start_counterfactual.get("combo_key")
+        cf_required_text = "|".join(cf_required)
+        if raw_action != "START":
+            _increment_reasons(start_blocker_counts, plan_start_block_reasons)
+        if effective_action == "HOLD":
+            _increment_reasons(hold_reason_counts, plan_start_block_reasons)
+            _increment_reason(hold_reason_counts, suppression_reason, 1)
+            if cf_required:
+                _increment_reason(start_counterfactual_combo_counts, cf_combo, 1)
+                if len(cf_required) == 1:
+                    _increment_reason(start_counterfactual_single_counts, cf_single, 1)
+        plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=True)
+        if raw_action == "STOP":
+            if not plan_stop_reason_flags:
+                plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=False)
+            _increment_reasons(stop_reason_counts, plan_stop_reason_flags)
+
+        if effective_action == "STOP":
             stop_count += 1
             if stop_reason is None:
                 stop_reason = "PLAN_STOP"
@@ -985,7 +1031,10 @@ def simulate_grid_replay(
                     "equity": quote + base * c,
                     "open_orders": 0,
                     "stop": True,
-                    "action": action,
+                    "action": effective_action,
+                    "raw_action": raw_action,
+                    "effective_action": effective_action,
+                    "action_suppression_reason": suppression_reason,
                     "plan_index": int(plan_idx),
                     "plan_time_utc": str(active_plan.get("_plan_time")),
                     "start_counterfactual_required_count": cf_required_count,
@@ -996,9 +1045,12 @@ def simulate_grid_replay(
             )
 
             prev_plan = active_plan
+            last_effective_action_signature = action_signature(
+                "STOP", plan_sig, stop_reason or "PLAN_STOP"
+            )
             continue
 
-        if action == "HOLD":
+        if effective_action == "HOLD":
             if has_active_orders and soft_adjust:
                 for od in open_orders:
                     if od.status not in ("open", "partial"):
@@ -1130,7 +1182,10 @@ def simulate_grid_replay(
                 "equity": quote + base * c,
                 "open_orders": len(open_orders),
                 "stop": False,
-                "action": action,
+                "action": effective_action,
+                "raw_action": raw_action,
+                "effective_action": effective_action,
+                "action_suppression_reason": suppression_reason,
                 "plan_index": int(plan_idx),
                 "plan_time_utc": str(active_plan.get("_plan_time")),
                 "start_counterfactual_required_count": cf_required_count,
@@ -1141,6 +1196,7 @@ def simulate_grid_replay(
         )
 
         prev_plan = active_plan
+        last_effective_action_signature = action_signature(effective_action, plan_sig)
 
     last_close = float(df.iloc[-1]["close"])
     equity = quote + base * last_close
@@ -1174,7 +1230,11 @@ def simulate_grid_replay(
             "close_on_stop": bool(close_on_stop),
             "plans_total": int(len(plans)),
             "plans_switched": int(plan_switch_count),
-            "actions": action_counts,
+            "actions": effective_action_counts,
+            "raw_actions": raw_action_counts,
+            "effective_actions": effective_action_counts,
+            "action_suppression_counts": _sorted_reason_counts(action_suppression_counts),
+            "action_suppressed_total": int(sum(action_suppression_counts.values())),
             "stop_events": int(stop_count),
             "seed_events": int(seed_count),
             "rebuild_events": int(rebuild_count),
