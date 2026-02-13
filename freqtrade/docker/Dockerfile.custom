@@ -1,0 +1,10 @@
+ARG sourceimage=freqtradeorg/freqtrade
+ARG sourcetag=stable
+FROM ${sourceimage}:${sourcetag}
+
+# Install dependencies
+COPY requirements*.txt /freqtrade/
+COPY docs/requirements-docs.txt /freqtrade/
+
+RUN pip install --upgrade pip
+RUN pip install -r requirements-dev.txt --user --no-cache-dir

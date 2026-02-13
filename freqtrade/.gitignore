@@ -1,0 +1,66 @@
+# Local/private config
+config*.json
+.env
+.venv/
+
+# Databases / logs
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+logfile.txt
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.cache/
+build/
+dist/
+*.egg-info/
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Runtime/generated artifacts
+user_data/data/
+user_data/backtest_results/
+user_data/hyperopt_results/
+user_data/plot/
+user_data/logs/
+user_data/walkforward/
+user_data/models/
+user_data/freqaimodels/
+user_data/notebooks/
+user_data/*.result.json
+user_data/*.curve.csv
+user_data/*.fills.csv
+user_data/*.events.csv
+user_data/*.state.json
+
+# Keep project code and strategy sources in user_data
+!user_data/scripts/
+!user_data/scripts/**
+!user_data/strategies/
+!user_data/strategies/**
+!user_data/hyperopts/
+!user_data/hyperopts/**
+!user_data/grid_plans/
+!user_data/grid_plans/**
+!user_data/*.md
+!user_data/*.json.example
+
+# Keep user_data source dirs but still ignore caches
+user_data/scripts/**/__pycache__/
+user_data/strategies/**/__pycache__/
+user_data/scripts/**/*.pyc
+user_data/strategies/**/*.pyc
+
+# Freqtrade UI build artifacts
+freqtrade/rpc/api_server/ui/*
+
+# Local docker overrides
+docker-compose-*.yml

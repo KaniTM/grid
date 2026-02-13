@@ -1,0 +1,267 @@
+{
+  "action": "START",
+  "candle_time_utc": "2026-02-10T00:00:00+00:00",
+  "candle_ts": 1770681600,
+  "capital_policy": {
+    "grid_budget_pct": 0.7,
+    "mode": "QUOTE_ONLY",
+    "reserve_pct": 0.3
+  },
+  "exchange": "binance",
+  "exit": {
+    "enabled": true,
+    "sl_price": 1989.8816679068143,
+    "sl_step_multiple": 1.0,
+    "source": "box_plus_step_multiples",
+    "tp_price": 2163.0724347049863,
+    "tp_step_multiple": 0.75
+  },
+  "grid": {
+    "est_fee_pct": 0.002,
+    "est_spread_pct": 0.0005,
+    "gross_step_min_pct": 0.006500000000000001,
+    "n_levels": 11,
+    "post_only": true,
+    "rung_density_bias": {
+      "enabled": true,
+      "hvn_boost": 1.0,
+      "lvn_penalty": 0.4,
+      "source": "micro_vap_hvn_lvn",
+      "weight_max": 3.0,
+      "weight_min": 0.2,
+      "weights_by_level_index": [
+        0.4,
+        1.0476471489025379,
+        1.021025060584636,
+        1.0,
+        1.9229327694576435,
+        2.5703161921196838,
+        1.907259017625735,
+        1.0,
+        0.4,
+        3.0,
+        0.4,
+        0.4
+      ]
+    },
+    "step_pct_actual": 0.006536306881180745,
+    "step_price": 13.583589552797797,
+    "target_net_step_pct": 0.004
+  },
+  "notes": {
+    "brain_mode": "deterministic_v1",
+    "expect_0_trades_in_freqtrade": true,
+    "ml": "freqai_placeholders_present"
+  },
+  "price_ref": {
+    "close": 2110.3,
+    "vwap_15m": 2077.9210599581215
+  },
+  "range": {
+    "high": 2152.884742540388,
+    "lookback_bars_used": 48,
+    "low": 2003.465257459612,
+    "micro_vap": {
+      "bins": 64,
+      "bottom_void": 0.547830820929398,
+      "enabled": true,
+      "hvn_levels": [
+        2086.346378090355,
+        2093.350416453516,
+        2116.6972109973876,
+        2119.0318904517744,
+        2126.0359288149357,
+        2130.70528772371
+      ],
+      "lookback_bars": 96,
+      "lvn_levels": [
+        2004.6325971868055,
+        2006.9672766411927,
+        2009.30195609558,
+        2011.636635549967,
+        2013.971315004354,
+        2018.6406739131285
+      ],
+      "poc": 2126.0359288149357,
+      "poc_vrvp_dist_steps": 0.6431467382740818,
+      "top_void": 0.8764534115262815,
+      "void_slope": 0.8764534115262815
+    },
+    "pad": 5.154742540387805,
+    "quartiles": {
+      "q1": 2040.8201287298061,
+      "q2": 2078.175,
+      "q3": 2115.529871270194
+    },
+    "volume_profile": {
+      "bins": 48,
+      "box_ok": true,
+      "box_shift_applied": 0.0,
+      "lookback_bars": 96,
+      "poc": 2117.2996875,
+      "poc_dist_frac_after_shift": 0.0,
+      "poc_inside_box": true,
+      "vah": 2133.239375,
+      "val": 2046.295625,
+      "value_area_pct": 0.7
+    },
+    "width_pct": 0.0718993756929882
+  },
+  "risk": {
+    "fast_stop_step_multiple": 1.0,
+    "min_runtime_blocked_stop": false,
+    "range_shift_stop_pct": 0.007,
+    "sl_price": 1989.8816679068143,
+    "stop_confirm_bars": 2,
+    "stop_policy": "DANGER_TO_QUOTE",
+    "stop_reasons": {
+      "close_outside_dn": false,
+      "close_outside_up": false,
+      "fast_outside_dn": false,
+      "fast_outside_up": false,
+      "lower_edge_lvn": true,
+      "lvn_corridor_stop_dn": false,
+      "lvn_corridor_stop_override": false,
+      "lvn_corridor_stop_up": false,
+      "lvn_corridor_width": 13.583589552797797,
+      "os_dev_trend_stop": false,
+      "range_shift_frac": null,
+      "range_shift_stop": false,
+      "squeeze_release_break_stop": false,
+      "two_consecutive_outside_dn": false,
+      "two_consecutive_outside_up": false,
+      "upper_edge_lvn": false
+    },
+    "stop_rule_triggered": false,
+    "stop_rule_triggered_raw": false,
+    "tp_price": 2163.0724347049863
+  },
+  "runtime_state": {
+    "active_since_ts": null,
+    "active_since_utc": null,
+    "clock_time_utc": "2026-02-10T00:00:00+00:00",
+    "clock_ts": 1770681600,
+    "cooldown_active": false,
+    "cooldown_until_ts": null,
+    "cooldown_until_utc": null,
+    "reclaim_active": false,
+    "reclaim_until_ts": null,
+    "reclaim_until_utc": null,
+    "running": false,
+    "runtime_secs": null,
+    "start_blocked": false,
+    "start_signal": false
+  },
+  "signals": {
+    "adx_4h": 26.116785110585933,
+    "bb_width_15m": 0.017986525595135437,
+    "bb_width_1h": 0.07221679845359456,
+    "bb_width_4h": 0.0576708241197871,
+    "bb_width_nonexpanding_1h": true,
+    "bbwp_15m_pct": 31.349206349206348,
+    "bbwp_1h_pct": 99.20634920634922,
+    "bbwp_4h_pct": 0.7936507936507936,
+    "bbwp_allow": false,
+    "bbwp_cooloff": true,
+    "bbwp_gate_ok": false,
+    "bbwp_veto": true,
+    "ema100_1h": 2093.0486212188885,
+    "ema50_1h": 2083.576204150132,
+    "ema_dist_frac_1h": 0.0044886589910232595,
+    "inside_7d": true,
+    "micro_hvn_levels": [
+      2086.346378090355,
+      2093.350416453516,
+      2116.6972109973876,
+      2119.0318904517744,
+      2126.0359288149357,
+      2130.70528772371
+    ],
+    "micro_lvn_levels": [
+      2004.6325971868055,
+      2006.9672766411927,
+      2009.30195609558,
+      2011.636635549967,
+      2013.971315004354,
+      2018.6406739131285
+    ],
+    "micro_poc": 2126.0359288149357,
+    "micro_poc_vrvp_dist_steps": 0.6431467382740818,
+    "micro_vap_ok": true,
+    "micro_void_slope": 0.8764534115262815,
+    "ml_confidence": null,
+    "os_dev_build_ok": false,
+    "os_dev_candidate_count": 1,
+    "os_dev_norm": 0.42999746629609004,
+    "os_dev_raw": 1,
+    "os_dev_rvol_ok": true,
+    "os_dev_state": 0,
+    "os_dev_zero_persist_bars": 1,
+    "p_breakout": null,
+    "p_range": null,
+    "rsi_15m": 50.77927937684484,
+    "rule_range_ok": false,
+    "rvol_15m": 0.4874855372521349,
+    "squeeze_gate_ok": false,
+    "squeeze_on_1h": false,
+    "squeeze_released_1h": false,
+    "vol_ratio_1h": 0.47644579751191896,
+    "vrvp_box_ok": true,
+    "vwap_15m": 2077.9210599581215
+  },
+  "symbol": "ETH/USDT",
+  "timeframes": {
+    "exec": "15m",
+    "regime": "4h",
+    "signal": "1h"
+  },
+  "ts": "2026-02-12T16:07:34.157993+00:00",
+  "update_policy": {
+    "bbwp": {
+      "cooloff_release_m": 60.0,
+      "cooloff_release_s": 50.0,
+      "cooloff_trigger_pct": 98.0,
+      "enabled": true,
+      "l_max": 60.0,
+      "m_max": 50.0,
+      "s_max": 35.0,
+      "veto_pct": 90.0
+    },
+    "event_driven": true,
+    "exec_candle_check": true,
+    "micro_vap": {
+      "bins": 64,
+      "enabled": true,
+      "extrema_count": 6,
+      "hvn_quantile": 0.8,
+      "lookback_bars": 96,
+      "lvn_corridor_steps": 1.0,
+      "lvn_quantile": 0.2,
+      "void_slope_threshold": 0.55
+    },
+    "os_dev": {
+      "enabled": true,
+      "n_strike": 2,
+      "persist_bars": 48,
+      "range_band": 0.35,
+      "rvol_max": 1.2
+    },
+    "rung_bias": {
+      "hvn_boost": 1.0,
+      "lvn_penalty": 0.4,
+      "weight_max": 3.0,
+      "weight_min": 0.2
+    },
+    "runtime_controls": {
+      "cooldown_minutes": 90,
+      "min_runtime_hours": 3.0,
+      "min_runtime_secs": 10800,
+      "reclaim_hours": 8.0
+    },
+    "soft_adjust_max_step_frac": 0.5,
+    "squeeze": {
+      "enabled": true,
+      "kc_atr_mult": 1.5
+    }
+  }
+}

@@ -1,0 +1,1354 @@
+import argparse
+import json
+import os
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------
+# Helpers: load OHLCV from freqtrade data directory
+# -----------------------------
+def find_ohlcv_file(data_dir: str, pair: str, timeframe: str) -> str:
+    """
+    Locate OHLCV file for pair/timeframe under user_data/data/<exchange>/...
+    Supports: .feather, .parquet, .json, .json.gz, .csv, .csv.gz
+    """
+    pair_fs = pair.replace("/", "_").replace(":", "_")
+    candidates = []
+    for root, _, files in os.walk(data_dir):
+        for fn in files:
+            low = fn.lower()
+            if pair_fs.lower() in low and f"-{timeframe}".lower() in low:
+                candidates.append(os.path.join(root, fn))
+    if not candidates:
+        raise FileNotFoundError(f"No OHLCV file found for {pair} {timeframe} under {data_dir}")
+
+    pref = [".feather", ".parquet", ".json.gz", ".json", ".csv.gz", ".csv"]
+    candidates.sort(key=lambda p: next((i for i, ext in enumerate(pref) if p.lower().endswith(ext)), 999))
+    return candidates[0]
+
+
+def load_ohlcv(path: str) -> pd.DataFrame:
+    low = path.lower()
+    if low.endswith(".feather"):
+        df = pd.read_feather(path)
+    elif low.endswith(".parquet"):
+        df = pd.read_parquet(path)
+    elif low.endswith(".json.gz"):
+        df = pd.read_json(path, compression="gzip")
+    elif low.endswith(".json"):
+        df = pd.read_json(path)
+    elif low.endswith(".csv.gz"):
+        df = pd.read_csv(path, compression="gzip")
+    elif low.endswith(".csv"):
+        df = pd.read_csv(path)
+    else:
+        raise ValueError(f"Unsupported file format: {path}")
+
+    # Normalize column names
+    cols = {c.lower(): c for c in df.columns}
+    date_col = cols.get("date") or cols.get("timestamp") or cols.get("datetime")
+    if not date_col:
+        raise ValueError(f"Could not find date/timestamp column in {path}. Columns: {df.columns.tolist()}")
+
+    df = df.rename(columns={date_col: "date"})
+    for c in ["open", "high", "low", "close", "volume"]:
+        # case-insensitive rename
+        if c not in df.columns:
+            real = cols.get(c)
+            if real:
+                df = df.rename(columns={real: c})
+        else:
+            # ensure exact
+            for real in list(df.columns):
+                if real.lower() == c and real != c:
+                    df = df.rename(columns={real: c})
+
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+    return df
+
+
+def filter_timerange(df: pd.DataFrame, timerange: Optional[str]) -> pd.DataFrame:
+    """
+    timerange like: 20260101-20260201 (inclusive start, exclusive end)
+    """
+    if not timerange:
+        return df
+    if "-" not in timerange:
+        raise ValueError("timerange must look like YYYYMMDD-YYYYMMDD")
+    a, b = timerange.split("-", 1)
+    start = pd.to_datetime(a, format="%Y%m%d", utc=True)
+    end = pd.to_datetime(b, format="%Y%m%d", utc=True)
+    return df[(df["date"] >= start) & (df["date"] < end)].reset_index(drop=True)
+
+
+def parse_start_at(start_at: Optional[str], plan: Dict) -> Optional[pd.Timestamp]:
+    """
+    start_at:
+      - None -> no filtering
+      - "plan" -> use plan["candle_time_utc"] (preferred) or plan["candle_ts"]
+      - "YYYYMMDD" or "YYYYMMDDHHMM"
+      - ISO timestamp (e.g. 2026-02-09T17:21:00Z)
+    """
+    if not start_at:
+        return None
+
+    s = start_at.strip().lower()
+    if s == "plan":
+        ct = plan.get("candle_time_utc")
+        if ct:
+            try:
+                return pd.to_datetime(ct, utc=True)
+            except Exception:
+                pass
+        cts = plan.get("candle_ts")
+        if cts is not None:
+            try:
+                return pd.to_datetime(int(cts), unit="s", utc=True)
+            except Exception:
+                pass
+        # fallback: plan["ts"] (write time, not candle time)
+        pts = plan.get("ts")
+        if pts:
+            try:
+                return pd.to_datetime(pts, utc=True)
+            except Exception:
+                pass
+        return None
+
+    # numeric formats
+    if s.isdigit():
+        if len(s) == 8:
+            return pd.to_datetime(s, format="%Y%m%d", utc=True)
+        if len(s) == 12:
+            return pd.to_datetime(s, format="%Y%m%d%H%M", utc=True)
+
+    # ISO-ish
+    try:
+        return pd.to_datetime(start_at, utc=True)
+    except Exception:
+        raise ValueError("Unsupported --start-at. Use 'plan', YYYYMMDD, YYYYMMDDHHMM, or ISO timestamp.")
+
+
+# -----------------------------
+# Grid Simulator
+# -----------------------------
+@dataclass
+class OrderSim:
+    side: str          # "buy" or "sell"
+    price: float
+    qty_base: float
+    level_index: int   # rung index
+    status: str = "open"
+
+
+@dataclass
+class FillSim:
+    ts_utc: str
+    side: str
+    price: float
+    qty_base: float
+    fee_quote: float
+    reason: str
+
+
+def build_levels(box_low: float, box_high: float, n_levels: int) -> np.ndarray:
+    if n_levels <= 0:
+        return np.array([])
+    return np.linspace(box_low, box_high, n_levels + 1)
+
+
+def _safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def extract_rung_weights(plan: Dict, n_levels: int) -> Optional[List[float]]:
+    try:
+        g = plan.get("grid", {}) or {}
+        rb = g.get("rung_density_bias", {}) or {}
+        ws = rb.get("weights_by_level_index")
+        if ws is None:
+            return None
+        vals = [max(float(x), 0.0) for x in ws]
+        if len(vals) != n_levels + 1:
+            return None
+        if not any(v > 0 for v in vals):
+            return None
+        return vals
+    except Exception:
+        return None
+
+
+def normalized_side_weights(indices: List[int], rung_weights: Optional[List[float]]) -> List[float]:
+    if not indices:
+        return []
+    if rung_weights is None:
+        return [1.0 / len(indices)] * len(indices)
+    vals = [max(float(rung_weights[i]), 0.0) if 0 <= i < len(rung_weights) else 0.0 for i in indices]
+    s = float(sum(vals))
+    if s <= 0:
+        return [1.0 / len(indices)] * len(indices)
+    return [float(v / s) for v in vals]
+
+
+def plan_signature(plan: Dict) -> Tuple:
+    r = plan["range"]
+    g = plan["grid"]
+    return (
+        round(float(r["low"]), 12),
+        round(float(r["high"]), 12),
+        int(g["n_levels"]),
+        round(float(g["step_price"]), 12),
+    )
+
+
+def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
+    try:
+        prev_low = float(prev_plan["range"]["low"])
+        prev_high = float(prev_plan["range"]["high"])
+        new_low = float(new_plan["range"]["low"])
+        new_high = float(new_plan["range"]["high"])
+        step = float(new_plan["grid"]["step_price"])
+        frac = float(new_plan.get("update_policy", {}).get("soft_adjust_max_step_frac", 0.5))
+        tol = frac * step
+        return abs(new_low - prev_low) <= tol and abs(new_high - prev_high) <= tol
+    except Exception:
+        return False
+
+
+def extract_exit_levels(plan: Dict) -> Tuple[Optional[float], Optional[float]]:
+    tp = None
+    sl = None
+    try:
+        ex = plan.get("exit", {}) or {}
+        tp = _safe_float(ex.get("tp_price"), default=None)
+        sl = _safe_float(ex.get("sl_price"), default=None)
+    except Exception:
+        tp = None
+        sl = None
+
+    if tp is None or sl is None:
+        try:
+            rk = plan.get("risk", {}) or {}
+            if tp is None:
+                tp = _safe_float(rk.get("tp_price"), default=None)
+            if sl is None:
+                sl = _safe_float(rk.get("sl_price"), default=None)
+        except Exception:
+            pass
+
+    return tp, sl
+
+
+def plan_effective_time(plan: Dict) -> Optional[pd.Timestamp]:
+    ct = plan.get("candle_time_utc")
+    if ct:
+        try:
+            return pd.to_datetime(ct, utc=True)
+        except Exception:
+            pass
+
+    cts = plan.get("candle_ts")
+    if cts is not None:
+        try:
+            return pd.to_datetime(int(cts), unit="s", utc=True)
+        except Exception:
+            pass
+
+    pts = plan.get("ts")
+    if pts:
+        try:
+            return pd.to_datetime(pts, utc=True)
+        except Exception:
+            pass
+
+    return None
+
+
+def load_plan_sequence(plan_path: str, plans_dir: Optional[str] = None) -> List[Dict]:
+    """
+    Load and sort archived plan snapshots for replay.
+    Includes the provided plan file and all grid_plan.*.json files in the same directory.
+    """
+    base_dir = plans_dir or os.path.dirname(plan_path)
+    if not base_dir:
+        base_dir = "."
+
+    paths = {plan_path}
+    try:
+        for fn in os.listdir(base_dir):
+            if not fn.startswith("grid_plan.") or not fn.endswith(".json"):
+                continue
+            paths.add(os.path.join(base_dir, fn))
+    except Exception:
+        pass
+
+    loaded: List[Tuple[pd.Timestamp, float, str, Dict]] = []
+    for p in sorted(paths):
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                plan = json.load(f)
+        except Exception:
+            continue
+        if "range" not in plan or "grid" not in plan:
+            continue
+        pt = plan_effective_time(plan)
+        if pt is None:
+            continue
+        try:
+            mt = float(os.path.getmtime(p))
+        except Exception:
+            mt = 0.0
+        loaded.append((pt, mt, p, plan))
+
+    if not loaded:
+        raise FileNotFoundError(f"No valid plan snapshots found near: {plan_path}")
+
+    # Sort by effective time, then mtime/path; keep last snapshot per timestamp.
+    loaded.sort(key=lambda x: (x[0], x[1], x[2]))
+    dedup: Dict[int, Tuple[pd.Timestamp, float, str, Dict]] = {}
+    for item in loaded:
+        ts_key = int(item[0].value)
+        dedup[ts_key] = item
+
+    out: List[Dict] = []
+    for ts_key in sorted(dedup.keys()):
+        pt, mt, p, plan = dedup[ts_key]
+        cp = dict(plan)
+        cp["_plan_time"] = pt
+        cp["_plan_path"] = p
+        out.append(cp)
+    return out
+
+
+def _uniq_reasons(vals: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for v in vals:
+        k = str(v).strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out
+
+
+def _increment_reason(counter: Dict[str, int], reason: Optional[str], inc: int = 1) -> None:
+    if reason is None:
+        return
+    key = str(reason).strip()
+    if not key:
+        return
+    counter[key] = int(counter.get(key, 0)) + int(max(inc, 0))
+
+
+def _increment_reasons(counter: Dict[str, int], reasons: List[str]) -> None:
+    for r in reasons:
+        _increment_reason(counter, r, 1)
+
+
+def _sorted_reason_counts(counter: Dict[str, int]) -> Dict[str, int]:
+    return {k: int(v) for k, v in sorted(counter.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))}
+
+
+def extract_start_block_reasons(plan: Dict) -> List[str]:
+    diag = plan.get("diagnostics", {}) or {}
+    runtime = plan.get("runtime_state", {}) or {}
+    signals = plan.get("signals", {}) or {}
+
+    reasons: List[str] = []
+    for src in (diag.get("start_block_reasons"), runtime.get("start_block_reasons")):
+        if isinstance(src, list):
+            reasons.extend([str(x) for x in src if str(x).strip()])
+    if reasons:
+        return _uniq_reasons(reasons)
+
+    rr = signals.get("rule_range_fail_reasons")
+    if isinstance(rr, list):
+        reasons.extend([f"gate_fail:{x}" for x in rr if str(x).strip()])
+    if diag.get("price_in_box") is False:
+        reasons.append("price_outside_box")
+    if diag.get("rsi_ok") is False:
+        reasons.append("rsi_out_of_range")
+    if runtime.get("reclaim_active") is True:
+        reasons.append("reclaim_active")
+    if runtime.get("cooldown_active") is True:
+        reasons.append("cooldown_active")
+    if diag.get("stop_rule_triggered") is True:
+        reasons.append("stop_rule_active")
+    if diag.get("stop_rule_triggered_raw") is True and diag.get("stop_rule_triggered") is False:
+        reasons.append("stop_rule_suppressed_by_min_runtime")
+    return _uniq_reasons(reasons)
+
+
+def extract_start_counterfactual(
+    plan: Dict,
+    action: Optional[str] = None,
+    start_block_reasons: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    """
+    For HOLD candles, compute the minimal set of blockers that would need to
+    clear for START to be possible on that candle.
+    """
+    diag = plan.get("diagnostics", {}) or {}
+    runtime = plan.get("runtime_state", {}) or {}
+    signals = plan.get("signals", {}) or {}
+
+    act = str(action if action is not None else plan.get("action", "HOLD")).upper()
+    reasons = _uniq_reasons([str(x) for x in (start_block_reasons or extract_start_block_reasons(plan))])
+
+    gate_reasons = [
+        r
+        for r in reasons
+        if r == "gate_ratio_below_required" or r.startswith("gate_fail:") or r.startswith("core_gate_fail:")
+    ]
+
+    start_gate_ok_raw = diag.get("start_gate_ok")
+    if isinstance(start_gate_ok_raw, bool):
+        start_gate_ok = bool(start_gate_ok_raw)
+    else:
+        start_gate_ok = len(gate_reasons) == 0
+
+    if (not start_gate_ok) and (not gate_reasons):
+        rr = signals.get("rule_range_fail_reasons")
+        if isinstance(rr, list):
+            gate_reasons = [f"gate_fail:{str(x)}" for x in rr if str(x).strip()]
+        if not gate_reasons:
+            gate_reasons = ["start_gate_not_ok"]
+
+    price_in_box_raw = diag.get("price_in_box")
+    price_in_box = bool(price_in_box_raw) if isinstance(price_in_box_raw, bool) else ("price_outside_box" not in reasons)
+
+    rsi_ok_raw = diag.get("rsi_ok")
+    rsi_ok = bool(rsi_ok_raw) if isinstance(rsi_ok_raw, bool) else ("rsi_out_of_range" not in reasons)
+
+    start_signal_raw = runtime.get("start_signal", diag.get("start_signal"))
+    start_signal = bool(start_signal_raw) if isinstance(start_signal_raw, bool) else False
+
+    start_blocked_raw = runtime.get("start_blocked", diag.get("start_blocked"))
+    start_blocked = bool(start_blocked_raw) if isinstance(start_blocked_raw, bool) else False
+
+    reclaim_active_raw = runtime.get("reclaim_active")
+    reclaim_active = bool(reclaim_active_raw) if isinstance(reclaim_active_raw, bool) else ("reclaim_active" in reasons)
+
+    cooldown_active_raw = runtime.get("cooldown_active")
+    cooldown_active = bool(cooldown_active_raw) if isinstance(cooldown_active_raw, bool) else ("cooldown_active" in reasons)
+
+    required: List[str] = []
+    if not start_gate_ok:
+        required.extend(gate_reasons)
+    if not price_in_box:
+        required.append("price_outside_box")
+    if not rsi_ok:
+        required.append("rsi_out_of_range")
+    if start_signal and start_blocked:
+        if reclaim_active:
+            required.append("reclaim_active")
+        if cooldown_active:
+            required.append("cooldown_active")
+        if (not reclaim_active) and (not cooldown_active):
+            required.append("start_blocked")
+
+    required = _uniq_reasons(required)
+    combo_key = "+".join(required) if required else None
+    single = required[0] if len(required) == 1 else None
+
+    return {
+        "action": act,
+        "required_blockers": required,
+        "required_count": int(len(required)),
+        "single_blocker": single,
+        "combo_key": combo_key,
+    }
+
+
+def extract_stop_reason_flags(plan: Dict, applied_only: bool = True) -> List[str]:
+    diag = plan.get("diagnostics", {}) or {}
+    runtime = plan.get("runtime_state", {}) or {}
+
+    key = "stop_reason_flags_applied_active" if applied_only else "stop_reason_flags_raw_active"
+    reasons: List[str] = []
+    for src in (diag.get(key), runtime.get(key)):
+        if isinstance(src, list):
+            reasons.extend([str(x) for x in src if str(x).strip()])
+
+    if reasons:
+        return _uniq_reasons(reasons)
+
+    stop_reasons = (plan.get("risk", {}) or {}).get("stop_reasons", {}) or {}
+    for k, v in stop_reasons.items():
+        if isinstance(v, bool) and v:
+            reasons.append(str(k))
+    return _uniq_reasons(reasons)
+
+
+def build_desired_ladder(
+    levels: np.ndarray,
+    ref_price: float,
+    quote_total: float,
+    base_total: float,
+    maker_fee_pct: float,
+    grid_budget_pct: float,
+    max_orders_per_side: int = 40,
+    rung_weights: Optional[List[float]] = None,
+) -> List[OrderSim]:
+    buys: List[Tuple[int, float]] = []
+    sells: List[Tuple[int, float]] = []
+
+    for i, px in enumerate(levels):
+        px = float(px)
+        if px <= 0:
+            continue
+        if px <= ref_price:
+            buys.append((i, px))
+        elif base_total > 0:
+            sells.append((i, px))
+
+    if len(buys) > max_orders_per_side:
+        buys = buys[-max_orders_per_side:]
+    if len(sells) > max_orders_per_side:
+        sells = sells[:max_orders_per_side]
+
+    out: List[OrderSim] = []
+    fee = maker_fee_pct / 100.0
+    quote_budget = max(float(quote_total) * float(grid_budget_pct), 0.0)
+
+    if buys and quote_budget > 0:
+        side_w = normalized_side_weights([i for i, _ in buys], rung_weights)
+        for (i, px), w in zip(buys, side_w):
+            quote_per = quote_budget * float(w)
+            cost = quote_per / (1.0 + fee) if (1.0 + fee) > 0 else quote_per
+            qty = cost / px
+            if qty > 0:
+                out.append(OrderSim("buy", px, qty, i))
+
+    if sells and base_total > 0:
+        side_w = normalized_side_weights([i for i, _ in sells], rung_weights)
+        for (i, px), w in zip(sells, side_w):
+            qty = float(base_total) * float(w)
+            if qty > 0:
+                out.append(OrderSim("sell", px, qty, i))
+
+    return out
+
+
+def simulate_grid(
+    df: pd.DataFrame,
+    box_low: float,
+    box_high: float,
+    n_levels: int,
+    start_quote: float,
+    start_base: float,
+    maker_fee_pct: float,
+    stop_out_steps: int = 1,
+    touch_fill: bool = True,
+    tp_price: Optional[float] = None,
+    sl_price: Optional[float] = None,
+    rung_weights: Optional[List[float]] = None,
+) -> Dict:
+    """
+    Neutral-ish grid simulation (v1):
+    - Builds fixed levels in [box_low, box_high].
+    - Places initial BUY ladder below the first candle close (quote-only unless start_base > 0).
+    - If start_base > 0, it can place initial SELL ladder above price too (more market-maker-ish).
+    - Fills use OHLC touch:
+        buy fills if low <= price
+        sell fills if high >= price
+      (or reverse/cross mode if touch_fill=False)
+    - On buy fill -> place sell one rung above (same qty)
+    - On sell fill -> place buy one rung below (same qty)
+    - Stop-out if TP/SL level is crossed (if provided), otherwise fallback to
+      box break by stop_out_steps * step.
+    """
+    if df.empty:
+        raise ValueError("OHLCV dataframe is empty (timerange/filter may have removed all rows).")
+
+    levels = build_levels(box_low, box_high, n_levels)
+    if len(levels) < 2:
+        raise ValueError("Not enough levels. n_levels must be >= 1.")
+
+    step = float(levels[1] - levels[0])
+    fee = maker_fee_pct / 100.0
+
+    quote = float(start_quote)
+    base = float(start_base)
+
+    open_orders: List[OrderSim] = []
+    fills: List[FillSim] = []
+
+    curve = []
+
+    first_close = float(df.iloc[0]["close"])
+    initial_equity = quote + base * first_close
+
+    # -----------------------------
+    # Initial ladder
+    # -----------------------------
+    buy_idxs = [i for i, p in enumerate(levels) if p <= first_close]
+    if not buy_idxs:
+        buy_idxs = [0]
+
+    sell_idxs = []
+    if base > 0:
+        sell_idxs = [i for i, p in enumerate(levels) if p >= first_close]
+        if not sell_idxs:
+            sell_idxs = [n_levels]
+
+    if buy_idxs:
+        side_w = normalized_side_weights(buy_idxs, rung_weights)
+        for i, w in zip(buy_idxs, side_w):
+            px = float(levels[i])
+            if px <= 0:
+                continue
+            quote_per_order = quote * float(w)
+            qty = quote_per_order / px
+            if qty <= 0:
+                continue
+            open_orders.append(OrderSim(side="buy", price=px, qty_base=qty, level_index=i))
+
+    if sell_idxs and base > 0:
+        side_w = normalized_side_weights(sell_idxs, rung_weights)
+        for i, w in zip(sell_idxs, side_w):
+            px = float(levels[i])
+            if px <= 0:
+                continue
+            qty = base * float(w)
+            if qty <= 0:
+                continue
+            open_orders.append(OrderSim(side="sell", price=px, qty_base=qty, level_index=i))
+
+    # -----------------------------
+    # Simulation loop
+    # -----------------------------
+    for _, row in df.iterrows():
+        ts = row["date"].isoformat()
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+
+        # Stop-out check on close (prefer explicit TP/SL from plan when provided).
+        stop_reason = None
+        if tp_price is not None and c >= tp_price:
+            stop_reason = "STOP_OUT_TP"
+        elif sl_price is not None and c <= sl_price:
+            stop_reason = "STOP_OUT_SL"
+        elif c > box_high + stop_out_steps * step or c < box_low - stop_out_steps * step:
+            stop_reason = "STOP_OUT_BOX_BREAK"
+
+        if stop_reason is not None:
+            if base > 0:
+                proceeds = base * c
+                fee_quote = proceeds * fee
+                quote += proceeds - fee_quote
+                fills.append(FillSim(ts, "sell", c, base, fee_quote, stop_reason))
+                base = 0.0
+
+            for od in open_orders:
+                od.status = "canceled"
+            open_orders = []
+
+            curve.append({
+                "ts": ts,
+                "close": c,
+                "quote": quote,
+                "base": base,
+                "equity": quote + base * c,
+                "open_orders": 0,
+                "stop": True,
+            })
+            break
+
+        newly_filled: List[OrderSim] = []
+        remaining: List[OrderSim] = []
+
+        for od in open_orders:
+            if od.status != "open":
+                continue
+
+            if od.side == "buy":
+                fill = (l <= od.price) if touch_fill else (o > od.price and c < od.price)
+                if fill:
+                    cost = od.qty_base * od.price
+                    fee_quote = cost * fee
+                    if quote >= cost + fee_quote:
+                        quote -= (cost + fee_quote)
+                        base += od.qty_base
+                        od.status = "filled"
+                        fills.append(FillSim(ts, "buy", od.price, od.qty_base, fee_quote, "FILL"))
+                        newly_filled.append(od)
+                    else:
+                        remaining.append(od)
+                else:
+                    remaining.append(od)
+
+            else:  # sell
+                fill = (h >= od.price) if touch_fill else (o < od.price and c > od.price)
+                if fill:
+                    proceeds = od.qty_base * od.price
+                    fee_quote = proceeds * fee
+                    if base >= od.qty_base:
+                        base -= od.qty_base
+                        quote += (proceeds - fee_quote)
+                        od.status = "filled"
+                        fills.append(FillSim(ts, "sell", od.price, od.qty_base, fee_quote, "FILL"))
+                        newly_filled.append(od)
+                    else:
+                        remaining.append(od)
+                else:
+                    remaining.append(od)
+
+        open_orders = remaining
+
+        for od in newly_filled:
+            i = od.level_index
+            if od.side == "buy":
+                if i + 1 <= n_levels:
+                    sell_px = float(levels[i + 1])
+                    open_orders.append(OrderSim("sell", sell_px, od.qty_base, i + 1))
+            else:
+                if i - 1 >= 0:
+                    buy_px = float(levels[i - 1])
+                    open_orders.append(OrderSim("buy", buy_px, od.qty_base, i - 1))
+
+        curve.append({
+            "ts": ts,
+            "close": c,
+            "quote": quote,
+            "base": base,
+            "equity": quote + base * c,
+            "open_orders": len(open_orders),
+            "stop": False,
+        })
+
+    last_close = float(df.iloc[-1]["close"])
+    equity = quote + base * last_close
+
+    return {
+        "summary": {
+            "start_quote": start_quote,
+            "start_base": start_base,
+            "end_quote": quote,
+            "end_base": base,
+            "first_close": float(first_close),
+            "last_close": last_close,
+            "equity": equity,
+            "initial_equity": float(initial_equity),
+            "pnl_quote": float(equity - initial_equity),
+            "pnl_pct": float((equity / initial_equity - 1.0) * 100.0) if initial_equity > 0 else 0.0,
+            "box_low": box_low,
+            "box_high": box_high,
+            "n_levels": n_levels,
+            "step": step,
+            "maker_fee_pct": maker_fee_pct,
+            "stop_out_steps": stop_out_steps,
+            "touch_fill": touch_fill,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+        },
+        "fills": [asdict(x) for x in fills],
+        "open_orders": [asdict(x) for x in open_orders],
+        "curve": curve,
+    }
+
+
+def simulate_grid_replay(
+    df: pd.DataFrame,
+    plans: List[Dict],
+    start_quote: float,
+    start_base: float,
+    maker_fee_pct: float,
+    stop_out_steps: int = 1,
+    touch_fill: bool = True,
+    max_orders_per_side: int = 40,
+    close_on_stop: bool = False,
+) -> Dict:
+    """
+    Replay simulation across time-varying plan snapshots.
+    Semantics match executor v1:
+    - START seeds/rebuilds ladder (or soft-adjusts prices).
+    - HOLD manages existing ladder only; never seeds from empty.
+    - STOP cancels all open orders (optional flatten with close_on_stop).
+    """
+    if df.empty:
+        raise ValueError("OHLCV dataframe is empty (timerange/filter may have removed all rows).")
+    if not plans:
+        raise ValueError("No plans provided for replay simulation.")
+
+    fee = maker_fee_pct / 100.0
+    quote = float(start_quote)
+    base = float(start_base)
+
+    open_orders: List[OrderSim] = []
+    fills: List[FillSim] = []
+    curve: List[Dict] = []
+    events: List[Dict] = []
+
+    first_close = float(df.iloc[0]["close"])
+    initial_equity = quote + base * first_close
+
+    plan_idx = -1
+    active_plan: Optional[Dict] = None
+    prev_plan: Optional[Dict] = None
+
+    action_counts: Dict[str, int] = {"START": 0, "HOLD": 0, "STOP": 0, "NO_PLAN": 0}
+    stop_count = 0
+    seed_count = 0
+    rebuild_count = 0
+    soft_adjust_count = 0
+    plan_switch_count = 0
+    close_on_stop_count = 0
+    start_blocker_counts: Dict[str, int] = {}
+    start_counterfactual_single_counts: Dict[str, int] = {}
+    start_counterfactual_combo_counts: Dict[str, int] = {}
+    hold_reason_counts: Dict[str, int] = {}
+    stop_reason_counts: Dict[str, int] = {}
+    stop_event_reason_counts: Dict[str, int] = {}
+
+    for _, row in df.iterrows():
+        dt = pd.Timestamp(row["date"])
+        ts = dt.isoformat()
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+
+        switched = False
+        while (plan_idx + 1) < len(plans):
+            nxt = plans[plan_idx + 1]
+            ptime = nxt.get("_plan_time")
+            if ptime is None or ptime > dt:
+                break
+            plan_idx += 1
+            active_plan = nxt
+            switched = True
+
+        if switched and active_plan is not None:
+            plan_switch_count += 1
+            events.append(
+                {
+                    "ts": ts,
+                    "type": "PLAN_SWITCH",
+                    "plan_index": int(plan_idx),
+                    "plan_time_utc": str(active_plan.get("_plan_time")),
+                    "plan_path": active_plan.get("_plan_path"),
+                    "action": str(active_plan.get("action", "HOLD")).upper(),
+                }
+            )
+
+        if active_plan is None:
+            action_counts["NO_PLAN"] += 1
+            curve.append(
+                {
+                    "ts": ts,
+                    "close": c,
+                    "quote": quote,
+                    "base": base,
+                    "equity": quote + base * c,
+                    "open_orders": len([x for x in open_orders if x.status == "open"]),
+                    "stop": False,
+                    "action": "NO_PLAN",
+                    "plan_index": None,
+                    "plan_time_utc": None,
+                    "start_counterfactual_required_count": 0,
+                    "start_counterfactual_single": None,
+                    "start_counterfactual_combo": None,
+                    "start_counterfactual_required": "",
+                }
+            )
+            continue
+
+        if "range" not in active_plan or "grid" not in active_plan:
+            raise KeyError("Plan schema mismatch during replay: expected keys ['range','grid'].")
+
+        box_low = float(active_plan["range"]["low"])
+        box_high = float(active_plan["range"]["high"])
+        n_levels = int(active_plan["grid"]["n_levels"])
+        levels = build_levels(box_low, box_high, n_levels)
+        if len(levels) < 2:
+            raise ValueError("Not enough levels in replay plan (n_levels must be >= 1).")
+        step = float(levels[1] - levels[0])
+
+        ref_price = _safe_float((active_plan.get("price_ref", {}) or {}).get("close"), default=None)
+        if ref_price is None:
+            ref_price = c
+
+        tp_price, sl_price = extract_exit_levels(active_plan)
+        action = str(active_plan.get("action", "HOLD")).upper()
+        if action not in ("START", "HOLD", "STOP"):
+            action = "HOLD"
+
+        stop_reason: Optional[str] = None
+        if action != "STOP":
+            if tp_price is not None and c >= tp_price:
+                action = "STOP"
+                stop_reason = "STOP_OUT_TP"
+            elif sl_price is not None and c <= sl_price:
+                action = "STOP"
+                stop_reason = "STOP_OUT_SL"
+            elif tp_price is None and sl_price is None:
+                if c > box_high + stop_out_steps * step or c < box_low - stop_out_steps * step:
+                    action = "STOP"
+                    stop_reason = "STOP_OUT_BOX_BREAK"
+
+        action_counts[action] += 1
+        plan_start_block_reasons = extract_start_block_reasons(active_plan)
+        start_counterfactual = extract_start_counterfactual(
+            active_plan,
+            action=action,
+            start_block_reasons=plan_start_block_reasons,
+        )
+        cf_required = [str(x) for x in (start_counterfactual.get("required_blockers", []) or [])]
+        cf_required_count = int(start_counterfactual.get("required_count", 0) or 0)
+        cf_single = start_counterfactual.get("single_blocker")
+        cf_combo = start_counterfactual.get("combo_key")
+        cf_required_text = "|".join(cf_required)
+        if action != "START":
+            _increment_reasons(start_blocker_counts, plan_start_block_reasons)
+        if action == "HOLD":
+            _increment_reasons(hold_reason_counts, plan_start_block_reasons)
+            if cf_required:
+                _increment_reason(start_counterfactual_combo_counts, cf_combo, 1)
+                if len(cf_required) == 1:
+                    _increment_reason(start_counterfactual_single_counts, cf_single, 1)
+        plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=True)
+        if action == "STOP":
+            if not plan_stop_reason_flags:
+                plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=False)
+            _increment_reasons(stop_reason_counts, plan_stop_reason_flags)
+
+        rebuild = False
+        soft_adjust = False
+        if prev_plan is None:
+            rebuild = True
+        else:
+            sig_prev = plan_signature(prev_plan)
+            sig_new = plan_signature(active_plan)
+            if sig_prev != sig_new:
+                if soft_adjust_ok(prev_plan, active_plan):
+                    soft_adjust = True
+                else:
+                    rebuild = True
+
+        has_active_orders = any(o.status in ("open", "partial") for o in open_orders)
+
+        if action == "STOP":
+            stop_count += 1
+            if stop_reason is None:
+                stop_reason = "PLAN_STOP"
+            _increment_reason(stop_event_reason_counts, stop_reason, 1)
+            if not plan_stop_reason_flags:
+                _increment_reason(stop_reason_counts, f"event:{stop_reason}", 1)
+
+            for od in open_orders:
+                od.status = "canceled"
+            open_orders = []
+
+            if close_on_stop and base > 0:
+                proceeds = base * c
+                fee_quote = proceeds * fee
+                quote += proceeds - fee_quote
+                fills.append(FillSim(ts, "sell", c, base, fee_quote, stop_reason))
+                base = 0.0
+                close_on_stop_count += 1
+
+            events.append(
+                {
+                    "ts": ts,
+                    "type": "STOP",
+                    "reason": stop_reason,
+                    "reason_flags": [str(x) for x in plan_stop_reason_flags],
+                    "start_block_reasons": [str(x) for x in plan_start_block_reasons],
+                    "plan_index": int(plan_idx),
+                    "plan_time_utc": str(active_plan.get("_plan_time")),
+                }
+            )
+
+            curve.append(
+                {
+                    "ts": ts,
+                    "close": c,
+                    "quote": quote,
+                    "base": base,
+                    "equity": quote + base * c,
+                    "open_orders": 0,
+                    "stop": True,
+                    "action": action,
+                    "plan_index": int(plan_idx),
+                    "plan_time_utc": str(active_plan.get("_plan_time")),
+                    "start_counterfactual_required_count": cf_required_count,
+                    "start_counterfactual_single": cf_single,
+                    "start_counterfactual_combo": cf_combo,
+                    "start_counterfactual_required": cf_required_text,
+                }
+            )
+
+            prev_plan = active_plan
+            continue
+
+        if action == "HOLD":
+            if has_active_orders and soft_adjust:
+                for od in open_orders:
+                    if od.status not in ("open", "partial"):
+                        continue
+                    if od.level_index < 0 or od.level_index > n_levels:
+                        continue
+                    od.price = float(levels[od.level_index])
+                soft_adjust_count += 1
+                events.append(
+                    {
+                        "ts": ts,
+                        "type": "SOFT_ADJUST",
+                        "action": "HOLD",
+                        "plan_index": int(plan_idx),
+                    }
+                )
+
+        else:
+            need_seed = (not has_active_orders) or rebuild or (prev_plan is None)
+            if need_seed:
+                if has_active_orders:
+                    for od in open_orders:
+                        od.status = "canceled"
+                    open_orders = []
+                    rebuild_count += 1
+                    events.append(
+                        {
+                            "ts": ts,
+                            "type": "REBUILD",
+                            "plan_index": int(plan_idx),
+                        }
+                    )
+
+                desired = build_desired_ladder(
+                    levels=levels,
+                    ref_price=float(ref_price),
+                    quote_total=quote,
+                    base_total=base,
+                    maker_fee_pct=maker_fee_pct,
+                    grid_budget_pct=float((active_plan.get("capital_policy", {}) or {}).get("grid_budget_pct", 1.0)),
+                    max_orders_per_side=max_orders_per_side,
+                    rung_weights=extract_rung_weights(active_plan, n_levels),
+                )
+                open_orders = desired
+                seed_count += 1
+                events.append(
+                    {
+                        "ts": ts,
+                        "type": "SEED",
+                        "orders": len(desired),
+                        "plan_index": int(plan_idx),
+                    }
+                )
+            elif soft_adjust:
+                for od in open_orders:
+                    if od.status not in ("open", "partial"):
+                        continue
+                    if od.level_index < 0 or od.level_index > n_levels:
+                        continue
+                    od.price = float(levels[od.level_index])
+                soft_adjust_count += 1
+                events.append(
+                    {
+                        "ts": ts,
+                        "type": "SOFT_ADJUST",
+                        "action": "START",
+                        "plan_index": int(plan_idx),
+                    }
+                )
+
+        newly_filled: List[OrderSim] = []
+        remaining: List[OrderSim] = []
+
+        for od in open_orders:
+            if od.status != "open":
+                continue
+
+            if od.side == "buy":
+                fill = (l <= od.price) if touch_fill else (o > od.price and c < od.price)
+                if fill:
+                    cost = od.qty_base * od.price
+                    fee_quote = cost * fee
+                    if quote >= cost + fee_quote:
+                        quote -= (cost + fee_quote)
+                        base += od.qty_base
+                        od.status = "filled"
+                        fills.append(FillSim(ts, "buy", od.price, od.qty_base, fee_quote, "FILL"))
+                        newly_filled.append(od)
+                    else:
+                        remaining.append(od)
+                else:
+                    remaining.append(od)
+
+            else:
+                fill = (h >= od.price) if touch_fill else (o < od.price and c > od.price)
+                if fill:
+                    proceeds = od.qty_base * od.price
+                    fee_quote = proceeds * fee
+                    if base >= od.qty_base:
+                        base -= od.qty_base
+                        quote += (proceeds - fee_quote)
+                        od.status = "filled"
+                        fills.append(FillSim(ts, "sell", od.price, od.qty_base, fee_quote, "FILL"))
+                        newly_filled.append(od)
+                    else:
+                        remaining.append(od)
+                else:
+                    remaining.append(od)
+
+        open_orders = remaining
+
+        for od in newly_filled:
+            i = od.level_index
+            if od.side == "buy":
+                if i + 1 <= n_levels:
+                    sell_px = float(levels[i + 1])
+                    open_orders.append(OrderSim("sell", sell_px, od.qty_base, i + 1))
+            else:
+                if i - 1 >= 0:
+                    buy_px = float(levels[i - 1])
+                    open_orders.append(OrderSim("buy", buy_px, od.qty_base, i - 1))
+
+        curve.append(
+            {
+                "ts": ts,
+                "close": c,
+                "quote": quote,
+                "base": base,
+                "equity": quote + base * c,
+                "open_orders": len(open_orders),
+                "stop": False,
+                "action": action,
+                "plan_index": int(plan_idx),
+                "plan_time_utc": str(active_plan.get("_plan_time")),
+                "start_counterfactual_required_count": cf_required_count,
+                "start_counterfactual_single": cf_single,
+                "start_counterfactual_combo": cf_combo,
+                "start_counterfactual_required": cf_required_text,
+            }
+        )
+
+        prev_plan = active_plan
+
+    last_close = float(df.iloc[-1]["close"])
+    equity = quote + base * last_close
+
+    plan_times = [str(p.get("_plan_time")) for p in plans]
+    plan_paths = [str(p.get("_plan_path")) for p in plans]
+    stop_reason_counts_sorted = _sorted_reason_counts(stop_reason_counts)
+    stop_event_reason_counts_sorted = _sorted_reason_counts(stop_event_reason_counts)
+    combined_stop_reason_counts = dict(stop_reason_counts_sorted)
+    for k, v in stop_event_reason_counts_sorted.items():
+        ek = f"event:{k}"
+        combined_stop_reason_counts[ek] = int(combined_stop_reason_counts.get(ek, 0)) + int(v)
+    combined_stop_reason_counts = _sorted_reason_counts(combined_stop_reason_counts)
+
+    return {
+        "summary": {
+            "mode": "replay",
+            "start_quote": start_quote,
+            "start_base": start_base,
+            "end_quote": quote,
+            "end_base": base,
+            "first_close": float(first_close),
+            "last_close": last_close,
+            "equity": equity,
+            "initial_equity": float(initial_equity),
+            "pnl_quote": float(equity - initial_equity),
+            "pnl_pct": float((equity / initial_equity - 1.0) * 100.0) if initial_equity > 0 else 0.0,
+            "maker_fee_pct": maker_fee_pct,
+            "stop_out_steps": stop_out_steps,
+            "touch_fill": touch_fill,
+            "close_on_stop": bool(close_on_stop),
+            "plans_total": int(len(plans)),
+            "plans_switched": int(plan_switch_count),
+            "actions": action_counts,
+            "stop_events": int(stop_count),
+            "seed_events": int(seed_count),
+            "rebuild_events": int(rebuild_count),
+            "soft_adjust_events": int(soft_adjust_count),
+            "close_on_stop_events": int(close_on_stop_count),
+            "start_blocker_counts": _sorted_reason_counts(start_blocker_counts),
+            "start_counterfactual_single_counts": _sorted_reason_counts(start_counterfactual_single_counts),
+            "start_counterfactual_combo_counts": _sorted_reason_counts(start_counterfactual_combo_counts),
+            "hold_reason_counts": _sorted_reason_counts(hold_reason_counts),
+            "stop_reason_counts": stop_reason_counts_sorted,
+            "stop_event_reason_counts": stop_event_reason_counts_sorted,
+            "stop_reason_counts_combined": combined_stop_reason_counts,
+        },
+        "fills": [asdict(x) for x in fills],
+        "open_orders": [asdict(x) for x in open_orders],
+        "curve": curve,
+        "events": events,
+        "plan_times_utc": plan_times,
+        "plan_paths": plan_paths,
+    }
+
+
+def load_plan(plan_path: str) -> Dict:
+    with open(plan_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pair", required=True, help="e.g. ETH/USDT")
+    ap.add_argument("--timeframe", required=True, help="e.g. 15m or 1h (must match the OHLCV file you downloaded)")
+    ap.add_argument("--data-dir", default="/freqtrade/user_data/data", help="freqtrade data directory")
+    ap.add_argument("--plan", required=True, help="plan json path (grid_plan.latest.json)")
+    ap.add_argument("--replay-plans", action="store_true", help="Replay archived plan snapshots over candle time")
+    ap.add_argument("--plans-dir", default=None, help="Directory with archived grid_plan.*.json files (optional)")
+    ap.add_argument("--timerange", default=None, help="YYYYMMDD-YYYYMMDD (optional)")
+    ap.add_argument("--start-at", default=None, help="Start time: 'plan' or YYYYMMDD or YYYYMMDDHHMM or ISO timestamp")
+    ap.add_argument("--start-quote", type=float, default=1000.0)
+    ap.add_argument("--start-base", type=float, default=0.0)
+    ap.add_argument("--fee-pct", type=float, default=0.10)
+    ap.add_argument("--stop-out-steps", type=int, default=1)
+    ap.add_argument("--max-orders-per-side", type=int, default=40, help="Initial ladder cap per side in replay mode")
+    ap.add_argument("--close-on-stop", action="store_true", help="Flatten base inventory when STOP occurs")
+    ap.add_argument("--touch-fill", action="store_true", help="OHLC touch-fill model (default)")
+    ap.add_argument("--reverse-fill", action="store_true", help="reverse/cross-fill model (more strict)")
+    ap.add_argument("--out", default="/freqtrade/user_data/grid_sim_v1.result.json")
+    args = ap.parse_args()
+
+    touch_fill = True
+    if args.reverse_fill:
+        touch_fill = False
+    if args.touch_fill:
+        touch_fill = True
+
+    plan = load_plan(args.plan)
+    plan_sequence: Optional[List[Dict]] = None
+
+    if "range" not in plan or "grid" not in plan:
+        raise KeyError(
+            "Plan schema mismatch: expected keys ['range','grid'] from GridBrainV1.\n"
+            "Make sure --plan points to grid_plans/<exchange>/<pair>/grid_plan.latest.json"
+        )
+
+    # Warn if plan says exec TF != your OHLCV TF
+    plan_exec_tf = (plan.get("timeframes") or {}).get("exec")
+    if plan_exec_tf and plan_exec_tf != args.timeframe:
+        print(
+            f"[WARN] Plan exec timeframe is '{plan_exec_tf}' but you are simulating on '{args.timeframe}'.\n"
+            f"       This can be OK for rough testing, but fills/stop behavior will differ.\n",
+            flush=True,
+        )
+
+    if args.replay_plans:
+        plan_sequence = load_plan_sequence(args.plan, args.plans_dir)
+        if not plan_sequence:
+            raise ValueError("Replay mode requested but no valid plan snapshots were loaded.")
+
+    box_low = float(plan["range"]["low"])
+    box_high = float(plan["range"]["high"])
+    n_levels = int(plan["grid"]["n_levels"])
+    rung_weights = extract_rung_weights(plan, n_levels)
+    tp_price = None
+    sl_price = None
+    try:
+        ex = plan.get("exit", {}) or {}
+        if ex.get("tp_price") is not None:
+            tp_price = float(ex.get("tp_price"))
+        if ex.get("sl_price") is not None:
+            sl_price = float(ex.get("sl_price"))
+    except Exception:
+        tp_price = None
+        sl_price = None
+
+    if tp_price is None or sl_price is None:
+        try:
+            rk = plan.get("risk", {}) or {}
+            if tp_price is None and rk.get("tp_price") is not None:
+                tp_price = float(rk.get("tp_price"))
+            if sl_price is None and rk.get("sl_price") is not None:
+                sl_price = float(rk.get("sl_price"))
+        except Exception:
+            pass
+
+    ohlcv_path = find_ohlcv_file(args.data_dir, args.pair, args.timeframe)
+    df = load_ohlcv(ohlcv_path)
+    df = filter_timerange(df, args.timerange)
+
+    start_plan = plan
+    if args.replay_plans and plan_sequence:
+        if args.start_at is None:
+            start_at_ts = plan_sequence[0]["_plan_time"]
+        else:
+            if args.start_at.strip().lower() == "plan":
+                start_plan = plan_sequence[0]
+            start_at_ts = parse_start_at(args.start_at, start_plan)
+    else:
+        start_at_ts = parse_start_at(args.start_at, start_plan)
+
+    if start_at_ts is not None:
+        df = df[df["date"] >= start_at_ts].reset_index(drop=True)
+
+    if args.replay_plans:
+        if not plan_sequence:
+            raise ValueError("Replay mode requested but no plan sequence is available.")
+        res = simulate_grid_replay(
+            df=df,
+            plans=plan_sequence,
+            start_quote=args.start_quote,
+            start_base=args.start_base,
+            maker_fee_pct=args.fee_pct,
+            stop_out_steps=args.stop_out_steps,
+            touch_fill=touch_fill,
+            max_orders_per_side=args.max_orders_per_side,
+            close_on_stop=args.close_on_stop,
+        )
+    else:
+        res = simulate_grid(
+            df=df,
+            box_low=box_low,
+            box_high=box_high,
+            n_levels=n_levels,
+            start_quote=args.start_quote,
+            start_base=args.start_base,
+            maker_fee_pct=args.fee_pct,
+            stop_out_steps=args.stop_out_steps,
+            touch_fill=touch_fill,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            rung_weights=rung_weights,
+        )
+
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=2)
+
+    fills = pd.DataFrame(res["fills"])
+    csv_out = args.out.replace(".json", ".fills.csv")
+    fills.to_csv(csv_out, index=False)
+
+    curve = pd.DataFrame(res["curve"])
+    curve_out = args.out.replace(".json", ".curve.csv")
+    curve.to_csv(curve_out, index=False)
+
+    if "events" in res:
+        events = pd.DataFrame(res["events"])
+        events_out = args.out.replace(".json", ".events.csv")
+        events.to_csv(events_out, index=False)
+        print(f"Wrote events: {events_out}", flush=True)
+
+    print(f"Loaded OHLCV: {ohlcv_path}", flush=True)
+    print(f"Wrote result: {args.out}", flush=True)
+    print(f"Wrote fills:  {csv_out}", flush=True)
+    print(f"Wrote curve:  {curve_out}", flush=True)
+    print("Summary:", res["summary"], flush=True)
+
+
+if __name__ == "__main__":
+    main()

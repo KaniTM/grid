@@ -1,0 +1,100 @@
+{
+  "ts": 1770912556.6693072,
+  "exchange": "binance",
+  "symbol": "ETH/USDT",
+  "plan_ts": "2026-02-12T16:07:34.157993+00:00",
+  "mode": "paper",
+  "step": 13.583589552797797,
+  "n_levels": 11,
+  "box_low": 2003.465257459612,
+  "box_high": 2152.884742540388,
+  "quote_total": 1000.0,
+  "base_total": 0.0,
+  "quote_free": 300.0,
+  "base_free": 0.0,
+  "quote_reserved": 700.0,
+  "base_reserved": 0.0,
+  "runtime": {
+    "last_trade_ms": null,
+    "seen_trade_ids": 0,
+    "use_exchange_balance": true,
+    "mark_price": 2110.3,
+    "tp_price": 2163.0724347049863,
+    "sl_price": 1989.8816679068143,
+    "stop_reason": null
+  },
+  "orders": [
+    {
+      "side": "buy",
+      "price": 2003.465257459612,
+      "qty_base": 0.012845332479003413,
+      "level_index": 0,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2017.0488470124099,
+      "qty_base": 0.03341687189305346,
+      "level_index": 1,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2030.6324365652076,
+      "qty_base": 0.03234984890892295,
+      "level_index": 2,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2044.2160261180054,
+      "qty_base": 0.031473162588242135,
+      "level_index": 3,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2057.799615670803,
+      "qty_base": 0.06012127646232227,
+      "level_index": 4,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2071.383205223601,
+      "qty_base": 0.07983499004785798,
+      "level_index": 5,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2084.9667947763987,
+      "qty_base": 0.05885423352914127,
+      "level_index": 6,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    },
+    {
+      "side": "buy",
+      "price": 2098.5503843291967,
+      "qty_base": 0.03065827908442994,
+      "level_index": 7,
+      "order_id": null,
+      "status": "open",
+      "filled_base": 0.0
+    }
+  ]
+}
