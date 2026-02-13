@@ -1,0 +1,63 @@
+{
+  "intraday": {
+    "adx_enter_max": 64.9176,
+    "adx_exit_max": 67.9176,
+    "adx_exit_min": 67.9176,
+    "bbw_1h_pct_max": 94.4444,
+    "bbwp_l_enter_high": 93.3333,
+    "bbwp_l_max": 93.3333,
+    "bbwp_m_enter_high": 94.0678,
+    "bbwp_m_max": 94.0678,
+    "bbwp_s_enter_high": 81.746,
+    "bbwp_s_max": 81.746,
+    "ema_dist_max_frac": 0.022898,
+    "os_dev_persist_bars": 24,
+    "os_dev_rvol_max": 1.2955,
+    "router_eligible": true,
+    "vol_spike_mult": 1.7715
+  },
+  "recommended_thresholds": {
+    "intraday": {
+      "adx_enter_max": 64.9176,
+      "adx_exit_max": 67.9176,
+      "bbw_1h_pct_max": 94.4444,
+      "bbwp_l_max": 93.3333,
+      "bbwp_m_max": 94.0678,
+      "bbwp_s_max": 81.746,
+      "ema_dist_max_frac": 0.022898,
+      "os_dev_persist_bars": 24,
+      "os_dev_rvol_max": 1.2955,
+      "vol_spike_mult": 1.7715
+    },
+    "swing": {
+      "adx_enter_max": 52.1555,
+      "adx_exit_max": 74.5829,
+      "bbw_1h_pct_max": 98.9416,
+      "bbwp_l_max": 100.0,
+      "bbwp_m_max": 98.0263,
+      "bbwp_s_max": 86.1111,
+      "ema_dist_max_frac": 0.032085,
+      "os_dev_persist_bars": 12,
+      "os_dev_rvol_max": 1.0826,
+      "vol_spike_mult": 2.0556
+    }
+  },
+  "source_report": "/home/kani/grid-ml-system/freqtrade/user_data/regime_audit/regime_audit_smoke_verbose_v2/report.json",
+  "swing": {
+    "adx_enter_max": 52.1555,
+    "adx_exit_max": 74.5829,
+    "adx_exit_min": 74.5829,
+    "bbw_1h_pct_max": 98.9416,
+    "bbwp_l_enter_high": 100.0,
+    "bbwp_l_max": 100.0,
+    "bbwp_m_enter_high": 98.0263,
+    "bbwp_m_max": 98.0263,
+    "bbwp_s_enter_high": 86.1111,
+    "bbwp_s_max": 86.1111,
+    "ema_dist_max_frac": 0.032085,
+    "os_dev_persist_bars": 12,
+    "os_dev_rvol_max": 1.0826,
+    "router_eligible": true,
+    "vol_spike_mult": 2.0556
+  }
+}
