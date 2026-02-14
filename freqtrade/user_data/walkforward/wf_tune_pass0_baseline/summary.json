@@ -113,7 +113,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 101}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 101, \"os_dev_trend_stop\": 100, \"range_shift_stop\": 2}",
       "top_start_blocker": "reclaim_active:192",
-      "top_stop_reason": "event:PLAN_STOP:101"
+      "top_stop_reason": "event:PLAN_STOP:101",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 2,
@@ -142,7 +144,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 112}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 112, \"os_dev_trend_stop\": 111, \"range_shift_stop\": 1}",
       "top_start_blocker": "reclaim_active:189",
-      "top_stop_reason": "event:PLAN_STOP:112"
+      "top_stop_reason": "event:PLAN_STOP:112",
+      "end_quote": 651.5740498188575,
+      "end_base": 0.16678896770530569
     }
   ]
 }

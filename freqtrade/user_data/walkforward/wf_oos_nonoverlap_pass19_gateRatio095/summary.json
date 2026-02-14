@@ -109,7 +109,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 17}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 17, \"os_dev_trend_stop\": 9, \"range_shift_stop\": 8}",
       "top_start_blocker": "core_gate_fail:adx_ok:192",
-      "top_stop_reason": "event:PLAN_STOP:17"
+      "top_stop_reason": "event:PLAN_STOP:17",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 2,
@@ -138,7 +140,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 10}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 10, \"os_dev_trend_stop\": 7, \"range_shift_stop\": 3}",
       "top_start_blocker": "core_gate_fail:adx_ok:192",
-      "top_stop_reason": "event:PLAN_STOP:10"
+      "top_stop_reason": "event:PLAN_STOP:10",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 3,
@@ -167,7 +171,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 22}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 22, \"os_dev_trend_stop\": 13, \"range_shift_stop\": 9}",
       "top_start_blocker": "core_gate_fail:adx_ok:192",
-      "top_stop_reason": "event:PLAN_STOP:22"
+      "top_stop_reason": "event:PLAN_STOP:22",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 4,
@@ -196,7 +202,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 3}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 3, \"os_dev_trend_stop\": 1, \"range_shift_stop\": 2}",
       "top_start_blocker": "gate_ratio_below_required:184",
-      "top_stop_reason": "event:PLAN_STOP:3"
+      "top_stop_reason": "event:PLAN_STOP:3",
+      "end_quote": 791.5556246011549,
+      "end_base": 0.10063373727767586
     }
   ]
 }

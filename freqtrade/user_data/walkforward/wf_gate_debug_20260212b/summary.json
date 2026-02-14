@@ -83,7 +83,9 @@
       "soft_adjust_events": 0,
       "action_start": 0,
       "action_hold": 75,
-      "action_stop": 21
+      "action_stop": 21,
+      "end_quote": 1000.0,
+      "end_base": 0.0
     }
   ]
 }

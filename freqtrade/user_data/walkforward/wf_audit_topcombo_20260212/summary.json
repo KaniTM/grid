@@ -228,7 +228,9 @@
       "top_start_blocker": "gate_fail:adx_ok:192",
       "top_start_counterfactual_single": null,
       "top_start_counterfactual_combo": "gate_fail:adx_ok+gate_fail:ema_dist_ok+gate_fail:bbwp_gate_ok:45",
-      "top_stop_reason": "event:PLAN_STOP:17"
+      "top_stop_reason": "event:PLAN_STOP:17",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 2,
@@ -261,7 +263,9 @@
       "top_start_blocker": "gate_fail:adx_ok:192",
       "top_start_counterfactual_single": null,
       "top_start_counterfactual_combo": "gate_fail:adx_ok+gate_fail:ema_dist_ok+gate_fail:fvg_gate_ok:42",
-      "top_stop_reason": "event:PLAN_STOP:10"
+      "top_stop_reason": "event:PLAN_STOP:10",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 3,
@@ -294,7 +298,9 @@
       "top_start_blocker": "gate_fail:adx_ok:192",
       "top_start_counterfactual_single": null,
       "top_start_counterfactual_combo": "gate_fail:adx_ok+gate_fail:ema_dist_ok+gate_fail:bbwp_gate_ok+gate_fail:fvg_gate_ok:45",
-      "top_stop_reason": "event:PLAN_STOP:22"
+      "top_stop_reason": "event:PLAN_STOP:22",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 4,
@@ -327,7 +333,9 @@
       "top_start_blocker": "gate_fail:adx_ok:175",
       "top_start_counterfactual_single": "gate_fail:adx_ok:5",
       "top_start_counterfactual_combo": "gate_fail:adx_ok+gate_fail:ema_dist_ok:42",
-      "top_stop_reason": "event:PLAN_STOP:3"
+      "top_stop_reason": "event:PLAN_STOP:3",
+      "end_quote": 791.5556246011549,
+      "end_base": 0.10063373727767586
     }
   ]
 }

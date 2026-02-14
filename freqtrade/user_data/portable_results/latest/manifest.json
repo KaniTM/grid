@@ -2,12 +2,14 @@
   "portable_results_dir": "user_data/portable_results/latest",
   "copied": {
     "walkforward_runs": [
-      "wf_step6_long_B_audit_20200101_20260213",
-      "wf_step6_long_A_manual_20200101_20260213",
-      "wf_step6_ext_B_audit_20240101_20260213",
-      "wf_step6_ext_A_manual_20240101_20260213"
+      "wf_tune_pass9_adx24",
+      "wf_tune_selected_pass1_check",
+      "wf_tune_pass7_persist24",
+      "wf_tune_pass8_osdevband065",
+      "wf_tune_pass6_ema1pct",
+      "wf_tune_pass5_reclaim4h"
     ],
-    "ab_compare": "wf_step6_ext_AB_compare_20240101_20260213.json",
-    "mode_threshold_overrides": "regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json"
+    "ab_compare": "wf_step6_long_AB_compare_20200101_20260213.json",
+    "mode_threshold_overrides": "regime_audit/regime_calib_long_20240101_20251101_v2/mode_threshold_overrides.json"
   }
 }

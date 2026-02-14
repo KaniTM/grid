@@ -1,3 +1,0 @@
-ts,type,plan_index,plan_time_utc,plan_path,action,reason
-2026-02-08T00:00:00+00:00,PLAN_SWITCH,0,2026-02-08 00:00:00+00:00,/freqtrade/user_data/walkforward/wf_gate_debug_20260212d/window_001_plans/grid_plan.latest.json,HOLD,
-2026-02-08T12:15:00+00:00,STOP,0,2026-02-08 00:00:00+00:00,,,STOP_OUT_TP

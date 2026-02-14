@@ -115,7 +115,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 44}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 44, \"os_dev_trend_stop\": 42, \"range_shift_stop\": 2}",
       "top_start_blocker": "gate_fail:adx_ok:191",
-      "top_stop_reason": "event:PLAN_STOP:44"
+      "top_stop_reason": "event:PLAN_STOP:44",
+      "end_quote": 1000.0,
+      "end_base": 0.0
     },
     {
       "index": 2,
@@ -144,7 +146,9 @@
       "stop_event_reason_counts": "{\"PLAN_STOP\": 54}",
       "stop_reason_counts_combined": "{\"event:PLAN_STOP\": 54, \"os_dev_trend_stop\": 53, \"range_shift_stop\": 1}",
       "top_start_blocker": "gate_fail:os_dev_build_ok:158",
-      "top_stop_reason": "event:PLAN_STOP:54"
+      "top_stop_reason": "event:PLAN_STOP:54",
+      "end_quote": 348.15099248763045,
+      "end_base": 0.31383891648792367
     }
   ]
 }
