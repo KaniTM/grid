@@ -4,32 +4,38 @@
       "out_dir": "",
       "ref_file": "ab_compare.json",
       "run_id": "",
-      "updated_utc": "2026-02-14T08:02:52.262282+00:00"
+      "updated_utc": "2026-02-14T10:43:32.129828+00:00"
+    },
+    "data_sync": {
+      "out_dir": "",
+      "ref_file": "data_sync.json",
+      "run_id": "data_sync_20260214T083258Z",
+      "updated_utc": "2026-02-14T08:33:02.405073+00:00"
     },
     "portable_results": {
       "out_dir": "portable_results/latest",
       "ref_file": "portable_results.json",
       "run_id": "",
-      "updated_utc": "2026-02-14T08:04:24.923215+00:00"
+      "updated_utc": "2026-02-14T10:43:43.876844+00:00"
     },
     "regime_audit": {
-      "out_dir": "regime_audit/regime_calib_long_20240101_20251101_v2",
+      "out_dir": "regime_audit/regime_daily_20260214",
       "ref_file": "regime_audit.json",
-      "run_id": "regime_calib_long_20240101_20251101_v2",
-      "updated_utc": "2026-02-14T08:02:52.260686+00:00"
+      "run_id": "regime_daily_20260214",
+      "updated_utc": "2026-02-14T08:33:20.234944+00:00"
     },
     "tuning_shortlist": {
       "out_dir": "",
       "ref_file": "tuning_shortlist.json",
       "run_id": "",
-      "updated_utc": "2026-02-14T08:02:52.263567+00:00"
+      "updated_utc": "2026-02-14T10:43:32.327314+00:00"
     },
     "walkforward": {
-      "out_dir": "walkforward/wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+      "out_dir": "walkforward/wf_exp_bbwp_plus3_20200101_20260213_v1",
       "ref_file": "walkforward.json",
-      "run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
-      "updated_utc": "2026-02-14T08:02:52.258654+00:00"
+      "run_id": "wf_exp_bbwp_plus3_20200101_20260213_v1",
+      "updated_utc": "2026-02-14T10:42:58.351522+00:00"
     }
   },
-  "updated_utc": "2026-02-14T08:04:24.923215+00:00"
+  "updated_utc": "2026-02-14T10:43:43.876844+00:00"
 }

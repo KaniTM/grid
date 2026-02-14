@@ -1,0 +1,52 @@
+{
+  "A": {
+    "run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+    "created_utc": "2026-02-14T05:40:22.287312+00:00",
+    "start_day": "20200101",
+    "end_day": "20260213",
+    "windows_total": 160,
+    "windows_ok": 160,
+    "windows_failed": 0,
+    "sum_pnl_quote": 668.9928726209156,
+    "avg_pnl_pct": 0.4181205453880722,
+    "median_pnl_pct": 0.0,
+    "win_rate": 25.624999999999996,
+    "profit_factor": 1.6761634045308094,
+    "max_loss_pct": -19.315827970665477,
+    "max_gain_pct": 21.35648294728172,
+    "top_start_blocker": "gate_fail:mode_active_ok:199647",
+    "top_start_counterfactual_combo": "gate_fail:mode_active_ok+gate_fail:bbwp_gate_ok+gate_fail:fvg_gate_ok:15375",
+    "top_stop_reason": "event:PLAN_STOP:100869"
+  },
+  "B": {
+    "run_id": "wf_exp_router_fast_20200101_20260213_v1",
+    "created_utc": "2026-02-14T10:37:10.851401+00:00",
+    "start_day": "20200101",
+    "end_day": "20260213",
+    "windows_total": 160,
+    "windows_ok": 123,
+    "windows_failed": 37,
+    "sum_pnl_quote": 566.3056248342714,
+    "avg_pnl_pct": 0.4604110771010342,
+    "median_pnl_pct": 0.0,
+    "win_rate": 26.82926829268293,
+    "profit_factor": 1.9830457678593487,
+    "max_loss_pct": -9.360598032010492,
+    "max_gain_pct": 21.35648294728172,
+    "top_start_blocker": "gate_fail:mode_active_ok:151185",
+    "top_start_counterfactual_combo": "gate_fail:mode_active_ok+gate_fail:bbwp_gate_ok+gate_fail:fvg_gate_ok:11737",
+    "top_stop_reason": "event:PLAN_STOP:77086"
+  },
+  "delta_B_minus_A": {
+    "windows_total": 0.0,
+    "windows_ok": -37.0,
+    "windows_failed": 37.0,
+    "sum_pnl_quote": -102.6872477866442,
+    "avg_pnl_pct": 0.04229053171296199,
+    "median_pnl_pct": 0.0,
+    "win_rate": 1.204268292682933,
+    "profit_factor": 0.30688236332853935,
+    "max_loss_pct": 9.955229938654986,
+    "max_gain_pct": 0.0
+  }
+}

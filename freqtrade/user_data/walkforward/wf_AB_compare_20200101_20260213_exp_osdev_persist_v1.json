@@ -1,0 +1,52 @@
+{
+  "A": {
+    "run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+    "created_utc": "2026-02-14T05:40:22.287312+00:00",
+    "start_day": "20200101",
+    "end_day": "20260213",
+    "windows_total": 160,
+    "windows_ok": 160,
+    "windows_failed": 0,
+    "sum_pnl_quote": 668.9928726209156,
+    "avg_pnl_pct": 0.4181205453880722,
+    "median_pnl_pct": 0.0,
+    "win_rate": 25.624999999999996,
+    "profit_factor": 1.6761634045308094,
+    "max_loss_pct": -19.315827970665477,
+    "max_gain_pct": 21.35648294728172,
+    "top_start_blocker": "gate_fail:mode_active_ok:199647",
+    "top_start_counterfactual_combo": "gate_fail:mode_active_ok+gate_fail:bbwp_gate_ok+gate_fail:fvg_gate_ok:15375",
+    "top_stop_reason": "event:PLAN_STOP:100869"
+  },
+  "B": {
+    "run_id": "wf_exp_osdev_persist_20200101_20260213_v1",
+    "created_utc": "2026-02-14T10:21:31.938036+00:00",
+    "start_day": "20200101",
+    "end_day": "20260213",
+    "windows_total": 160,
+    "windows_ok": 94,
+    "windows_failed": 66,
+    "sum_pnl_quote": -236.38544523338635,
+    "avg_pnl_pct": -0.2514738779078577,
+    "median_pnl_pct": 0.0,
+    "win_rate": 18.085106382978726,
+    "profit_factor": 0.694849293577642,
+    "max_loss_pct": -19.315827970665477,
+    "max_gain_pct": 15.114302707753492,
+    "top_start_blocker": "gate_fail:mode_active_ok:117399",
+    "top_start_counterfactual_combo": "gate_fail:mode_active_ok+gate_fail:bbwp_gate_ok+gate_fail:fvg_gate_ok:9702",
+    "top_stop_reason": "event:PLAN_STOP:60270"
+  },
+  "delta_B_minus_A": {
+    "windows_total": 0.0,
+    "windows_ok": -66.0,
+    "windows_failed": 66.0,
+    "sum_pnl_quote": -905.3783178543019,
+    "avg_pnl_pct": -0.6695944232959299,
+    "median_pnl_pct": 0.0,
+    "win_rate": -7.539893617021271,
+    "profit_factor": -0.9813141109531673,
+    "max_loss_pct": 0.0,
+    "max_gain_pct": -6.242180239528228
+  }
+}

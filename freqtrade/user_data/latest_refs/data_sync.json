@@ -1,0 +1,61 @@
+{
+  "category": "data_sync",
+  "exchange": "binance",
+  "mode": "append",
+  "pairs": [
+    "ETH/USDT"
+  ],
+  "return_code": 0,
+  "run_id": "data_sync_20260214T083258Z",
+  "run_state_dir": "run_state/data_sync/data_sync_20260214T083258Z",
+  "run_type": "data_sync",
+  "status": "completed",
+  "step_word": "RUN_COMPLETE",
+  "tasks": [
+    {
+      "before_max_day": "20260214",
+      "before_min_day": "20200101",
+      "before_rows": 214505,
+      "data_path": "data/binance/ETH_USDT-15m.feather",
+      "pair": "ETH/USDT",
+      "prepend": false,
+      "reason": "already_up_to_date max_day=20260214 target_end=20260214",
+      "status": "skip",
+      "timeframe": "15m",
+      "timerange": "20260212-20260214"
+    },
+    {
+      "before_max_day": "20260214",
+      "before_min_day": "20200101",
+      "before_rows": 53640,
+      "data_path": "data/binance/ETH_USDT-1h.feather",
+      "pair": "ETH/USDT",
+      "prepend": false,
+      "reason": "already_up_to_date max_day=20260214 target_end=20260214",
+      "status": "skip",
+      "timeframe": "1h",
+      "timerange": "20260212-20260214"
+    },
+    {
+      "before_max_day": "20260214",
+      "before_min_day": "20200101",
+      "before_rows": 13417,
+      "data_path": "data/binance/ETH_USDT-4h.feather",
+      "pair": "ETH/USDT",
+      "prepend": false,
+      "reason": "already_up_to_date max_day=20260214 target_end=20260214",
+      "status": "skip",
+      "timeframe": "4h",
+      "timerange": "20260212-20260214"
+    }
+  ],
+  "tasks_completed": 3,
+  "tasks_failed": 0,
+  "tasks_total": 3,
+  "timeframes": [
+    "15m",
+    "1h",
+    "4h"
+  ],
+  "updated_utc": "2026-02-14T08:33:02.405073+00:00"
+}
