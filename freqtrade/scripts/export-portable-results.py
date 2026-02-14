@@ -12,6 +12,8 @@ import json
 import shutil
 from pathlib import Path
 
+from latest_refs import publish_latest_ref, rel_payload_path
+
 
 def pick_latest_walkforward_runs(wf_dir: Path, limit: int) -> list[Path]:
     runs: list[tuple[float, Path]] = []
@@ -80,6 +82,17 @@ def main() -> int:
         "copied": copied,
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    latest_payload = {
+        "run_type": "portable_export",
+        "out_dir": rel_payload_path(user_data, out_dir),
+        "manifest_path": rel_payload_path(user_data, out_dir / "manifest.json"),
+        "walkforward_runs": copied.get("walkforward_runs", []),
+        "ab_compare": str(copied.get("ab_compare") or ""),
+        "mode_threshold_overrides": str(copied.get("mode_threshold_overrides") or ""),
+    }
+    ref = publish_latest_ref(user_data, "portable_results", latest_payload)
+    manifest["latest_ref"] = str(ref)
 
     print(json.dumps(manifest, indent=2))
     return 0

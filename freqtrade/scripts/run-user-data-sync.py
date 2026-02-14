@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
 
 
@@ -283,6 +284,7 @@ def main() -> int:
 
     failures: List[str] = []
     completed = 0
+    task_records: List[Dict[str, object]] = []
     for i, (pair, timeframe) in enumerate(tasks, start=1):
         pct = _format_pct(i - 1, total)
         task_status = "running"
@@ -331,6 +333,20 @@ def main() -> int:
         if skip_reason:
             completed += 1
             task_status = "skip"
+            task_records.append(
+                {
+                    "pair": str(pair),
+                    "timeframe": str(timeframe),
+                    "status": "skip",
+                    "reason": str(skip_reason),
+                    "timerange": str(timerange),
+                    "prepend": bool(prepend_flag),
+                    "data_path": rel_payload_path(user_data_dir, host_file),
+                    "before_rows": int(before_rows),
+                    "before_min_day": before_min or "",
+                    "before_max_day": before_max or "",
+                }
+            )
             print(
                 f"[data-sync] task {i}/{total} pct={_format_pct(i, total)} pair={pair} tf={timeframe} "
                 f"status=skip reason={skip_reason}",
@@ -399,6 +415,23 @@ def main() -> int:
                 flush=True,
             )
             task_status = "ok"
+            task_records.append(
+                {
+                    "pair": str(pair),
+                    "timeframe": str(timeframe),
+                    "status": "ok",
+                    "timerange": str(timerange),
+                    "prepend": bool(prepend_flag),
+                    "data_path": rel_payload_path(user_data_dir, host_file),
+                    "before_rows": int(before_rows),
+                    "after_rows": int(after_rows),
+                    "rows_delta": int(after_rows - before_rows),
+                    "before_min_day": before_min or "",
+                    "before_max_day": before_max or "",
+                    "after_min_day": after_min or "",
+                    "after_max_day": after_max or "",
+                }
+            )
             if run_state is not None:
                 run_state.event(
                     "TASK_DONE",
@@ -437,6 +470,20 @@ def main() -> int:
             msg = f"pair={pair} tf={timeframe} error={exc}"
             failures.append(msg)
             task_status = "error"
+            task_records.append(
+                {
+                    "pair": str(pair),
+                    "timeframe": str(timeframe),
+                    "status": "error",
+                    "error": str(exc),
+                    "timerange": str(timerange),
+                    "prepend": bool(prepend_flag),
+                    "data_path": rel_payload_path(user_data_dir, host_file),
+                    "before_rows": int(before_rows),
+                    "before_min_day": before_min or "",
+                    "before_max_day": before_max or "",
+                }
+            )
             print(f"[data-sync] task {i}/{total} pct={_format_pct(i, total)} status=error {msg}", flush=True)
             if run_state is not None:
                 run_state.event(
@@ -511,6 +558,27 @@ def main() -> int:
             tasks_completed=int(completed),
             tasks_failed=int(len(failures)),
         )
+    latest_payload = {
+        "run_type": "data_sync",
+        "run_id": str(run_id),
+        "status": str(final_status),
+        "step_word": str(final_word),
+        "return_code": int(rc),
+        "mode": str(args.mode),
+        "exchange": str(args.exchange),
+        "pairs": [str(x) for x in args.pairs],
+        "timeframes": [str(x) for x in args.timeframes],
+        "tasks_total": int(total),
+        "tasks_completed": int(completed),
+        "tasks_failed": int(len(failures)),
+        "tasks": task_records,
+        "run_state_dir": rel_payload_path(
+            user_data_dir,
+            (user_data_dir / "run_state" / "data_sync" / run_id),
+        ),
+    }
+    latest_ref = publish_latest_ref(user_data_dir, "data_sync", latest_payload)
+    print(f"[data-sync] latest_ref wrote {latest_ref}", flush=True)
     return int(rc)
 
 

@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
 
 
@@ -1265,6 +1266,28 @@ def main() -> int:
             windows_ok=int(agg.get("windows_ok", 0)),
             windows_failed=int(agg.get("windows_failed", 0)),
         )
+
+    if not args.dry_run:
+        summary_out = out_dir / "summary.json"
+        windows_out = out_dir / "windows.csv"
+        rows_ok = [r for r in rows if str(r.status).lower() == "ok"]
+        rows_missing_bal = [r for r in rows_ok if (r.end_quote is None) or (r.end_base is None)]
+        latest_payload = {
+            "run_type": "walkforward",
+            "run_id": str(run_id),
+            "status": str(final_status),
+            "step_word": str(final_word),
+            "return_code": int(rc),
+            "timerange": str(args.timerange),
+            "out_dir": rel_payload_path(user_data_dir, out_dir),
+            "summary_path": rel_payload_path(user_data_dir, summary_out),
+            "windows_path": rel_payload_path(user_data_dir, windows_out),
+            "aggregate": aggregate_brief(agg),
+            "raw_window_files_prunable": bool(len(rows_missing_bal) == 0),
+            "raw_window_files_blocked_count": int(len(rows_missing_bal)),
+        }
+        latest_ref = publish_latest_ref(user_data_dir, "walkforward", latest_payload)
+        print(f"[walkforward] latest_ref wrote {latest_ref}", flush=True)
     return int(rc)
 
 

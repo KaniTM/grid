@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from latest_refs import collect_latest_run_pins
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -303,6 +305,17 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Run-id to always keep when --keep-regime-runs is used.",
     )
+    ap.add_argument(
+        "--auto-pin-latest-refs",
+        action="store_true",
+        default=True,
+        help="Auto-pin run-ids from user_data/latest_refs when pruning old runs.",
+    )
+    ap.add_argument(
+        "--no-auto-pin-latest-refs",
+        action="store_false",
+        dest="auto_pin_latest_refs",
+    )
     return ap.parse_args()
 
 
@@ -314,6 +327,15 @@ def main() -> int:
         user_data = (root_dir / user_data).resolve()
     if not user_data.is_dir():
         raise FileNotFoundError(f"user_data directory not found: {user_data}")
+
+    manual_pin_wf: Set[str] = {str(x).strip() for x in args.pin_walkforward_run if str(x).strip()}
+    manual_pin_rg: Set[str] = {str(x).strip() for x in args.pin_regime_run if str(x).strip()}
+    auto_pin_wf: Set[str] = set()
+    auto_pin_rg: Set[str] = set()
+    if bool(args.auto_pin_latest_refs):
+        auto_pin_wf, auto_pin_rg = collect_latest_run_pins(user_data)
+    effective_pin_wf: Set[str] = set(manual_pin_wf) | set(auto_pin_wf)
+    effective_pin_rg: Set[str] = set(manual_pin_rg) | set(auto_pin_rg)
 
     candidates: Dict[Path, Candidate] = {}
     hydration_info: Dict[str, object] = {}
@@ -386,14 +408,14 @@ def main() -> int:
         candidates,
         user_data / "walkforward",
         int(args.keep_walkforward_runs),
-        {str(x).strip() for x in args.pin_walkforward_run if str(x).strip()},
+        effective_pin_wf,
         "walkforward_old_run_dir",
     )
     _prune_old_runs(
         candidates,
         user_data / "regime_audit",
         int(args.keep_regime_runs),
-        {str(x).strip() for x in args.pin_regime_run if str(x).strip()},
+        effective_pin_rg,
         "regime_old_run_dir",
     )
 
@@ -412,13 +434,26 @@ def main() -> int:
         item["count"] += 1
         item["bytes"] += int(c.bytes_size)
 
+    walkforward_runs = [d.name for d in _latest_run_dirs(user_data / "walkforward")]
+    walkforward_raw_prunable_runs = sorted([name for name in walkforward_runs if name not in blocked_walkforward_runs])
+
     summary = {
         "mode": "apply" if args.apply else "dry-run",
         "user_data": str(user_data),
         "candidates": len(collapsed),
         "bytes_reclaimable": int(total_bytes),
+        "pinning": {
+            "auto_pin_latest_refs": bool(args.auto_pin_latest_refs),
+            "manual_walkforward_runs": sorted(manual_pin_wf),
+            "manual_regime_runs": sorted(manual_pin_rg),
+            "auto_walkforward_runs": sorted(auto_pin_wf),
+            "auto_regime_runs": sorted(auto_pin_rg),
+            "effective_walkforward_runs": sorted(effective_pin_wf),
+            "effective_regime_runs": sorted(effective_pin_rg),
+        },
         "walkforward_hydration": hydration_info,
         "walkforward_blocked_runs": sorted(blocked_walkforward_runs),
+        "walkforward_raw_prunable_runs": walkforward_raw_prunable_runs,
         "reasons": reason_totals,
         "largest_candidates": [
             {
@@ -457,6 +492,17 @@ def main() -> int:
                     "reason=missing_end_balances",
                     flush=True,
                 )
+            print(
+                "[cleanup] walkforward_raw_prunable_runs "
+                f"count={len(walkforward_raw_prunable_runs)}",
+                flush=True,
+            )
+        if bool(args.auto_pin_latest_refs):
+            print(
+                "[cleanup] auto_pinned "
+                f"walkforward={len(auto_pin_wf)} regime={len(auto_pin_rg)}",
+                flush=True,
+            )
         for reason, stats in sorted(
             reason_totals.items(),
             key=lambda kv: (-int(kv[1]["bytes"]), str(kv[0])),

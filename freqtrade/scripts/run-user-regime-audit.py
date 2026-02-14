@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
+from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
 
 
@@ -371,6 +372,26 @@ def main() -> int:
             return_code=0,
         )
         run_state.event("RUN_COMPLETE", run_id=str(run_id), return_code=0)
+    latest_payload = {
+        "run_type": "regime_audit",
+        "run_id": str(run_id),
+        "status": "completed",
+        "step_word": "RUN_COMPLETE",
+        "pair": str(args.pair),
+        "timeframe": str(args.timeframe),
+        "timerange": str(args.timerange or ""),
+        "out_dir": rel_payload_path(user_data_dir, out_dir),
+        "report_path": rel_payload_path(user_data_dir, report_local),
+        "overrides_path": rel_payload_path(user_data_dir, overrides_local),
+        "features_path": rel_payload_path(user_data_dir, features_local),
+        "verbose_path": rel_payload_path(user_data_dir, verbose_local),
+        "transitions_csv_path": rel_payload_path(user_data_dir, transitions_csv_local),
+        "transitions_json_path": rel_payload_path(user_data_dir, transitions_json_local),
+        "label_counts": labels,
+        "recommended_thresholds": rec,
+    }
+    latest_ref = publish_latest_ref(user_data_dir, "regime_audit", latest_payload)
+    print(f"[regime-audit] latest_ref wrote {latest_ref}", flush=True)
     return 0
 
 
