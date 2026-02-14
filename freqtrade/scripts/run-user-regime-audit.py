@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 
 def q(text: str) -> str:
@@ -23,12 +25,92 @@ def to_container_user_data_path(local_path: Path, user_data_dir: Path) -> str:
     return f"/freqtrade/user_data/{rel.as_posix()}"
 
 
-def run_compose_inner(root_dir: Path, service: str, inner_cmd: str, dry_run: bool = False) -> None:
+def _proc_usage(pid: int) -> Dict[str, object]:
+    stat_path = Path(f"/proc/{int(pid)}/stat")
+    if not stat_path.exists():
+        return {}
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            return {}
+        rest = raw[rparen + 2 :].split()
+        utime = float(rest[11])
+        stime = float(rest[12])
+        rss_pages = int(rest[21])
+        clk = float(os.sysconf("SC_CLK_TCK"))
+        page_size = float(os.sysconf("SC_PAGE_SIZE"))
+        cpu_sec = (utime + stime) / clk
+        rss_mb = (rss_pages * page_size) / (1024.0 * 1024.0)
+        return {"cpu_sec": round(cpu_sec, 3), "rss_mb": round(rss_mb, 1)}
+    except Exception:
+        return {}
+
+
+def _probe_outputs(paths: Dict[str, Path]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for key, path in paths.items():
+        if path.exists():
+            try:
+                out[f"{key}_bytes"] = int(path.stat().st_size)
+            except Exception:
+                out[f"{key}_bytes"] = -1
+        else:
+            out[f"{key}_bytes"] = 0
+    return out
+
+
+def run_compose_inner(
+    root_dir: Path,
+    service: str,
+    inner_cmd: str,
+    heartbeat_sec: int = 60,
+    progress_label: str = "",
+    progress_probe: Optional[Callable[[], Dict[str, object]]] = None,
+    dry_run: bool = False,
+) -> None:
     cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
     print(f"[regime-audit] $ {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
     if dry_run:
         return
-    subprocess.run(cmd, cwd=str(root_dir), check=True)
+    hb = int(heartbeat_sec)
+    if hb <= 0:
+        subprocess.run(cmd, cwd=str(root_dir), check=True)
+        return
+    proc = subprocess.Popen(cmd, cwd=str(root_dir))
+    started = time.time()
+    label = str(progress_label).strip() or "compose"
+    last_probe: Dict[str, object] = {}
+    while True:
+        try:
+            rc = proc.wait(timeout=hb)
+            if rc != 0:
+                raise subprocess.CalledProcessError(rc, cmd)
+            return
+        except subprocess.TimeoutExpired:
+            elapsed = int(max(0.0, time.time() - started))
+            usage = _proc_usage(int(proc.pid))
+            probe: Dict[str, object] = {}
+            if progress_probe is not None:
+                try:
+                    probe = progress_probe() or {}
+                except Exception as exc:
+                    probe = {"probe_error": str(exc)}
+            changed = int(probe != last_probe)
+            last_probe = dict(probe)
+            usage_txt = " ".join(f"{k}={v}" for k, v in usage.items())
+            probe_txt = json.dumps(probe, sort_keys=True) if probe else "{}"
+            print(
+                f"[regime-audit] heartbeat stage={label} elapsed_sec={elapsed} {usage_txt} "
+                f"progress_changed={changed} probe={probe_txt} still_running=1",
+                flush=True,
+            )
+        except KeyboardInterrupt:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--service", default="freqtrade")
     ap.add_argument("--emit-features-csv", action="store_true")
     ap.add_argument("--emit-verbose", action="store_true", help="Emit per-candle verbose and transition event artifacts")
+    ap.add_argument(
+        "--heartbeat-sec",
+        type=int,
+        default=60,
+        help="Print periodic heartbeat while compose command is running (0 disables).",
+    )
     ap.add_argument("--dry-run", action="store_true")
     return ap
 
@@ -104,7 +192,26 @@ def main() -> int:
     if transitions_json_container:
         inner = f"{inner} --emit-transitions-json {q(transitions_json_container)}"
 
-    run_compose_inner(root_dir, args.service, inner, dry_run=args.dry_run)
+    progress_paths: Dict[str, Path] = {"report": report_local}
+    if features_local:
+        progress_paths["features"] = features_local
+    if verbose_local:
+        progress_paths["verbose"] = verbose_local
+    if transitions_csv_local:
+        progress_paths["transitions_csv"] = transitions_csv_local
+    if transitions_json_local:
+        progress_paths["transitions_json"] = transitions_json_local
+
+    print("[regime-audit] stage 1/1 running audit", flush=True)
+    run_compose_inner(
+        root_dir,
+        args.service,
+        inner,
+        heartbeat_sec=int(args.heartbeat_sec),
+        progress_label="regime_audit",
+        progress_probe=lambda: _probe_outputs(progress_paths),
+        dry_run=args.dry_run,
+    )
     if args.dry_run:
         return 0
 

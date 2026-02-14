@@ -41,6 +41,8 @@ done
 
 if ((${#files[@]} == 0)); then
     files=(
+        "scripts/run-user-data-sync.py"
+        "scripts/manage-user-artifacts.py"
         "scripts/run-user-regime-audit.py"
         "scripts/run-user-walkforward.py"
         "user_data/scripts/grid_simulator_v1.py"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import shlex
 import shutil
 import statistics
@@ -22,7 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -39,6 +40,8 @@ class WindowResult:
     pnl_pct: Optional[float] = None
     initial_equity: Optional[float] = None
     end_equity: Optional[float] = None
+    end_quote: Optional[float] = None
+    end_base: Optional[float] = None
     fills: Optional[int] = None
     stop_events: Optional[int] = None
     seed_events: Optional[int] = None
@@ -73,6 +76,8 @@ class WindowResult:
             "pnl_pct": self.pnl_pct,
             "initial_equity": self.initial_equity,
             "end_equity": self.end_equity,
+            "end_quote": self.end_quote,
+            "end_base": self.end_base,
             "fills": self.fills,
             "stop_events": self.stop_events,
             "seed_events": self.seed_events,
@@ -174,11 +179,65 @@ def q(text: str) -> str:
     return shlex.quote(text)
 
 
+def _proc_usage(pid: int) -> Dict[str, object]:
+    stat_path = Path(f"/proc/{int(pid)}/stat")
+    if not stat_path.exists():
+        return {}
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            return {}
+        rest = raw[rparen + 2 :].split()
+        utime = float(rest[11])
+        stime = float(rest[12])
+        rss_pages = int(rest[21])
+        clk = float(os.sysconf("SC_CLK_TCK"))
+        page_size = float(os.sysconf("SC_PAGE_SIZE"))
+        cpu_sec = (utime + stime) / clk
+        rss_mb = (rss_pages * page_size) / (1024.0 * 1024.0)
+        return {"cpu_sec": round(cpu_sec, 3), "rss_mb": round(rss_mb, 1)}
+    except Exception:
+        return {}
+
+
+def _format_pct(done: int, total: int) -> str:
+    if int(total) <= 0:
+        return "0.00%"
+    return f"{(100.0 * float(done) / float(total)):.2f}%"
+
+
+def _count_plan_files(plan_dir: Path) -> int:
+    if not plan_dir.is_dir():
+        return 0
+    n = 0
+    for p in plan_dir.glob("grid_plan*.json"):
+        if p.is_file():
+            n += 1
+    return n
+
+
+def _probe_path_sizes(paths: Dict[str, Path]) -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    for key, path in paths.items():
+        if path.exists():
+            try:
+                out[f"{key}_bytes"] = int(path.stat().st_size)
+            except Exception:
+                out[f"{key}_bytes"] = -1
+        else:
+            out[f"{key}_bytes"] = 0
+    return out
+
+
 def run_compose_inner(
     root_dir: Path,
     service: str,
     inner_cmd: str,
     env_exports: Optional[List[str]] = None,
+    heartbeat_sec: int = 60,
+    progress_label: str = "",
+    progress_probe: Optional[Callable[[], Dict[str, object]]] = None,
     dry_run: bool = False,
 ) -> None:
     if env_exports:
@@ -189,7 +248,169 @@ def run_compose_inner(
     print(f"[walkforward] $ {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
     if dry_run:
         return
-    subprocess.run(cmd, cwd=str(root_dir), check=True)
+    hb = int(heartbeat_sec)
+    if hb <= 0:
+        subprocess.run(cmd, cwd=str(root_dir), check=True)
+        return
+    proc = subprocess.Popen(cmd, cwd=str(root_dir))
+    started = time.time()
+    label = str(progress_label).strip() or "compose"
+    last_probe: Dict[str, object] = {}
+    while True:
+        try:
+            rc = proc.wait(timeout=hb)
+            if rc != 0:
+                raise subprocess.CalledProcessError(rc, cmd)
+            return
+        except subprocess.TimeoutExpired:
+            elapsed = int(max(0.0, time.time() - started))
+            usage = _proc_usage(int(proc.pid))
+            probe: Dict[str, object] = {}
+            if progress_probe is not None:
+                try:
+                    probe = progress_probe() or {}
+                except Exception as exc:
+                    probe = {"probe_error": str(exc)}
+            changed = int(probe != last_probe)
+            last_probe = dict(probe)
+            usage_txt = " ".join(f"{k}={v}" for k, v in usage.items())
+            probe_txt = json.dumps(probe, sort_keys=True) if probe else "{}"
+            print(
+                f"[walkforward] heartbeat stage={label} elapsed_sec={elapsed} {usage_txt} "
+                f"progress_changed={changed} probe={probe_txt} still_running=1",
+                flush=True,
+            )
+        except KeyboardInterrupt:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            raise
+
+
+def _to_float_optional(value: object) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _to_int_optional(value: object) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _to_dict_counts(value: object) -> Dict[str, int]:
+    raw = value
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            raw = json.loads(text)
+        except Exception:
+            return {}
+    if raw is None:
+        return {}
+    return _coerce_reason_counts(raw)
+
+
+def window_result_from_dict(raw: Dict) -> WindowResult:
+    return WindowResult(
+        index=int(raw.get("index")),
+        timerange=str(raw.get("timerange", "")),
+        start_day=str(raw.get("start_day", "")),
+        end_day=str(raw.get("end_day", "")),
+        status=str(raw.get("status", "")),
+        error=str(raw.get("error", "")),
+        result_file=str(raw.get("result_file", "")),
+        plans_file_count=int(raw.get("plans_file_count") or 0),
+        pnl_quote=_to_float_optional(raw.get("pnl_quote")),
+        pnl_pct=_to_float_optional(raw.get("pnl_pct")),
+        initial_equity=_to_float_optional(raw.get("initial_equity")),
+        end_equity=_to_float_optional(raw.get("end_equity")),
+        end_quote=_to_float_optional(raw.get("end_quote")),
+        end_base=_to_float_optional(raw.get("end_base")),
+        fills=_to_int_optional(raw.get("fills")),
+        stop_events=_to_int_optional(raw.get("stop_events")),
+        seed_events=_to_int_optional(raw.get("seed_events")),
+        rebuild_events=_to_int_optional(raw.get("rebuild_events")),
+        soft_adjust_events=_to_int_optional(raw.get("soft_adjust_events")),
+        action_start=_to_int_optional(raw.get("action_start")),
+        action_hold=_to_int_optional(raw.get("action_hold")),
+        action_stop=_to_int_optional(raw.get("action_stop")),
+        start_blocker_counts=_to_dict_counts(raw.get("start_blocker_counts")),
+        start_counterfactual_single_counts=_to_dict_counts(raw.get("start_counterfactual_single_counts")),
+        start_counterfactual_combo_counts=_to_dict_counts(raw.get("start_counterfactual_combo_counts")),
+        hold_reason_counts=_to_dict_counts(raw.get("hold_reason_counts")),
+        stop_reason_counts=_to_dict_counts(raw.get("stop_reason_counts")),
+        stop_event_reason_counts=_to_dict_counts(raw.get("stop_event_reason_counts")),
+        stop_reason_counts_combined=_to_dict_counts(raw.get("stop_reason_counts_combined")),
+        top_start_blocker=(str(raw.get("top_start_blocker")) if raw.get("top_start_blocker") not in (None, "") else None),
+        top_start_counterfactual_single=(
+            str(raw.get("top_start_counterfactual_single"))
+            if raw.get("top_start_counterfactual_single") not in (None, "")
+            else None
+        ),
+        top_start_counterfactual_combo=(
+            str(raw.get("top_start_counterfactual_combo"))
+            if raw.get("top_start_counterfactual_combo") not in (None, "")
+            else None
+        ),
+        top_stop_reason=(str(raw.get("top_stop_reason")) if raw.get("top_stop_reason") not in (None, "") else None),
+    )
+
+
+def write_outputs(out_dir: Path, run_id: str, args: argparse.Namespace, rows: List[WindowResult]) -> Tuple[Path, Path, Dict]:
+    agg = aggregate(rows)
+    summary = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "args": vars(args),
+        "aggregate": agg,
+        "windows": [r.as_dict() for r in rows],
+    }
+
+    summary_path = out_dir / "summary.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    csv_path = out_dir / "windows.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].as_dict().keys()) if rows else [])
+        if rows:
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r.as_dict())
+    return summary_path, csv_path, agg
+
+
+def aggregate_brief(agg: Dict) -> Dict:
+    keys = [
+        "windows_total",
+        "windows_ok",
+        "windows_failed",
+        "sum_pnl_quote",
+        "avg_pnl_pct",
+        "median_pnl_pct",
+        "win_rate",
+        "profit_factor",
+        "max_gain_pct",
+        "max_loss_pct",
+        "top_start_blocker",
+        "top_start_counterfactual_combo",
+        "top_stop_reason",
+    ]
+    out: Dict[str, object] = {}
+    for k in keys:
+        out[k] = agg.get(k)
+    return out
 
 
 def extract_window_plans(
@@ -452,6 +673,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--backtesting-extra", default="", help="Extra args appended to freqtrade backtesting command")
     ap.add_argument("--sim-extra", default="", help="Extra args appended to simulator command")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--resume", action="store_true", help="Resume existing run-id by skipping completed windows.")
+    ap.add_argument(
+        "--resume-require-result-files",
+        action="store_true",
+        help="With --resume, only skip a window if status=ok and result_file still exists.",
+    )
+    ap.add_argument(
+        "--heartbeat-sec",
+        type=int,
+        default=60,
+        help="Print periodic heartbeat while compose commands are running (0 disables).",
+    )
     ap.add_argument("--fail-on-window-error", action="store_true")
     ap.add_argument(
         "--allow-overlap",
@@ -492,6 +725,78 @@ def main() -> int:
     run_id = args.run_id or datetime.now(timezone.utc).strftime("wf_%Y%m%dT%H%M%SZ")
     out_dir = user_data_dir / "walkforward" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = out_dir / "summary.json"
+
+    existing_rows_by_index: Dict[int, WindowResult] = {}
+    if args.resume and summary_path.exists():
+        with summary_path.open("r", encoding="utf-8") as f:
+            existing = json.load(f)
+        existing_args = existing.get("args", {}) or {}
+        prev_timerange = str(existing_args.get("timerange") or "").strip()
+        cur_timerange = str(args.timerange or "").strip()
+        timerange_extended = False
+        if prev_timerange and cur_timerange and (prev_timerange != cur_timerange):
+            try:
+                prev_start, prev_end = parse_day_timerange(prev_timerange)
+                cur_start, cur_end = parse_day_timerange(cur_timerange)
+            except Exception:
+                raise RuntimeError(
+                    "Resume refused: existing summary timerange is incompatible with current timerange "
+                    f"(current={cur_timerange!r} previous={prev_timerange!r})."
+                )
+            if cur_start == prev_start and cur_end >= prev_end:
+                timerange_extended = bool(cur_end > prev_end)
+            else:
+                raise RuntimeError(
+                    "Resume refused: timerange mismatch is not an extension from the same start.\n"
+                    f"current={cur_timerange!r} previous={prev_timerange!r}"
+                )
+        compare_keys = (
+            "window_days",
+            "step_days",
+            "min_window_days",
+            "pair",
+            "exchange",
+            "timeframe",
+            "start_quote",
+            "start_base",
+            "carry_capital",
+            "fee_pct",
+            "max_orders_per_side",
+            "close_on_stop",
+            "reverse_fill",
+            "regime_threshold_profile",
+            "mode_thresholds_path",
+        )
+        mismatches: List[str] = []
+        for key in compare_keys:
+            cur = getattr(args, key, None)
+            prev = existing_args.get(key, None)
+            if key in ("mode_thresholds_path",):
+                cur = str(cur or "").strip()
+                prev = str(prev or "").strip()
+            if cur != prev:
+                mismatches.append(f"{key}: current={cur!r} previous={prev!r}")
+        if mismatches:
+            raise RuntimeError(
+                "Resume refused: existing summary args mismatch current args.\n"
+                + "\n".join(mismatches)
+            )
+        if timerange_extended:
+            print(
+                f"[walkforward] resume timerange extension previous={prev_timerange} current={cur_timerange}",
+                flush=True,
+            )
+        for row_raw in existing.get("windows", []) or []:
+            try:
+                parsed = window_result_from_dict(row_raw)
+                existing_rows_by_index[int(parsed.index)] = parsed
+            except Exception:
+                continue
+        print(
+            f"[walkforward] resume loaded previous windows={len(existing_rows_by_index)} from {summary_path}",
+            flush=True,
+        )
 
     env_exports: List[str] = []
     if args.regime_threshold_profile:
@@ -520,9 +825,58 @@ def main() -> int:
 
     for idx, ws, we in windows:
         timerange = f"{fmt_day(ws)}-{fmt_day(we)}"
+        existing_row = existing_rows_by_index.get(int(idx))
+        if args.resume and existing_row and str(existing_row.status).lower() == "ok":
+            result_file_exists = False
+            rf = str(existing_row.result_file or "").strip()
+            if rf:
+                result_file_exists = Path(rf).exists()
+            if (not args.resume_require_result_files) or result_file_exists:
+                rows.append(existing_row)
+                done = len(rows)
+                print(
+                    f"[walkforward] window {idx}/{len(windows)} timerange={timerange} "
+                    f"resume=skip status=ok result_file_exists={int(result_file_exists)} "
+                    f"completed={done}/{len(windows)} pct={_format_pct(done, len(windows))}",
+                    flush=True,
+                )
+                if args.carry_capital:
+                    if existing_row.end_quote is not None and existing_row.end_base is not None:
+                        cur_quote = float(existing_row.end_quote)
+                        cur_base = float(existing_row.end_base)
+                    elif result_file_exists:
+                        sim = load_sim_summary(Path(rf))
+                        existing_row.end_quote = float(sim["end_quote"])
+                        existing_row.end_base = float(sim["end_base"])
+                        cur_quote = float(existing_row.end_quote)
+                        cur_base = float(existing_row.end_base)
+                    else:
+                        raise RuntimeError(
+                            f"Cannot resume carry-capital for window {idx}: missing end_quote/end_base and result_file."
+                        )
+                elif not args.carry_capital:
+                    cur_quote = float(args.start_quote)
+                    cur_base = float(args.start_base)
+                if not args.dry_run:
+                    summary_path_ckpt, csv_path_ckpt, agg_ckpt = write_outputs(out_dir, run_id, args, rows)
+                    print(
+                        f"[walkforward] checkpoint done={len(rows)}/{len(windows)} "
+                        f"ok={int(agg_ckpt.get('windows_ok', 0))} failed={int(agg_ckpt.get('windows_failed', 0))}",
+                        flush=True,
+                    )
+                    print(f"[walkforward] checkpoint wrote {summary_path_ckpt}", flush=True)
+                    print(f"[walkforward] checkpoint wrote {csv_path_ckpt}", flush=True)
+                else:
+                    print(
+                        f"[walkforward] checkpoint done={len(rows)}/{len(windows)} dry_run=1 (no files written)",
+                        flush=True,
+                    )
+                continue
+
         print(
             f"[walkforward] window {idx}/{len(windows)} timerange={timerange} "
-            f"start_quote={cur_quote:.6f} start_base={cur_base:.6f}",
+            f"start_quote={cur_quote:.6f} start_base={cur_base:.6f} "
+            f"completed={len(rows)}/{len(windows)} pct={_format_pct(len(rows), len(windows))}",
             flush=True,
         )
 
@@ -551,16 +905,30 @@ def main() -> int:
                 )
                 if args.backtesting_extra.strip():
                     backtesting_inner = f"{backtesting_inner} {args.backtesting_extra.strip()}"
+                backtest_started = time.time()
+                print(
+                    f"[walkforward] window {idx} stage=backtesting status=start timerange={timerange}",
+                    flush=True,
+                )
+                backtest_probe = lambda: {"plan_files": int(_count_plan_files(src_plan_dir))}
                 run_compose_inner(
                     root_dir,
                     args.service,
                     backtesting_inner,
                     env_exports=env_exports,
+                    heartbeat_sec=int(args.heartbeat_sec),
+                    progress_label=f"window_{idx:03d}_backtesting",
+                    progress_probe=backtest_probe,
                     dry_run=args.dry_run,
+                )
+                print(
+                    f"[walkforward] window {idx} stage=backtesting status=done elapsed_sec={int(max(0.0, time.time() - backtest_started))}",
+                    flush=True,
                 )
 
             window_plan_dir = out_dir / f"window_{idx:03d}_plans"
             min_mtime_epoch = None if args.skip_backtesting else (window_started_epoch - 5.0)
+            extract_started = time.time()
             plan_count = extract_window_plans(
                 src_plan_dir,
                 window_plan_dir,
@@ -569,6 +937,11 @@ def main() -> int:
                 min_mtime_epoch=min_mtime_epoch,
             )
             row.plans_file_count = int(plan_count)
+            print(
+                f"[walkforward] window {idx} stage=extract_plans status=done plans={int(plan_count)} "
+                f"elapsed_sec={int(max(0.0, time.time() - extract_started))}",
+                flush=True,
+            )
             if plan_count <= 0:
                 raise RuntimeError(
                     f"No plan snapshots found for window {timerange} under {src_plan_dir}"
@@ -607,12 +980,28 @@ def main() -> int:
             )
             if args.sim_extra.strip():
                 sim_inner = f"{sim_inner} {args.sim_extra.strip()}"
+            sim_started = time.time()
+            print(f"[walkforward] window {idx} stage=simulate status=start timerange={timerange}", flush=True)
+            sim_paths = {
+                "result_json": result_local,
+                "fills_csv": Path(str(result_local).replace(".json", ".fills.csv")),
+                "curve_csv": Path(str(result_local).replace(".json", ".curve.csv")),
+                "events_csv": Path(str(result_local).replace(".json", ".events.csv")),
+            }
+            sim_probe = lambda: _probe_path_sizes(sim_paths)
             run_compose_inner(
                 root_dir,
                 args.service,
                 sim_inner,
                 env_exports=env_exports,
+                heartbeat_sec=int(args.heartbeat_sec),
+                progress_label=f"window_{idx:03d}_simulate",
+                progress_probe=sim_probe,
                 dry_run=args.dry_run,
+            )
+            print(
+                f"[walkforward] window {idx} stage=simulate status=done elapsed_sec={int(max(0.0, time.time() - sim_started))}",
+                flush=True,
             )
 
             row.result_file = str(result_local)
@@ -622,6 +1011,8 @@ def main() -> int:
                 row.pnl_pct = sim["pnl_pct"]
                 row.initial_equity = sim["initial_equity"]
                 row.end_equity = sim["end_equity"]
+                row.end_quote = sim["end_quote"]
+                row.end_base = sim["end_base"]
                 row.fills = sim["fills"]
                 row.stop_events = sim["stop_events"]
                 row.seed_events = sim["seed_events"]
@@ -669,30 +1060,34 @@ def main() -> int:
             cur_quote = float(args.start_quote)
             cur_base = float(args.start_base)
 
+        done = len(rows)
+        if not args.dry_run:
+            summary_path_ckpt, csv_path_ckpt, agg_ckpt = write_outputs(out_dir, run_id, args, rows)
+            print(
+                f"[walkforward] checkpoint done={done}/{len(windows)} pct={_format_pct(done, len(windows))} "
+                f"ok={int(agg_ckpt.get('windows_ok', 0))} failed={int(agg_ckpt.get('windows_failed', 0))}",
+                flush=True,
+            )
+            print(f"[walkforward] checkpoint wrote {summary_path_ckpt}", flush=True)
+            print(f"[walkforward] checkpoint wrote {csv_path_ckpt}", flush=True)
+        else:
+            print(
+                f"[walkforward] checkpoint done={done}/{len(windows)} pct={_format_pct(done, len(windows))} "
+                "dry_run=1 (no files written)",
+                flush=True,
+            )
+
     agg = aggregate(rows)
-    summary = {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "run_id": run_id,
-        "args": vars(args),
-        "aggregate": agg,
-        "windows": [r.as_dict() for r in rows],
-    }
-
-    summary_path = out_dir / "summary.json"
-    with summary_path.open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    csv_path = out_dir / "windows.csv"
-    with csv_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].as_dict().keys()) if rows else [])
-        if rows:
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(r.as_dict())
-
-    print(f"[walkforward] wrote {summary_path}", flush=True)
-    print(f"[walkforward] wrote {csv_path}", flush=True)
-    print(f"[walkforward] aggregate: {agg}", flush=True)
+    if not args.dry_run:
+        summary_path, csv_path, agg = write_outputs(out_dir, run_id, args, rows)
+        print(f"[walkforward] wrote {summary_path}", flush=True)
+        print(f"[walkforward] wrote {csv_path}", flush=True)
+    else:
+        print(
+            f"[walkforward] dry_run complete run_id={run_id} out_dir={out_dir} (no summary/csv written)",
+            flush=True,
+        )
+    print(f"[walkforward] aggregate: {json.dumps(aggregate_brief(agg), sort_keys=True)}", flush=True)
 
     if args.fail_on_window_error and any(r.status != "ok" for r in rows):
         return 1

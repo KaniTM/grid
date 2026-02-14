@@ -6,6 +6,7 @@
 *.pyc
 *.pyo
 *.tmp
+user_data/.probe_from_compose
 
 # Backtest artifacts: keep pointer only
 user_data/backtest_results/**
@@ -28,3 +29,9 @@ user_data/walkforward/**/window_*.result.events.csv
 user_data/walkforward/**/window_*.result.fills.csv
 user_data/walkforward/**/window_*.result.curve.csv
 user_data/walkforward/**/window_*_plans/**
+
+# Regime audit: keep compact report + overrides, ignore heavy verbose dumps
+user_data/regime_audit/**/features.csv
+user_data/regime_audit/**/per_candle_verbose.csv
+user_data/regime_audit/**/transition_events.csv
+user_data/regime_audit/**/transition_events.json

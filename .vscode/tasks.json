@@ -1,0 +1,91 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Codex: Pin Thread ID",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/scripts/codex_thread.sh pin ${input:codexThreadId}",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Codex: Import Pinned Thread",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/scripts/codex_thread.sh import",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Codex: Resume Pinned Thread (Terminal)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/scripts/codex_thread.sh resume",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Codex: Pinned Thread Status",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/scripts/codex_thread.sh status",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Grid: Daily Workflow (Research)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/freqtrade/scripts/run-user-daily-workflow.sh --profile research --cleanup conservative",
+      "options": {
+        "cwd": "${workspaceFolder}/freqtrade"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Grid: Daily Workflow (Light)",
+      "type": "shell",
+      "command": "bash ${workspaceFolder}/freqtrade/scripts/run-user-daily-workflow.sh --profile light --cleanup conservative",
+      "options": {
+        "cwd": "${workspaceFolder}/freqtrade"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "codexThreadId",
+      "type": "promptString",
+      "description": "Codex thread UUID to pin",
+      "default": "019c4f7f-6127-7430-88f8-c13973fc18f8"
+    }
+  ]
+}
