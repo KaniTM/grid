@@ -24,6 +24,7 @@ Environment overrides (common):
   SYNC_TIMERANGE="20200101-20260214"  # needed for SYNC_MODE=full
   SYNC_START_DAY="20200101"       # needed for SYNC_MODE=prepend
   SYNC_END_DAY="20260214"
+  SYNC_STALLED_HEARTBEATS_MAX=10
   EXPORT_LATEST_RUNS=6
   KEEP_WALKFORWARD_RUNS=0         # if >0, prune old run dirs
   KEEP_REGIME_RUNS=0              # if >0, prune old run dirs
@@ -31,8 +32,10 @@ Environment overrides (common):
 Research profile overrides:
   REGIME_TIMERANGE="20200101-20260214"
   REGIME_RUN_ID="regime_daily_20260214"
+  REGIME_STALLED_HEARTBEATS_MAX=10
   WF_TIMERANGE="20200101-20260214"
   WF_RUN_ID="wf_daily_eth_14d"
+  WF_STALLED_HEARTBEATS_MAX=10
 EOF
 }
 
@@ -76,6 +79,7 @@ TIMEFRAMES="${TIMEFRAMES:-15m 1h 4h}"
 SYNC_MODE="${SYNC_MODE:-append}"
 SYNC_OVERLAP_DAYS="${SYNC_OVERLAP_DAYS:-2}"
 SYNC_HEARTBEAT_SEC="${SYNC_HEARTBEAT_SEC:-30}"
+SYNC_STALLED_HEARTBEATS_MAX="${SYNC_STALLED_HEARTBEATS_MAX:-0}"
 SYNC_TIMERANGE="${SYNC_TIMERANGE:-}"
 SYNC_START_DAY="${SYNC_START_DAY:-}"
 SYNC_END_DAY="${SYNC_END_DAY:-}"
@@ -91,6 +95,7 @@ REGIME_TIMEFRAME="${REGIME_TIMEFRAME:-15m}"
 REGIME_TIMERANGE="${REGIME_TIMERANGE:-20200101-${TODAY_UTC}}"
 REGIME_RUN_ID="${REGIME_RUN_ID:-regime_daily_${TODAY_UTC}}"
 REGIME_HEARTBEAT_SEC="${REGIME_HEARTBEAT_SEC:-60}"
+REGIME_STALLED_HEARTBEATS_MAX="${REGIME_STALLED_HEARTBEATS_MAX:-0}"
 REGIME_EMIT_FEATURES="${REGIME_EMIT_FEATURES:-0}"
 REGIME_EMIT_VERBOSE="${REGIME_EMIT_VERBOSE:-0}"
 
@@ -111,6 +116,7 @@ WF_DATA_DIR="${WF_DATA_DIR:-/freqtrade/user_data/data/binance}"
 WF_FEE_PCT="${WF_FEE_PCT:-0.10}"
 WF_MAX_ORDERS_PER_SIDE="${WF_MAX_ORDERS_PER_SIDE:-40}"
 WF_HEARTBEAT_SEC="${WF_HEARTBEAT_SEC:-60}"
+WF_STALLED_HEARTBEATS_MAX="${WF_STALLED_HEARTBEATS_MAX:-0}"
 WF_CARRY_CAPITAL="${WF_CARRY_CAPITAL:-0}"
 WF_CLOSE_ON_STOP="${WF_CLOSE_ON_STOP:-0}"
 WF_REVERSE_FILL="${WF_REVERSE_FILL:-0}"
@@ -166,6 +172,7 @@ run_sync() {
         --overlap-days "${SYNC_OVERLAP_DAYS}"
         --bootstrap-start "${SYNC_BOOTSTRAP_START}"
         --heartbeat-sec "${SYNC_HEARTBEAT_SEC}"
+        --stalled-heartbeats-max "${SYNC_STALLED_HEARTBEATS_MAX}"
     )
     if [[ -n "${SYNC_END_DAY}" ]]; then
         cmd+=(--end-day "${SYNC_END_DAY}")
@@ -196,6 +203,7 @@ run_regime_audit() {
         --timerange "${REGIME_TIMERANGE}"
         --run-id "${REGIME_RUN_ID}"
         --heartbeat-sec "${REGIME_HEARTBEAT_SEC}"
+        --stalled-heartbeats-max "${REGIME_STALLED_HEARTBEATS_MAX}"
     )
     if [[ "${REGIME_EMIT_FEATURES}" == "1" ]]; then
         cmd+=(--emit-features-csv)
@@ -239,6 +247,7 @@ run_walkforward() {
         --run-id "${WF_RUN_ID}"
         --resume
         --heartbeat-sec "${WF_HEARTBEAT_SEC}"
+        --stalled-heartbeats-max "${WF_STALLED_HEARTBEATS_MAX}"
     )
     if [[ "${WF_CARRY_CAPITAL}" == "1" ]]; then
         cmd+=(--carry-capital)

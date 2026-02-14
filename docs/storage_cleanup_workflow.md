@@ -92,7 +92,8 @@ python3 scripts/run-user-data-sync.py \
   --pairs ETH/USDT \
   --timeframes 15m 1h 4h \
   --mode append \
-  --heartbeat-sec 30
+  --heartbeat-sec 30 \
+  --stalled-heartbeats-max 10
 ```
 
 Backfill older history only:
@@ -115,7 +116,8 @@ Walkforward:
 cd freqtrade
 python3 scripts/run-user-walkforward.py ... \
   --resume \
-  --heartbeat-sec 60
+  --heartbeat-sec 60 \
+  --stalled-heartbeats-max 10
 ```
 
 Regime audit:
@@ -123,5 +125,22 @@ Regime audit:
 ```bash
 cd freqtrade
 python3 scripts/run-user-regime-audit.py ... \
-  --heartbeat-sec 60
+  --heartbeat-sec 60 \
+  --stalled-heartbeats-max 10
+```
+
+## Integrity + completion-word check
+
+Every long run now writes status words under `_state/`:
+- `state.json` (latest snapshot)
+- `events.jsonl` (append-only words like `RUN_START`, `WINDOW_DONE`, `RUN_COMPLETE`)
+
+Verify compact artifacts (dates, window sequence, NaN/inf, marker completion):
+
+```bash
+cd freqtrade
+python3 scripts/verify-user-integrity.py \
+  --walkforward-run-id wf_step6_long_A_manual_20200101_20260213 \
+  --walkforward-run-id wf_step6_long_B_audit_20200101_20260213 \
+  --ab-compare user_data/walkforward/wf_step6_long_AB_compare_20200101_20260213.json
 ```

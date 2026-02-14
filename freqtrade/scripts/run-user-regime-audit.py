@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
+from run_state import RunStateTracker
+
 
 def q(text: str) -> str:
     return shlex.quote(text)
@@ -67,6 +69,7 @@ def run_compose_inner(
     heartbeat_sec: int = 60,
     progress_label: str = "",
     progress_probe: Optional[Callable[[], Dict[str, object]]] = None,
+    stalled_heartbeats_max: int = 0,
     dry_run: bool = False,
 ) -> None:
     cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
@@ -81,6 +84,8 @@ def run_compose_inner(
     started = time.time()
     label = str(progress_label).strip() or "compose"
     last_probe: Dict[str, object] = {}
+    stale_heartbeats = 0
+    stale_max = int(max(0, int(stalled_heartbeats_max)))
     while True:
         try:
             rc = proc.wait(timeout=hb)
@@ -98,13 +103,25 @@ def run_compose_inner(
                     probe = {"probe_error": str(exc)}
             changed = int(probe != last_probe)
             last_probe = dict(probe)
+            if changed:
+                stale_heartbeats = 0
+            else:
+                stale_heartbeats += 1
             usage_txt = " ".join(f"{k}={v}" for k, v in usage.items())
             probe_txt = json.dumps(probe, sort_keys=True) if probe else "{}"
             print(
                 f"[regime-audit] heartbeat stage={label} elapsed_sec={elapsed} {usage_txt} "
-                f"progress_changed={changed} probe={probe_txt} still_running=1",
+                f"progress_changed={changed} stale_heartbeats={stale_heartbeats} probe={probe_txt} still_running=1",
                 flush=True,
             )
+            if stale_max > 0 and stale_heartbeats >= stale_max:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"Stalled: no observable probe progress for {stale_heartbeats} heartbeats at stage={label}."
+                )
         except KeyboardInterrupt:
             try:
                 proc.terminate()
@@ -131,7 +148,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=60,
         help="Print periodic heartbeat while compose command is running (0 disables).",
     )
+    ap.add_argument(
+        "--stalled-heartbeats-max",
+        type=int,
+        default=0,
+        help="If >0, abort when probe output is unchanged for this many heartbeats.",
+    )
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--disable-run-state",
+        action="store_true",
+        help="Disable _state marker files (state.json + events.jsonl).",
+    )
     return ap
 
 
@@ -151,6 +179,27 @@ def main() -> int:
     else:
         out_dir = (user_data_dir / "regime_audit" / run_id).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    run_state: Optional[RunStateTracker] = None
+    if not args.disable_run_state:
+        run_state = RunStateTracker(out_dir / "_state" / "state.json", out_dir / "_state" / "events.jsonl")
+        run_state.update(
+            run_type="regime_audit",
+            run_id=str(run_id),
+            out_dir=str(out_dir),
+            status="running",
+            step_word="RUN_START",
+            pair=str(args.pair),
+            timeframe=str(args.timeframe),
+            timerange=str(args.timerange or ""),
+            dry_run=int(bool(args.dry_run)),
+        )
+        run_state.event(
+            "RUN_START",
+            run_id=str(run_id),
+            pair=str(args.pair),
+            timeframe=str(args.timeframe),
+            timerange=str(args.timerange or ""),
+        )
 
     report_local = out_dir / "report.json"
     report_container = to_container_user_data_path(report_local, user_data_dir)
@@ -203,16 +252,35 @@ def main() -> int:
         progress_paths["transitions_json"] = transitions_json_local
 
     print("[regime-audit] stage 1/1 running audit", flush=True)
-    run_compose_inner(
-        root_dir,
-        args.service,
-        inner,
-        heartbeat_sec=int(args.heartbeat_sec),
-        progress_label="regime_audit",
-        progress_probe=lambda: _probe_outputs(progress_paths),
-        dry_run=args.dry_run,
-    )
+    if run_state is not None:
+        run_state.event("AUDIT_START", run_id=str(run_id))
+    try:
+        run_compose_inner(
+            root_dir,
+            args.service,
+            inner,
+            heartbeat_sec=int(args.heartbeat_sec),
+            progress_label="regime_audit",
+            progress_probe=lambda: _probe_outputs(progress_paths),
+            stalled_heartbeats_max=int(args.stalled_heartbeats_max),
+            dry_run=args.dry_run,
+        )
+    except KeyboardInterrupt:
+        if run_state is not None:
+            run_state.update(status="interrupted", step_word="INTERRUPTED")
+            run_state.event("INTERRUPTED", run_id=str(run_id))
+        raise
+    except Exception as exc:
+        if run_state is not None:
+            run_state.update(status="failed", step_word="RUN_FAILED", error=str(exc))
+            run_state.event("RUN_FAILED", run_id=str(run_id), error=str(exc))
+        raise
+    if run_state is not None:
+        run_state.event("AUDIT_DONE", run_id=str(run_id))
     if args.dry_run:
+        if run_state is not None:
+            run_state.update(status="completed", step_word="RUN_COMPLETE", return_code=0)
+            run_state.event("RUN_COMPLETE", run_id=str(run_id), return_code=0, dry_run=1)
         return 0
 
     with report_local.open("r", encoding="utf-8") as f:
@@ -281,6 +349,8 @@ def main() -> int:
             indent=2,
             sort_keys=True,
         )
+    if run_state is not None:
+        run_state.event("OVERRIDES_WRITTEN", path=str(overrides_local))
 
     print(f"[regime-audit] wrote {report_local}", flush=True)
     print(f"[regime-audit] wrote {overrides_local}", flush=True)
@@ -292,6 +362,15 @@ def main() -> int:
         print(f"[regime-audit] wrote {transitions_csv_local}", flush=True)
     if transitions_json_local:
         print(f"[regime-audit] wrote {transitions_json_local}", flush=True)
+    if run_state is not None:
+        run_state.update(
+            status="completed",
+            step_word="RUN_COMPLETE",
+            report_path=str(report_local),
+            overrides_path=str(overrides_local),
+            return_code=0,
+        )
+        run_state.event("RUN_COMPLETE", run_id=str(run_id), return_code=0)
     return 0
 
 

@@ -35,3 +35,7 @@ user_data/regime_audit/**/features.csv
 user_data/regime_audit/**/per_candle_verbose.csv
 user_data/regime_audit/**/transition_events.csv
 user_data/regime_audit/**/transition_events.json
+
+# Run-state marker artifacts (local resume/progress only)
+user_data/run_state/**
+user_data/regime_audit/**/_state/**

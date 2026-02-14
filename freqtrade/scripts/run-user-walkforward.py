@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from run_state import RunStateTracker
+
 
 @dataclass
 class WindowResult:
@@ -238,6 +240,7 @@ def run_compose_inner(
     heartbeat_sec: int = 60,
     progress_label: str = "",
     progress_probe: Optional[Callable[[], Dict[str, object]]] = None,
+    stalled_heartbeats_max: int = 0,
     dry_run: bool = False,
 ) -> None:
     if env_exports:
@@ -256,6 +259,8 @@ def run_compose_inner(
     started = time.time()
     label = str(progress_label).strip() or "compose"
     last_probe: Dict[str, object] = {}
+    stale_heartbeats = 0
+    stale_max = int(max(0, int(stalled_heartbeats_max)))
     while True:
         try:
             rc = proc.wait(timeout=hb)
@@ -273,13 +278,25 @@ def run_compose_inner(
                     probe = {"probe_error": str(exc)}
             changed = int(probe != last_probe)
             last_probe = dict(probe)
+            if changed:
+                stale_heartbeats = 0
+            else:
+                stale_heartbeats += 1
             usage_txt = " ".join(f"{k}={v}" for k, v in usage.items())
             probe_txt = json.dumps(probe, sort_keys=True) if probe else "{}"
             print(
                 f"[walkforward] heartbeat stage={label} elapsed_sec={elapsed} {usage_txt} "
-                f"progress_changed={changed} probe={probe_txt} still_running=1",
+                f"progress_changed={changed} stale_heartbeats={stale_heartbeats} probe={probe_txt} still_running=1",
                 flush=True,
             )
+            if stale_max > 0 and stale_heartbeats >= stale_max:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"Stalled: no observable probe progress for {stale_heartbeats} heartbeats at stage={label}."
+                )
         except KeyboardInterrupt:
             try:
                 proc.terminate()
@@ -685,6 +702,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=60,
         help="Print periodic heartbeat while compose commands are running (0 disables).",
     )
+    ap.add_argument(
+        "--stalled-heartbeats-max",
+        type=int,
+        default=0,
+        help="If >0, abort when probe output is unchanged for this many heartbeats.",
+    )
     ap.add_argument("--fail-on-window-error", action="store_true")
     ap.add_argument(
         "--allow-overlap",
@@ -695,6 +718,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-single-plan",
         action="store_true",
         help="Allow windows with only one plan snapshot (disables time-varying coverage enforcement).",
+    )
+    ap.add_argument(
+        "--disable-run-state",
+        action="store_true",
+        help="Disable _state marker files (state.json + events.jsonl).",
     )
     return ap
 
@@ -726,6 +754,29 @@ def main() -> int:
     out_dir = user_data_dir / "walkforward" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_path = out_dir / "summary.json"
+    run_state: Optional[RunStateTracker] = None
+    if not args.disable_run_state:
+        run_state = RunStateTracker(out_dir / "_state" / "state.json", out_dir / "_state" / "events.jsonl")
+        run_state.update(
+            run_type="walkforward",
+            run_id=run_id,
+            out_dir=str(out_dir),
+            timerange=str(args.timerange),
+            status="running",
+            step_word="RUN_START",
+            windows_total=int(len(windows)),
+            windows_completed=0,
+            windows_ok=0,
+            windows_failed=0,
+            pct_complete=_format_pct(0, len(windows)),
+            dry_run=int(bool(args.dry_run)),
+        )
+        run_state.event(
+            "RUN_START",
+            run_id=run_id,
+            timerange=str(args.timerange),
+            windows_total=int(len(windows)),
+        )
 
     existing_rows_by_index: Dict[int, WindowResult] = {}
     if args.resume and summary_path.exists():
@@ -797,6 +848,12 @@ def main() -> int:
             f"[walkforward] resume loaded previous windows={len(existing_rows_by_index)} from {summary_path}",
             flush=True,
         )
+        if run_state is not None:
+            run_state.event(
+                "RESUME_SCAN_DONE",
+                summary_path=str(summary_path),
+                previous_windows=int(len(existing_rows_by_index)),
+            )
 
     env_exports: List[str] = []
     if args.regime_threshold_profile:
@@ -825,6 +882,13 @@ def main() -> int:
 
     for idx, ws, we in windows:
         timerange = f"{fmt_day(ws)}-{fmt_day(we)}"
+        if run_state is not None:
+            run_state.event(
+                "WINDOW_START",
+                window_index=int(idx),
+                windows_total=int(len(windows)),
+                timerange=timerange,
+            )
         existing_row = existing_rows_by_index.get(int(idx))
         if args.resume and existing_row and str(existing_row.status).lower() == "ok":
             result_file_exists = False
@@ -871,6 +935,25 @@ def main() -> int:
                         f"[walkforward] checkpoint done={len(rows)}/{len(windows)} dry_run=1 (no files written)",
                         flush=True,
                     )
+                    agg_ckpt = aggregate(rows)
+                if run_state is not None:
+                    run_state.event(
+                        "WINDOW_RESUME_SKIP",
+                        window_index=int(idx),
+                        timerange=timerange,
+                        result_file_exists=int(result_file_exists),
+                    )
+                    run_state.update(
+                        status="running",
+                        step_word="WINDOW_DONE",
+                        last_window_index=int(idx),
+                        last_window_timerange=timerange,
+                        last_window_status="ok",
+                        windows_completed=int(len(rows)),
+                        windows_ok=int(agg_ckpt.get("windows_ok", 0)),
+                        windows_failed=int(agg_ckpt.get("windows_failed", 0)),
+                        pct_complete=_format_pct(len(rows), len(windows)),
+                    )
                 continue
 
         print(
@@ -910,6 +993,8 @@ def main() -> int:
                     f"[walkforward] window {idx} stage=backtesting status=start timerange={timerange}",
                     flush=True,
                 )
+                if run_state is not None:
+                    run_state.event("WINDOW_BACKTEST_START", window_index=int(idx), timerange=timerange)
                 backtest_probe = lambda: {"plan_files": int(_count_plan_files(src_plan_dir))}
                 run_compose_inner(
                     root_dir,
@@ -919,12 +1004,15 @@ def main() -> int:
                     heartbeat_sec=int(args.heartbeat_sec),
                     progress_label=f"window_{idx:03d}_backtesting",
                     progress_probe=backtest_probe,
+                    stalled_heartbeats_max=int(args.stalled_heartbeats_max),
                     dry_run=args.dry_run,
                 )
                 print(
                     f"[walkforward] window {idx} stage=backtesting status=done elapsed_sec={int(max(0.0, time.time() - backtest_started))}",
                     flush=True,
                 )
+                if run_state is not None:
+                    run_state.event("WINDOW_BACKTEST_DONE", window_index=int(idx), timerange=timerange)
 
             window_plan_dir = out_dir / f"window_{idx:03d}_plans"
             min_mtime_epoch = None if args.skip_backtesting else (window_started_epoch - 5.0)
@@ -942,6 +1030,13 @@ def main() -> int:
                 f"elapsed_sec={int(max(0.0, time.time() - extract_started))}",
                 flush=True,
             )
+            if run_state is not None:
+                run_state.event(
+                    "WINDOW_EXTRACT_DONE",
+                    window_index=int(idx),
+                    timerange=timerange,
+                    plan_count=int(plan_count),
+                )
             if plan_count <= 0:
                 raise RuntimeError(
                     f"No plan snapshots found for window {timerange} under {src_plan_dir}"
@@ -982,6 +1077,8 @@ def main() -> int:
                 sim_inner = f"{sim_inner} {args.sim_extra.strip()}"
             sim_started = time.time()
             print(f"[walkforward] window {idx} stage=simulate status=start timerange={timerange}", flush=True)
+            if run_state is not None:
+                run_state.event("WINDOW_SIM_START", window_index=int(idx), timerange=timerange)
             sim_paths = {
                 "result_json": result_local,
                 "fills_csv": Path(str(result_local).replace(".json", ".fills.csv")),
@@ -997,12 +1094,15 @@ def main() -> int:
                 heartbeat_sec=int(args.heartbeat_sec),
                 progress_label=f"window_{idx:03d}_simulate",
                 progress_probe=sim_probe,
+                stalled_heartbeats_max=int(args.stalled_heartbeats_max),
                 dry_run=args.dry_run,
             )
             print(
                 f"[walkforward] window {idx} stage=simulate status=done elapsed_sec={int(max(0.0, time.time() - sim_started))}",
                 flush=True,
             )
+            if run_state is not None:
+                run_state.event("WINDOW_SIM_DONE", window_index=int(idx), timerange=timerange)
 
             row.result_file = str(result_local)
             if not args.dry_run:
@@ -1045,9 +1145,34 @@ def main() -> int:
             elif not args.carry_capital:
                 cur_quote = float(args.start_quote)
                 cur_base = float(args.start_base)
+        except KeyboardInterrupt:
+            if run_state is not None:
+                run_state.update(
+                    status="interrupted",
+                    step_word="INTERRUPTED",
+                    last_window_index=int(idx),
+                    last_window_timerange=timerange,
+                    last_window_status="interrupted",
+                    windows_completed=int(len(rows)),
+                    pct_complete=_format_pct(len(rows), len(windows)),
+                )
+                run_state.event(
+                    "INTERRUPTED",
+                    window_index=int(idx),
+                    timerange=timerange,
+                    windows_completed=int(len(rows)),
+                )
+            raise
         except Exception as exc:
             row.status = "error"
             row.error = str(exc)
+            if run_state is not None:
+                run_state.event(
+                    "WINDOW_ERROR",
+                    window_index=int(idx),
+                    timerange=timerange,
+                    error=str(exc),
+                )
             if not args.carry_capital:
                 cur_quote = float(args.start_quote)
                 cur_base = float(args.start_base)
@@ -1076,6 +1201,27 @@ def main() -> int:
                 "dry_run=1 (no files written)",
                 flush=True,
             )
+            agg_ckpt = aggregate(rows)
+
+        if run_state is not None:
+            run_state.event(
+                "WINDOW_DONE",
+                window_index=int(idx),
+                timerange=timerange,
+                status=str(row.status),
+                plans_file_count=int(row.plans_file_count or 0),
+            )
+            run_state.update(
+                status="running",
+                step_word=("WINDOW_DONE" if str(row.status).lower() == "ok" else "WINDOW_ERROR"),
+                last_window_index=int(idx),
+                last_window_timerange=timerange,
+                last_window_status=str(row.status),
+                windows_completed=int(done),
+                windows_ok=int(agg_ckpt.get("windows_ok", 0)),
+                windows_failed=int(agg_ckpt.get("windows_failed", 0)),
+                pct_complete=_format_pct(done, len(windows)),
+            )
 
     agg = aggregate(rows)
     if not args.dry_run:
@@ -1089,11 +1235,37 @@ def main() -> int:
         )
     print(f"[walkforward] aggregate: {json.dumps(aggregate_brief(agg), sort_keys=True)}", flush=True)
 
+    rc = 0
+    final_word = "RUN_COMPLETE"
+    final_status = "completed"
     if args.fail_on_window_error and any(r.status != "ok" for r in rows):
-        return 1
-    if int(agg.get("windows_ok", 0)) == 0:
-        return 2
-    return 0
+        rc = 1
+        final_word = "RUN_FAILED"
+        final_status = "failed"
+    elif int(agg.get("windows_ok", 0)) == 0:
+        rc = 2
+        final_word = "RUN_FAILED"
+        final_status = "failed"
+
+    if run_state is not None:
+        run_state.update(
+            status=final_status,
+            step_word=final_word,
+            windows_completed=int(len(rows)),
+            windows_ok=int(agg.get("windows_ok", 0)),
+            windows_failed=int(agg.get("windows_failed", 0)),
+            pct_complete=_format_pct(len(rows), len(windows)),
+            return_code=int(rc),
+        )
+        run_state.event(
+            final_word,
+            run_id=run_id,
+            return_code=int(rc),
+            windows_total=int(agg.get("windows_total", 0)),
+            windows_ok=int(agg.get("windows_ok", 0)),
+            windows_failed=int(agg.get("windows_failed", 0)),
+        )
+    return int(rc)
 
 
 if __name__ == "__main__":

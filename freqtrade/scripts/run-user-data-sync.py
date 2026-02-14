@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from run_state import RunStateTracker
+
 
 def q(text: str) -> str:
     return shlex.quote(text)
@@ -91,6 +93,7 @@ def run_compose_inner(
     heartbeat_sec: int = 60,
     progress_label: str = "",
     progress_probe: Optional[Callable[[], Dict[str, object]]] = None,
+    stalled_heartbeats_max: int = 0,
     dry_run: bool = False,
 ) -> None:
     cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
@@ -105,6 +108,8 @@ def run_compose_inner(
     started = time.time()
     label = str(progress_label).strip() or "compose"
     last_probe: Dict[str, object] = {}
+    stale_heartbeats = 0
+    stale_max = int(max(0, int(stalled_heartbeats_max)))
     while True:
         try:
             rc = proc.wait(timeout=hb)
@@ -122,13 +127,25 @@ def run_compose_inner(
                     probe = {"probe_error": str(exc)}
             changed = int(probe != last_probe)
             last_probe = dict(probe)
+            if changed:
+                stale_heartbeats = 0
+            else:
+                stale_heartbeats += 1
             usage_txt = " ".join(f"{k}={v}" for k, v in usage.items())
             probe_txt = json.dumps(probe, sort_keys=True) if probe else "{}"
             print(
                 f"[data-sync] heartbeat stage={label} elapsed_sec={elapsed} {usage_txt} "
-                f"progress_changed={changed} probe={probe_txt} still_running=1",
+                f"progress_changed={changed} stale_heartbeats={stale_heartbeats} probe={probe_txt} still_running=1",
                 flush=True,
             )
+            if stale_max > 0 and stale_heartbeats >= stale_max:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"Stalled: no observable probe progress for {stale_heartbeats} heartbeats at stage={label}."
+                )
         except KeyboardInterrupt:
             try:
                 proc.terminate()
@@ -206,11 +223,23 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--data-dir", default="/freqtrade/user_data/data/binance")
     ap.add_argument("--data-format-ohlcv", default="feather", choices=["json", "jsongz", "feather", "parquet"])
     ap.add_argument("--service", default="freqtrade")
+    ap.add_argument("--run-id", default=None, help="Run-state id under user_data/run_state/data_sync/")
     ap.add_argument("--trading-mode", default="spot", choices=["spot", "margin", "futures"])
     ap.add_argument("--no-parallel-download", action="store_true")
     ap.add_argument("--heartbeat-sec", type=int, default=30)
+    ap.add_argument(
+        "--stalled-heartbeats-max",
+        type=int,
+        default=0,
+        help="If >0, abort when probe output is unchanged for this many heartbeats.",
+    )
     ap.add_argument("--fail-on-task-error", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--disable-run-state",
+        action="store_true",
+        help="Disable run-state marker files (state.json + events.jsonl).",
+    )
     return ap
 
 
@@ -233,11 +262,39 @@ def main() -> int:
             tasks.append((str(p), str(tf)))
     total = len(tasks)
     print(f"[data-sync] tasks_total={total} mode={args.mode}", flush=True)
+    run_id = str(args.run_id or datetime.now(timezone.utc).strftime("data_sync_%Y%m%dT%H%M%SZ"))
+    run_state: Optional[RunStateTracker] = None
+    if not args.disable_run_state:
+        run_state_dir = user_data_dir / "run_state" / "data_sync" / run_id
+        run_state = RunStateTracker(run_state_dir / "state.json", run_state_dir / "events.jsonl")
+        run_state.update(
+            run_type="data_sync",
+            run_id=run_id,
+            status="running",
+            step_word="RUN_START",
+            mode=str(args.mode),
+            tasks_total=int(total),
+            tasks_completed=0,
+            tasks_failed=0,
+            pct_complete=_format_pct(0, total),
+            dry_run=int(bool(args.dry_run)),
+        )
+        run_state.event("RUN_START", run_id=run_id, mode=str(args.mode), tasks_total=int(total))
 
     failures: List[str] = []
     completed = 0
     for i, (pair, timeframe) in enumerate(tasks, start=1):
         pct = _format_pct(i - 1, total)
+        task_status = "running"
+        terminal_state_written = False
+        if run_state is not None:
+            run_state.event(
+                "TASK_START",
+                task_index=int(i),
+                tasks_total=int(total),
+                pair=str(pair),
+                timeframe=str(timeframe),
+            )
         pair_file = pair_fs(pair)
         file_name = f"{pair_file}-{timeframe}.{args.data_format_ohlcv}"
         container_file = f"{args.data_dir.rstrip('/')}/{file_name}"
@@ -273,11 +330,29 @@ def main() -> int:
 
         if skip_reason:
             completed += 1
+            task_status = "skip"
             print(
                 f"[data-sync] task {i}/{total} pct={_format_pct(i, total)} pair={pair} tf={timeframe} "
                 f"status=skip reason={skip_reason}",
                 flush=True,
             )
+            if run_state is not None:
+                run_state.event(
+                    "TASK_SKIP",
+                    task_index=int(i),
+                    pair=str(pair),
+                    timeframe=str(timeframe),
+                    reason=str(skip_reason),
+                )
+                run_state.update(
+                    status="running",
+                    step_word="TASK_DONE",
+                    tasks_completed=int(completed),
+                    tasks_failed=int(len(failures)),
+                    pct_complete=_format_pct(completed, total),
+                    last_task=f"{pair}|{timeframe}",
+                    last_task_status="skip",
+                )
             continue
 
         print(
@@ -310,6 +385,7 @@ def main() -> int:
                 heartbeat_sec=int(args.heartbeat_sec),
                 progress_label=f"download_{pair_file}_{timeframe}",
                 progress_probe=(lambda hf=host_file: _probe_file(hf)),
+                stalled_heartbeats_max=int(args.stalled_heartbeats_max),
                 dry_run=args.dry_run,
             )
             after = get_coverage(root_dir, args.service, container_file)
@@ -322,14 +398,85 @@ def main() -> int:
                 f"after_min={after_min or 'n/a'} after_max={after_max or 'n/a'}",
                 flush=True,
             )
+            task_status = "ok"
+            if run_state is not None:
+                run_state.event(
+                    "TASK_DONE",
+                    task_index=int(i),
+                    pair=str(pair),
+                    timeframe=str(timeframe),
+                    status="ok",
+                    before_rows=int(before_rows),
+                    after_rows=int(after_rows),
+                    rows_delta=int(after_rows - before_rows),
+                    after_min=after_min or "",
+                    after_max=after_max or "",
+                )
+        except KeyboardInterrupt:
+            task_status = "interrupted"
+            if run_state is not None:
+                run_state.event(
+                    "INTERRUPTED",
+                    task_index=int(i),
+                    pair=str(pair),
+                    timeframe=str(timeframe),
+                    tasks_completed=int(completed),
+                )
+                run_state.update(
+                    status="interrupted",
+                    step_word="INTERRUPTED",
+                    tasks_completed=int(completed),
+                    tasks_failed=int(len(failures)),
+                    pct_complete=_format_pct(completed, total),
+                    last_task=f"{pair}|{timeframe}",
+                    last_task_status="interrupted",
+                )
+            terminal_state_written = True
+            raise
         except Exception as exc:
             msg = f"pair={pair} tf={timeframe} error={exc}"
             failures.append(msg)
+            task_status = "error"
             print(f"[data-sync] task {i}/{total} pct={_format_pct(i, total)} status=error {msg}", flush=True)
+            if run_state is not None:
+                run_state.event(
+                    "TASK_ERROR",
+                    task_index=int(i),
+                    pair=str(pair),
+                    timeframe=str(timeframe),
+                    error=str(exc),
+                )
             if args.fail_on_task_error:
+                if run_state is not None:
+                    run_state.update(
+                        status="failed",
+                        step_word="RUN_FAILED",
+                        tasks_completed=int(completed),
+                        tasks_failed=int(len(failures)),
+                        pct_complete=_format_pct(completed, total),
+                        last_task=f"{pair}|{timeframe}",
+                        last_task_status="error",
+                    )
+                    run_state.event(
+                        "RUN_FAILED",
+                        run_id=run_id,
+                        reason="fail_on_task_error",
+                        task_index=int(i),
+                    )
+                    terminal_state_written = True
                 raise
         finally:
             completed += 1
+            if run_state is not None and (not terminal_state_written):
+                run_state.update(
+                    status="running",
+                    step_word=("TASK_ERROR" if task_status == "error" else "TASK_DONE"),
+                    tasks_completed=int(completed),
+                    tasks_failed=int(len(failures)),
+                    pct_complete=_format_pct(completed, total),
+                    last_task=f"{pair}|{timeframe}",
+                    last_task_status=str(task_status),
+                )
 
     print(
         f"[data-sync] done completed={completed}/{total} pct={_format_pct(completed, total)} failures={len(failures)}",
@@ -337,11 +484,35 @@ def main() -> int:
     )
     for item in failures:
         print(f"[data-sync] failure {item}", flush=True)
-    if failures and args.fail_on_task_error:
-        return 1
-    return 0
+    rc = 0
+    final_word = "RUN_COMPLETE"
+    final_status = "completed"
+    if failures:
+        final_word = "RUN_COMPLETE_WITH_ERRORS"
+        final_status = "completed_with_errors"
+        if args.fail_on_task_error:
+            rc = 1
+            final_word = "RUN_FAILED"
+            final_status = "failed"
+    if run_state is not None:
+        run_state.update(
+            status=final_status,
+            step_word=final_word,
+            tasks_completed=int(completed),
+            tasks_failed=int(len(failures)),
+            pct_complete=_format_pct(completed, total),
+            return_code=int(rc),
+        )
+        run_state.event(
+            final_word,
+            run_id=run_id,
+            return_code=int(rc),
+            tasks_total=int(total),
+            tasks_completed=int(completed),
+            tasks_failed=int(len(failures)),
+        )
+    return int(rc)
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
