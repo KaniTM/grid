@@ -1,0 +1,35 @@
+{
+  "refs": {
+    "ab_compare": {
+      "out_dir": "",
+      "ref_file": "ab_compare.json",
+      "run_id": "",
+      "updated_utc": "2026-02-14T08:02:52.262282+00:00"
+    },
+    "portable_results": {
+      "out_dir": "portable_results/latest",
+      "ref_file": "portable_results.json",
+      "run_id": "",
+      "updated_utc": "2026-02-14T08:04:24.923215+00:00"
+    },
+    "regime_audit": {
+      "out_dir": "regime_audit/regime_calib_long_20240101_20251101_v2",
+      "ref_file": "regime_audit.json",
+      "run_id": "regime_calib_long_20240101_20251101_v2",
+      "updated_utc": "2026-02-14T08:02:52.260686+00:00"
+    },
+    "tuning_shortlist": {
+      "out_dir": "",
+      "ref_file": "tuning_shortlist.json",
+      "run_id": "",
+      "updated_utc": "2026-02-14T08:02:52.263567+00:00"
+    },
+    "walkforward": {
+      "out_dir": "walkforward/wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+      "ref_file": "walkforward.json",
+      "run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+      "updated_utc": "2026-02-14T08:02:52.258654+00:00"
+    }
+  },
+  "updated_utc": "2026-02-14T08:04:24.923215+00:00"
+}

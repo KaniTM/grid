@@ -1,0 +1,17 @@
+{
+  "aggregate": {
+    "avg_pnl_pct": 0.4181205453880722,
+    "sum_pnl_quote": 668.9928726209156,
+    "win_rate": 25.624999999999996,
+    "windows_failed": 0,
+    "windows_ok": 160,
+    "windows_total": 160
+  },
+  "category": "walkforward",
+  "out_dir": "walkforward/wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+  "run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+  "run_type": "walkforward",
+  "summary_path": "walkforward/wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z/summary.json",
+  "updated_utc": "2026-02-14T08:02:52.258654+00:00",
+  "windows_path": "walkforward/wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z/windows.csv"
+}

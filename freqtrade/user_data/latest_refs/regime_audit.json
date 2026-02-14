@@ -1,0 +1,11 @@
+{
+  "category": "regime_audit",
+  "out_dir": "regime_audit/regime_calib_long_20240101_20251101_v2",
+  "overrides_path": "regime_audit/regime_calib_long_20240101_20251101_v2/mode_threshold_overrides.json",
+  "pair": "ETH/USDT",
+  "report_path": "regime_audit/regime_calib_long_20240101_20251101_v2/report.json",
+  "run_id": "regime_calib_long_20240101_20251101_v2",
+  "run_type": "regime_audit",
+  "timeframe": "15m",
+  "updated_utc": "2026-02-14T08:02:52.260686+00:00"
+}
