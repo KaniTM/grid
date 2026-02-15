@@ -1,21 +1,23 @@
 {
-  "ab_compare": "wf_AB_compare_20200101_20260213_exp_osdev_persist_v1.json",
+  "ab_compare": "wf_AB_compare_20200101_20260213_step6B_vs_bbwp_plus3_v2_strictfix2_20260215T101255Z.json",
   "category": "portable_results",
   "manifest_path": "portable_results/latest/manifest.json",
   "mode_threshold_overrides": "regime_audit/regime_daily_20260214/mode_threshold_overrides.json",
   "out_dir": "portable_results/latest",
   "run_type": "portable_export",
-  "updated_utc": "2026-02-14T10:43:43.876844+00:00",
+  "updated_utc": "2026-02-15T12:48:38.179855+00:00",
   "walkforward_runs": [
-    "wf_exp_bbwp_plus3_20200101_20260213_v1",
-    "wf_exp_router_fast_20200101_20260213_v1",
-    "wf_exp_osdev_persist_20200101_20260213_v1",
-    "wf_daily_ETH_USDT_w14_s14",
-    "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
-    "wf_step6_long_A_manual_20200101_20260213_fresh_20260214T012147Z",
-    "wf_step6_long_B_audit_20200101_20260213",
-    "wf_step6_long_A_manual_20200101_20260213",
-    "wf_tune_pass9_adx24",
-    "wf_tune_selected_pass1_check"
+    "wf_step6B_attr_debug_20260215T124506Z",
+    "wf_exp_bbwp_plus3_20200101_20260213_v2_strictfix2",
+    "wf_exp_osdev_persist_20200101_20260213_v3_strict_seq",
+    "wf_exp_router_fast_20200101_20260213_v2_strict",
+    "wf_smoke_supervisor_retry_20260214",
+    "wf_smoke_supervisor_nontransient_20260214",
+    "wf_smoke_failfast_resume_20260214",
+    "wf_exp_router_fast_20200101_20260213_v3_strictfix2",
+    "wf_exp_osdev_persist_20200101_20260213_v2_strictfix2",
+    "wf_parallel_fix_A_20260214T2100Z",
+    "wf_parallel_fix_B_20260214T2100Z",
+    "wf_exp_bbwp_plus3_20200101_20260213_v1"
   ]
 }

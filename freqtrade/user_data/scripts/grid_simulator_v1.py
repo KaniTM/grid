@@ -370,6 +370,13 @@ def _sorted_reason_counts(counter: Dict[str, int]) -> Dict[str, int]:
     return {k: int(v) for k, v in sorted(counter.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))}
 
 
+def _normalize_router_mode(value: object, default: str = "unknown") -> str:
+    mode = str(value or "").strip().lower()
+    if mode in ("intraday", "swing", "pause"):
+        return mode
+    return str(default or "unknown")
+
+
 def extract_start_block_reasons(plan: Dict) -> List[str]:
     diag = plan.get("diagnostics", {}) or {}
     runtime = plan.get("runtime_state", {}) or {}
@@ -825,6 +832,12 @@ def simulate_grid_replay(
     hold_reason_counts: Dict[str, int] = {}
     stop_reason_counts: Dict[str, int] = {}
     stop_event_reason_counts: Dict[str, int] = {}
+    mode_plan_counts: Dict[str, int] = {}
+    mode_desired_counts: Dict[str, int] = {}
+    raw_action_mode_counts: Dict[str, int] = {}
+    effective_action_mode_counts: Dict[str, int] = {}
+    fill_mode_counts: Dict[str, int] = {}
+    fill_mode_side_counts: Dict[str, int] = {}
     last_effective_action_signature: Optional[Tuple] = None
 
     for _, row in df.iterrows():
@@ -861,6 +874,8 @@ def simulate_grid_replay(
         if active_plan is None:
             raw_action_counts["NO_PLAN"] += 1
             effective_action_counts["NO_PLAN"] += 1
+            _increment_reason(raw_action_mode_counts, "NO_PLAN|no_plan", 1)
+            _increment_reason(effective_action_mode_counts, "NO_PLAN|no_plan", 1)
             curve.append(
                 {
                     "ts": ts,
@@ -883,6 +898,14 @@ def simulate_grid_replay(
                 }
             )
             continue
+
+        active_mode = _normalize_router_mode(active_plan.get("mode"), default="unknown")
+        desired_mode = _normalize_router_mode(
+            ((active_plan.get("regime_router") or {}).get("desired_mode")),
+            default="unknown",
+        )
+        _increment_reason(mode_plan_counts, active_mode, 1)
+        _increment_reason(mode_desired_counts, desired_mode, 1)
 
         if "range" not in active_plan or "grid" not in active_plan:
             raise KeyError("Plan schema mismatch during replay: expected keys ['range','grid'].")
@@ -950,6 +973,8 @@ def simulate_grid_replay(
 
         raw_action_counts[raw_action] += 1
         effective_action_counts[effective_action] += 1
+        _increment_reason(raw_action_mode_counts, f"{raw_action}|{active_mode}", 1)
+        _increment_reason(effective_action_mode_counts, f"{effective_action}|{active_mode}", 1)
         if suppression_reason is not None:
             _increment_reason(action_suppression_counts, suppression_reason, 1)
             events.append(
@@ -1007,6 +1032,8 @@ def simulate_grid_replay(
                 fee_quote = proceeds * fee
                 quote += proceeds - fee_quote
                 fills.append(FillSim(ts, "sell", c, base, fee_quote, stop_reason))
+                _increment_reason(fill_mode_counts, active_mode, 1)
+                _increment_reason(fill_mode_side_counts, f"sell|{active_mode}", 1)
                 base = 0.0
                 close_on_stop_count += 1
 
@@ -1138,6 +1165,8 @@ def simulate_grid_replay(
                         base += od.qty_base
                         od.status = "filled"
                         fills.append(FillSim(ts, "buy", od.price, od.qty_base, fee_quote, "FILL"))
+                        _increment_reason(fill_mode_counts, active_mode, 1)
+                        _increment_reason(fill_mode_side_counts, f"buy|{active_mode}", 1)
                         newly_filled.append(od)
                     else:
                         remaining.append(od)
@@ -1154,6 +1183,8 @@ def simulate_grid_replay(
                         quote += (proceeds - fee_quote)
                         od.status = "filled"
                         fills.append(FillSim(ts, "sell", od.price, od.qty_base, fee_quote, "FILL"))
+                        _increment_reason(fill_mode_counts, active_mode, 1)
+                        _increment_reason(fill_mode_side_counts, f"sell|{active_mode}", 1)
                         newly_filled.append(od)
                     else:
                         remaining.append(od)
@@ -1233,6 +1264,12 @@ def simulate_grid_replay(
             "actions": effective_action_counts,
             "raw_actions": raw_action_counts,
             "effective_actions": effective_action_counts,
+            "mode_plan_counts": _sorted_reason_counts(mode_plan_counts),
+            "mode_desired_counts": _sorted_reason_counts(mode_desired_counts),
+            "raw_action_mode_counts": _sorted_reason_counts(raw_action_mode_counts),
+            "effective_action_mode_counts": _sorted_reason_counts(effective_action_mode_counts),
+            "fill_mode_counts": _sorted_reason_counts(fill_mode_counts),
+            "fill_mode_side_counts": _sorted_reason_counts(fill_mode_side_counts),
             "action_suppression_counts": _sorted_reason_counts(action_suppression_counts),
             "action_suppressed_total": int(sum(action_suppression_counts.values())),
             "stop_events": int(stop_count),

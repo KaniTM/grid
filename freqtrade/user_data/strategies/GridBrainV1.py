@@ -24,6 +24,7 @@ class GridBrainV1(IStrategy):
     - Writes plan files under:
         user_data/grid_plans/<exchange>/<pair>/grid_plan.latest.json
         user_data/grid_plans/<exchange>/<pair>/grid_plan.<timestamp>.json
+      - Optional override for automation: GRID_PLANS_ROOT_REL
 
     Architecture:
       - Freqtrade/Strategy = Brain (signals + range + sizing + stop triggers)
@@ -934,7 +935,16 @@ class GridBrainV1(IStrategy):
 
     def _plan_dir(self, exchange_name: str, pair: str) -> str:
         safe_pair = pair.replace("/", "_").replace(":", "_")
-        return os.path.join("/freqtrade/user_data", self.plans_root_rel, exchange_name, safe_pair)
+        root_rel_env = str(os.getenv("GRID_PLANS_ROOT_REL", "") or "").strip()
+        if root_rel_env:
+            root_base = (
+                root_rel_env
+                if os.path.isabs(root_rel_env)
+                else os.path.join("/freqtrade/user_data", root_rel_env)
+            )
+        else:
+            root_base = os.path.join("/freqtrade/user_data", self.plans_root_rel)
+        return os.path.join(root_base, exchange_name, safe_pair)
 
     def _write_plan(self, exchange_name: str, pair: str, plan: dict) -> None:
         out_dir = self._plan_dir(exchange_name, pair)

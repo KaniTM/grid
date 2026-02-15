@@ -15,11 +15,13 @@ import argparse
 import csv
 import json
 import os
+import re
 import shlex
 import shutil
 import statistics
 import subprocess
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +39,7 @@ class WindowResult:
     end_day: str
     status: str
     error: str = ""
+    error_report_file: str = ""
     result_file: str = ""
     plans_file_count: int = 0
     pnl_quote: Optional[float] = None
@@ -53,6 +56,12 @@ class WindowResult:
     action_start: Optional[int] = None
     action_hold: Optional[int] = None
     action_stop: Optional[int] = None
+    mode_plan_counts: Optional[Dict[str, int]] = None
+    mode_desired_counts: Optional[Dict[str, int]] = None
+    raw_action_mode_counts: Optional[Dict[str, int]] = None
+    effective_action_mode_counts: Optional[Dict[str, int]] = None
+    fill_mode_counts: Optional[Dict[str, int]] = None
+    fill_mode_side_counts: Optional[Dict[str, int]] = None
     start_blocker_counts: Optional[Dict[str, int]] = None
     start_counterfactual_single_counts: Optional[Dict[str, int]] = None
     start_counterfactual_combo_counts: Optional[Dict[str, int]] = None
@@ -73,6 +82,7 @@ class WindowResult:
             "end_day": self.end_day,
             "status": self.status,
             "error": self.error,
+            "error_report_file": self.error_report_file,
             "result_file": self.result_file,
             "plans_file_count": self.plans_file_count,
             "pnl_quote": self.pnl_quote,
@@ -89,6 +99,12 @@ class WindowResult:
             "action_start": self.action_start,
             "action_hold": self.action_hold,
             "action_stop": self.action_stop,
+            "mode_plan_counts": json.dumps(self.mode_plan_counts or {}, sort_keys=True),
+            "mode_desired_counts": json.dumps(self.mode_desired_counts or {}, sort_keys=True),
+            "raw_action_mode_counts": json.dumps(self.raw_action_mode_counts or {}, sort_keys=True),
+            "effective_action_mode_counts": json.dumps(self.effective_action_mode_counts or {}, sort_keys=True),
+            "fill_mode_counts": json.dumps(self.fill_mode_counts or {}, sort_keys=True),
+            "fill_mode_side_counts": json.dumps(self.fill_mode_side_counts or {}, sort_keys=True),
             "start_blocker_counts": json.dumps(self.start_blocker_counts or {}, sort_keys=True),
             "start_counterfactual_single_counts": json.dumps(
                 self.start_counterfactual_single_counts or {}, sort_keys=True
@@ -120,6 +136,64 @@ def parse_day_timerange(timerange: str) -> Tuple[datetime, datetime]:
 
 def fmt_day(dt: datetime) -> str:
     return dt.strftime("%Y%m%d")
+
+
+def _safe_path_fragment(text: str) -> str:
+    raw = str(text or "")
+    out = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in raw)
+    out = out.strip("_")
+    return out or "run"
+
+
+_TRANSIENT_ERROR_PATTERNS: List[re.Pattern[str]] = [
+    re.compile(r"RequestTimeout", re.IGNORECASE),
+    re.compile(r"TemporaryError", re.IGNORECASE),
+    re.compile(r"Could not load markets", re.IGNORECASE),
+    re.compile(r"timed?\s*out", re.IGNORECASE),
+    re.compile(r"Too Many Requests", re.IGNORECASE),
+    re.compile(r"\b429\b"),
+    re.compile(r"DDoSProtection", re.IGNORECASE),
+    re.compile(r"NetworkError", re.IGNORECASE),
+    re.compile(r"ServiceUnavailable", re.IGNORECASE),
+    re.compile(r"Connection (?:reset|aborted|refused)", re.IGNORECASE),
+]
+
+
+def _is_transient_error(text: str) -> bool:
+    payload = str(text or "")
+    if not payload:
+        return False
+    return any(p.search(payload) for p in _TRANSIENT_ERROR_PATTERNS)
+
+
+def _write_window_error_report(
+    out_dir: Path,
+    run_id: str,
+    window_index: int,
+    timerange: str,
+    stage: str,
+    stage_cmd: str,
+    exc: Exception,
+) -> Path:
+    err_dir = out_dir / "errors"
+    err_dir.mkdir(parents=True, exist_ok=True)
+    report_path = err_dir / f"window_{int(window_index):03d}.error.json"
+    err_text = str(exc) or repr(exc)
+    payload = {
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "run_id": str(run_id),
+        "window_index": int(window_index),
+        "timerange": str(timerange),
+        "stage": str(stage or ""),
+        "stage_cmd": str(stage_cmd or ""),
+        "error_type": type(exc).__name__,
+        "error": err_text,
+        "error_transient": int(_is_transient_error(err_text)),
+        "traceback": traceback.format_exc(),
+    }
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return report_path
 
 
 def iter_windows(
@@ -347,6 +421,7 @@ def window_result_from_dict(raw: Dict) -> WindowResult:
         end_day=str(raw.get("end_day", "")),
         status=str(raw.get("status", "")),
         error=str(raw.get("error", "")),
+        error_report_file=str(raw.get("error_report_file", "")),
         result_file=str(raw.get("result_file", "")),
         plans_file_count=int(raw.get("plans_file_count") or 0),
         pnl_quote=_to_float_optional(raw.get("pnl_quote")),
@@ -363,6 +438,12 @@ def window_result_from_dict(raw: Dict) -> WindowResult:
         action_start=_to_int_optional(raw.get("action_start")),
         action_hold=_to_int_optional(raw.get("action_hold")),
         action_stop=_to_int_optional(raw.get("action_stop")),
+        mode_plan_counts=_to_dict_counts(raw.get("mode_plan_counts")),
+        mode_desired_counts=_to_dict_counts(raw.get("mode_desired_counts")),
+        raw_action_mode_counts=_to_dict_counts(raw.get("raw_action_mode_counts")),
+        effective_action_mode_counts=_to_dict_counts(raw.get("effective_action_mode_counts")),
+        fill_mode_counts=_to_dict_counts(raw.get("fill_mode_counts")),
+        fill_mode_side_counts=_to_dict_counts(raw.get("fill_mode_side_counts")),
         start_blocker_counts=_to_dict_counts(raw.get("start_blocker_counts")),
         start_counterfactual_single_counts=_to_dict_counts(raw.get("start_counterfactual_single_counts")),
         start_counterfactual_combo_counts=_to_dict_counts(raw.get("start_counterfactual_combo_counts")),
@@ -552,12 +633,42 @@ def _top_reason(counter: Dict[str, int]) -> Optional[str]:
     return f"{k}:{int(v)}"
 
 
+def _project_action_mode_counts(counter: Dict[str, int], action: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    prefix = f"{str(action or '').strip().upper()}|"
+    if not prefix.strip("|"):
+        return out
+    for raw_key, raw_val in (counter or {}).items():
+        key = str(raw_key or "")
+        if not key.startswith(prefix):
+            continue
+        mode = key[len(prefix) :].strip() or "unknown"
+        out[mode] = int(out.get(mode, 0)) + int(raw_val or 0)
+    return {k: int(v) for k, v in sorted(out.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))}
+
+
+def _count_shares(counter: Dict[str, int]) -> Dict[str, float]:
+    total = int(sum(int(v) for v in (counter or {}).values()))
+    if total <= 0:
+        return {}
+    out: Dict[str, float] = {}
+    for k, v in (counter or {}).items():
+        out[str(k)] = round(float(int(v) / total), 6)
+    return {k: float(v) for k, v in sorted(out.items(), key=lambda kv: (-float(kv[1]), str(kv[0])))}
+
+
 def load_sim_summary(result_path: Path) -> Dict:
     with result_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     summary = payload.get("summary", {}) or {}
     fills = payload.get("fills", []) or []
     actions = summary.get("actions", {}) or {}
+    mode_plan_counts = _coerce_reason_counts(summary.get("mode_plan_counts", {}))
+    mode_desired_counts = _coerce_reason_counts(summary.get("mode_desired_counts", {}))
+    raw_action_mode_counts = _coerce_reason_counts(summary.get("raw_action_mode_counts", {}))
+    effective_action_mode_counts = _coerce_reason_counts(summary.get("effective_action_mode_counts", {}))
+    fill_mode_counts = _coerce_reason_counts(summary.get("fill_mode_counts", {}))
+    fill_mode_side_counts = _coerce_reason_counts(summary.get("fill_mode_side_counts", {}))
     start_blocker_counts = _coerce_reason_counts(summary.get("start_blocker_counts", {}))
     start_counterfactual_single_counts = _coerce_reason_counts(
         summary.get("start_counterfactual_single_counts", {})
@@ -582,6 +693,12 @@ def load_sim_summary(result_path: Path) -> Dict:
         "action_start": int(actions.get("START", 0)),
         "action_hold": int(actions.get("HOLD", 0)),
         "action_stop": int(actions.get("STOP", 0)),
+        "mode_plan_counts": mode_plan_counts,
+        "mode_desired_counts": mode_desired_counts,
+        "raw_action_mode_counts": raw_action_mode_counts,
+        "effective_action_mode_counts": effective_action_mode_counts,
+        "fill_mode_counts": fill_mode_counts,
+        "fill_mode_side_counts": fill_mode_side_counts,
         "end_quote": float(summary.get("end_quote", 0.0)),
         "end_base": float(summary.get("end_base", 0.0)),
         "start_blocker_counts": start_blocker_counts,
@@ -639,6 +756,24 @@ def aggregate(rows: List[WindowResult]) -> Dict:
     stop_reason_counts_combined_total = _merge_reason_counts(
         [r.stop_reason_counts_combined or {} for r in ok if r.stop_reason_counts_combined is not None]
     )
+    mode_plan_counts_total = _merge_reason_counts(
+        [r.mode_plan_counts or {} for r in ok if r.mode_plan_counts is not None]
+    )
+    mode_desired_counts_total = _merge_reason_counts(
+        [r.mode_desired_counts or {} for r in ok if r.mode_desired_counts is not None]
+    )
+    raw_action_mode_counts_total = _merge_reason_counts(
+        [r.raw_action_mode_counts or {} for r in ok if r.raw_action_mode_counts is not None]
+    )
+    effective_action_mode_counts_total = _merge_reason_counts(
+        [r.effective_action_mode_counts or {} for r in ok if r.effective_action_mode_counts is not None]
+    )
+    fill_mode_counts_total = _merge_reason_counts(
+        [r.fill_mode_counts or {} for r in ok if r.fill_mode_counts is not None]
+    )
+    fill_mode_side_counts_total = _merge_reason_counts(
+        [r.fill_mode_side_counts or {} for r in ok if r.fill_mode_side_counts is not None]
+    )
     out["start_blocker_counts_total"] = start_blocker_counts_total
     out["start_counterfactual_single_counts_total"] = start_counterfactual_single_counts_total
     out["start_counterfactual_combo_counts_total"] = start_counterfactual_combo_counts_total
@@ -646,6 +781,19 @@ def aggregate(rows: List[WindowResult]) -> Dict:
     out["stop_reason_counts_total"] = stop_reason_counts_total
     out["stop_event_reason_counts_total"] = stop_event_reason_counts_total
     out["stop_reason_counts_combined_total"] = stop_reason_counts_combined_total
+    out["mode_plan_counts_total"] = mode_plan_counts_total
+    out["mode_desired_counts_total"] = mode_desired_counts_total
+    out["raw_action_mode_counts_total"] = raw_action_mode_counts_total
+    out["effective_action_mode_counts_total"] = effective_action_mode_counts_total
+    out["fill_mode_counts_total"] = fill_mode_counts_total
+    out["fill_mode_side_counts_total"] = fill_mode_side_counts_total
+    out["start_mode_counts_total"] = _project_action_mode_counts(effective_action_mode_counts_total, "START")
+    out["hold_mode_counts_total"] = _project_action_mode_counts(effective_action_mode_counts_total, "HOLD")
+    out["stop_mode_counts_total"] = _project_action_mode_counts(effective_action_mode_counts_total, "STOP")
+    out["mode_plan_shares_total"] = _count_shares(mode_plan_counts_total)
+    out["mode_desired_shares_total"] = _count_shares(mode_desired_counts_total)
+    out["start_mode_shares_total"] = _count_shares(out["start_mode_counts_total"])
+    out["fill_mode_shares_total"] = _count_shares(fill_mode_counts_total)
     out["top_start_blocker"] = _top_reason(start_blocker_counts_total)
     out["top_start_counterfactual_single"] = _top_reason(start_counterfactual_single_counts_total)
     out["top_start_counterfactual_combo"] = _top_reason(start_counterfactual_combo_counts_total)
@@ -709,7 +857,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="If >0, abort when probe output is unchanged for this many heartbeats.",
     )
-    ap.add_argument("--fail-on-window-error", action="store_true")
+    ap.add_argument(
+        "--fail-on-window-error",
+        action="store_true",
+        help="Fail fast on first window error (stop run early and return non-zero).",
+    )
     ap.add_argument(
         "--allow-overlap",
         action="store_true",
@@ -754,6 +906,10 @@ def main() -> int:
     run_id = args.run_id or datetime.now(timezone.utc).strftime("wf_%Y%m%dT%H%M%SZ")
     out_dir = user_data_dir / "walkforward" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    invocation_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    plan_root_rel = (
+        f"walkforward_runtime_plans/{_safe_path_fragment(run_id)}_{invocation_tag}_{int(os.getpid())}"
+    )
     summary_path = out_dir / "summary.json"
     run_state: Optional[RunStateTracker] = None
     if not args.disable_run_state:
@@ -771,12 +927,14 @@ def main() -> int:
             windows_failed=0,
             pct_complete=_format_pct(0, len(windows)),
             dry_run=int(bool(args.dry_run)),
+            runtime_plans_root_rel=str(plan_root_rel),
         )
         run_state.event(
             "RUN_START",
             run_id=run_id,
             timerange=str(args.timerange),
             windows_total=int(len(windows)),
+            runtime_plans_root_rel=str(plan_root_rel),
         )
 
     existing_rows_by_index: Dict[int, WindowResult] = {}
@@ -857,6 +1015,7 @@ def main() -> int:
             )
 
     env_exports: List[str] = []
+    env_exports.append(f"export GRID_PLANS_ROOT_REL={q(str(plan_root_rel))}")
     if args.regime_threshold_profile:
         env_exports.append(f"export GRID_REGIME_THRESHOLD_PROFILE={q(str(args.regime_threshold_profile).strip())}")
     if args.mode_thresholds_path:
@@ -873,9 +1032,13 @@ def main() -> int:
         env_exports.append(f"export GRID_MODE_THRESHOLDS_PATH={q(mode_path_out)}")
 
     pair_fs = args.pair.replace("/", "_").replace(":", "_")
-    src_plan_dir = user_data_dir / "grid_plans" / args.exchange / pair_fs
+    src_plan_dir = user_data_dir / Path(plan_root_rel) / args.exchange / pair_fs
 
-    print(f"[walkforward] windows={len(windows)} out_dir={out_dir}", flush=True)
+    print(
+        f"[walkforward] windows={len(windows)} out_dir={out_dir} "
+        f"runtime_plans_root_rel={plan_root_rel}",
+        flush=True,
+    )
 
     rows: List[WindowResult] = []
     cur_quote = float(args.start_quote)
@@ -972,6 +1135,8 @@ def main() -> int:
             status="ok",
         )
 
+        window_stage = "init"
+        window_stage_cmd = ""
         try:
             window_started_epoch = time.time()
             if not args.skip_backtesting:
@@ -989,6 +1154,8 @@ def main() -> int:
                 )
                 if args.backtesting_extra.strip():
                     backtesting_inner = f"{backtesting_inner} {args.backtesting_extra.strip()}"
+                window_stage = "backtesting"
+                window_stage_cmd = backtesting_inner
                 backtest_started = time.time()
                 print(
                     f"[walkforward] window {idx} stage=backtesting status=start timerange={timerange}",
@@ -1017,6 +1184,8 @@ def main() -> int:
 
             window_plan_dir = out_dir / f"window_{idx:03d}_plans"
             min_mtime_epoch = None if args.skip_backtesting else (window_started_epoch - 5.0)
+            window_stage = "extract_plans"
+            window_stage_cmd = ""
             extract_started = time.time()
             plan_count = extract_window_plans(
                 src_plan_dir,
@@ -1076,6 +1245,8 @@ def main() -> int:
             )
             if args.sim_extra.strip():
                 sim_inner = f"{sim_inner} {args.sim_extra.strip()}"
+            window_stage = "simulate"
+            window_stage_cmd = sim_inner
             sim_started = time.time()
             print(f"[walkforward] window {idx} stage=simulate status=start timerange={timerange}", flush=True)
             if run_state is not None:
@@ -1122,6 +1293,12 @@ def main() -> int:
                 row.action_start = sim["action_start"]
                 row.action_hold = sim["action_hold"]
                 row.action_stop = sim["action_stop"]
+                row.mode_plan_counts = sim["mode_plan_counts"]
+                row.mode_desired_counts = sim["mode_desired_counts"]
+                row.raw_action_mode_counts = sim["raw_action_mode_counts"]
+                row.effective_action_mode_counts = sim["effective_action_mode_counts"]
+                row.fill_mode_counts = sim["fill_mode_counts"]
+                row.fill_mode_side_counts = sim["fill_mode_side_counts"]
                 row.start_blocker_counts = sim["start_blocker_counts"]
                 row.start_counterfactual_single_counts = sim["start_counterfactual_single_counts"]
                 row.start_counterfactual_combo_counts = sim["start_counterfactual_combo_counts"]
@@ -1166,13 +1343,35 @@ def main() -> int:
             raise
         except Exception as exc:
             row.status = "error"
-            row.error = str(exc)
+            row.error = str(exc) or repr(exc)
+            err_report = _write_window_error_report(
+                out_dir=out_dir,
+                run_id=run_id,
+                window_index=int(idx),
+                timerange=timerange,
+                stage=window_stage,
+                stage_cmd=window_stage_cmd,
+                exc=exc,
+            )
+            row.error_report_file = str(err_report)
+            transient = int(_is_transient_error(row.error))
             if run_state is not None:
                 run_state.event(
                     "WINDOW_ERROR",
                     window_index=int(idx),
                     timerange=timerange,
-                    error=str(exc),
+                    stage=window_stage,
+                    error=row.error,
+                    error_transient=transient,
+                    error_report_file=str(err_report),
+                )
+                run_state.update(
+                    error=row.error,
+                    last_error_stage=str(window_stage),
+                    last_error_window_index=int(idx),
+                    last_error_timerange=timerange,
+                    last_error_transient=transient,
+                    last_error_report_file=str(err_report),
                 )
             if not args.carry_capital:
                 cur_quote = float(args.start_quote)
@@ -1212,7 +1411,7 @@ def main() -> int:
                 status=str(row.status),
                 plans_file_count=int(row.plans_file_count or 0),
             )
-            run_state.update(
+            update_payload = dict(
                 status="running",
                 step_word=("WINDOW_DONE" if str(row.status).lower() == "ok" else "WINDOW_ERROR"),
                 last_window_index=int(idx),
@@ -1223,6 +1422,30 @@ def main() -> int:
                 windows_failed=int(agg_ckpt.get("windows_failed", 0)),
                 pct_complete=_format_pct(done, len(windows)),
             )
+            if str(row.status).lower() != "ok":
+                update_payload.update(
+                    error=str(row.error or ""),
+                    last_error_stage=str(window_stage),
+                    last_error_window_index=int(idx),
+                    last_error_timerange=timerange,
+                    last_error_transient=int(_is_transient_error(str(row.error or ""))),
+                    last_error_report_file=str(row.error_report_file or ""),
+                )
+            run_state.update(**update_payload)
+
+        if args.fail_on_window_error and str(row.status).lower() != "ok":
+            print(
+                f"[walkforward] fail-fast enabled: aborting run after window {idx} error.",
+                flush=True,
+            )
+            if run_state is not None:
+                run_state.event(
+                    "RUN_ABORT_ON_WINDOW_ERROR",
+                    window_index=int(idx),
+                    timerange=timerange,
+                    error=str(row.error or ""),
+                )
+            break
 
     agg = aggregate(rows)
     if not args.dry_run:

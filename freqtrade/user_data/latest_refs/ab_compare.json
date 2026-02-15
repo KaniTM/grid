@@ -1,20 +1,20 @@
 {
   "A_run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
-  "B_run_id": "wf_exp_osdev_persist_20200101_20260213_v1",
+  "B_run_id": "wf_exp_bbwp_plus3_20200101_20260213_v2_strictfix2",
   "category": "ab_compare",
   "delta_B_minus_A": {
-    "avg_pnl_pct": -0.6695944232959299,
-    "max_gain_pct": -6.242180239528228,
+    "avg_pnl_pct": -0.08075724825836861,
+    "max_gain_pct": 0.0,
     "max_loss_pct": 0.0,
     "median_pnl_pct": 0.0,
-    "profit_factor": -0.9813141109531673,
-    "sum_pnl_quote": -905.3783178543019,
-    "win_rate": -7.539893617021271,
-    "windows_failed": 66.0,
-    "windows_ok": -66.0,
+    "profit_factor": -0.16410565679181,
+    "sum_pnl_quote": -129.21159721338938,
+    "win_rate": 0.6250000000000036,
+    "windows_failed": 0.0,
+    "windows_ok": 0.0,
     "windows_total": 0.0
   },
-  "out_path": "walkforward/wf_AB_compare_20200101_20260213_exp_osdev_persist_v1.json",
+  "out_path": "walkforward/wf_AB_compare_20200101_20260213_step6B_vs_bbwp_plus3_v2_strictfix2_20260215T101255Z.json",
   "run_type": "ab_compare",
-  "updated_utc": "2026-02-14T10:43:32.129828+00:00"
+  "updated_utc": "2026-02-15T10:12:55.429404+00:00"
 }

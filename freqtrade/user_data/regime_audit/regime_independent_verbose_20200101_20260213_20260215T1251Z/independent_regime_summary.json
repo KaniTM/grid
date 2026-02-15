@@ -1,0 +1,543 @@
+{
+  "created_utc": "2026-02-15T12:53:22.682406+00:00",
+  "source_report": "/home/kani/grid-ml-system/freqtrade/user_data/regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z/report.json",
+  "meta": {
+    "pair": "ETH/USDT",
+    "timeframe": "15m",
+    "timerange": "20200101-20260213",
+    "rows_valid_features": 213991,
+    "start_utc": "2020-01-01 00:00:00+00:00",
+    "end_utc": "2026-02-12 23:45:00+00:00"
+  },
+  "state_shares": {
+    "intraday": {
+      "counts": {
+        "range": 84065,
+        "trend": 33641,
+        "neutral": 96269,
+        "unlabeled": 16
+      },
+      "shares": {
+        "range": 0.392844,
+        "trend": 0.157208,
+        "neutral": 0.449874,
+        "unlabeled": 7.5e-05
+      },
+      "total": 213991
+    },
+    "swing": {
+      "counts": {
+        "range": 76999,
+        "trend": 40681,
+        "neutral": 96215,
+        "unlabeled": 96
+      },
+      "shares": {
+        "range": 0.359824,
+        "trend": 0.190106,
+        "neutral": 0.449622,
+        "unlabeled": 0.000449
+      },
+      "total": 213991
+    }
+  },
+  "transition_counts": {
+    "intraday": {
+      "neutral->range": 20527,
+      "neutral->trend": 8919,
+      "range->neutral": 20447,
+      "range->trend": 838,
+      "trend->neutral": 9000,
+      "trend->range": 757
+    },
+    "swing": {
+      "neutral->range": 7743,
+      "neutral->trend": 5595,
+      "range->neutral": 7753,
+      "range->trend": 23,
+      "trend->neutral": 5584,
+      "trend->range": 34
+    },
+    "total_events": 87220
+  },
+  "segment_duration": {
+    "intraday": {
+      "states": {
+        "range": {
+          "segment_count": 21285,
+          "mean_bars": 3.949,
+          "median_bars": 3.0,
+          "p90_bars": 9.0,
+          "p99_bars": 17.0,
+          "max_bars": 36,
+          "mean_days": 0.041141,
+          "median_days": 0.03125,
+          "p90_days": 0.09375,
+          "p99_days": 0.177083,
+          "max_days": 0.375
+        },
+        "trend": {
+          "segment_count": 9757,
+          "mean_bars": 3.448,
+          "median_bars": 2.0,
+          "p90_bars": 8.0,
+          "p99_bars": 19.0,
+          "max_bars": 37,
+          "mean_days": 0.035915,
+          "median_days": 0.020833,
+          "p90_days": 0.083333,
+          "p99_days": 0.197917,
+          "max_days": 0.385417
+        },
+        "neutral": {
+          "segment_count": 29447,
+          "mean_bars": 3.269,
+          "median_bars": 2.0,
+          "p90_bars": 7.0,
+          "p99_bars": 19.0,
+          "max_bars": 205,
+          "mean_days": 0.034054,
+          "median_days": 0.020833,
+          "p90_days": 0.072917,
+          "p99_days": 0.197917,
+          "max_days": 2.135417
+        }
+      },
+      "top_segments": {
+        "range": [
+          {
+            "state": "range",
+            "start_utc": "2021-04-11T15:00:00+00:00",
+            "end_utc": "2021-04-11T23:45:00+00:00",
+            "bars": 36
+          },
+          {
+            "state": "range",
+            "start_utc": "2021-05-08T01:00:00+00:00",
+            "end_utc": "2021-05-08T08:45:00+00:00",
+            "bars": 32
+          },
+          {
+            "state": "range",
+            "start_utc": "2025-02-11T19:00:00+00:00",
+            "end_utc": "2025-02-12T02:45:00+00:00",
+            "bars": 32
+          },
+          {
+            "state": "range",
+            "start_utc": "2024-10-08T17:45:00+00:00",
+            "end_utc": "2024-10-09T01:15:00+00:00",
+            "bars": 31
+          },
+          {
+            "state": "range",
+            "start_utc": "2024-02-01T16:45:00+00:00",
+            "end_utc": "2024-02-02T00:00:00+00:00",
+            "bars": 30
+          },
+          {
+            "state": "range",
+            "start_utc": "2024-06-08T09:30:00+00:00",
+            "end_utc": "2024-06-08T16:45:00+00:00",
+            "bars": 30
+          },
+          {
+            "state": "range",
+            "start_utc": "2025-09-15T21:30:00+00:00",
+            "end_utc": "2025-09-16T04:45:00+00:00",
+            "bars": 30
+          },
+          {
+            "state": "range",
+            "start_utc": "2020-07-29T10:15:00+00:00",
+            "end_utc": "2020-07-29T17:15:00+00:00",
+            "bars": 29
+          },
+          {
+            "state": "range",
+            "start_utc": "2020-10-25T11:15:00+00:00",
+            "end_utc": "2020-10-25T18:15:00+00:00",
+            "bars": 29
+          },
+          {
+            "state": "range",
+            "start_utc": "2022-03-12T00:30:00+00:00",
+            "end_utc": "2022-03-12T07:30:00+00:00",
+            "bars": 29
+          }
+        ],
+        "trend": [
+          {
+            "state": "trend",
+            "start_utc": "2022-01-20T16:15:00+00:00",
+            "end_utc": "2022-01-21T01:15:00+00:00",
+            "bars": 37
+          },
+          {
+            "state": "trend",
+            "start_utc": "2024-05-20T12:30:00+00:00",
+            "end_utc": "2024-05-20T21:30:00+00:00",
+            "bars": 37
+          },
+          {
+            "state": "trend",
+            "start_utc": "2023-01-20T12:30:00+00:00",
+            "end_utc": "2023-01-20T20:15:00+00:00",
+            "bars": 32
+          },
+          {
+            "state": "trend",
+            "start_utc": "2021-05-02T22:15:00+00:00",
+            "end_utc": "2021-05-03T05:30:00+00:00",
+            "bars": 30
+          },
+          {
+            "state": "trend",
+            "start_utc": "2022-03-08T21:00:00+00:00",
+            "end_utc": "2022-03-09T03:45:00+00:00",
+            "bars": 28
+          },
+          {
+            "state": "trend",
+            "start_utc": "2025-11-13T11:15:00+00:00",
+            "end_utc": "2025-11-13T17:45:00+00:00",
+            "bars": 27
+          },
+          {
+            "state": "trend",
+            "start_utc": "2020-08-30T09:00:00+00:00",
+            "end_utc": "2020-08-30T15:15:00+00:00",
+            "bars": 26
+          },
+          {
+            "state": "trend",
+            "start_utc": "2021-08-22T20:00:00+00:00",
+            "end_utc": "2021-08-23T02:15:00+00:00",
+            "bars": 26
+          },
+          {
+            "state": "trend",
+            "start_utc": "2022-04-21T12:15:00+00:00",
+            "end_utc": "2022-04-21T18:30:00+00:00",
+            "bars": 26
+          },
+          {
+            "state": "trend",
+            "start_utc": "2022-10-25T09:30:00+00:00",
+            "end_utc": "2022-10-25T15:45:00+00:00",
+            "bars": 26
+          }
+        ],
+        "neutral": [
+          {
+            "state": "neutral",
+            "start_utc": "2023-08-11T13:45:00+00:00",
+            "end_utc": "2023-08-13T16:45:00+00:00",
+            "bars": 205
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-08-04T20:45:00+00:00",
+            "end_utc": "2023-08-06T20:15:00+00:00",
+            "bars": 191
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-09-22T19:15:00+00:00",
+            "end_utc": "2023-09-24T13:30:00+00:00",
+            "bars": 170
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-08-25T19:30:00+00:00",
+            "end_utc": "2023-08-27T10:00:00+00:00",
+            "bars": 155
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-10-06T21:30:00+00:00",
+            "end_utc": "2023-10-08T09:00:00+00:00",
+            "bars": 143
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2026-01-09T22:00:00+00:00",
+            "end_utc": "2026-01-11T05:15:00+00:00",
+            "bars": 126
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-09-08T18:00:00+00:00",
+            "end_utc": "2023-09-10T01:00:00+00:00",
+            "bars": 125
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2020-07-17T12:00:00+00:00",
+            "end_utc": "2020-07-18T15:30:00+00:00",
+            "bars": 111
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2022-12-31T19:30:00+00:00",
+            "end_utc": "2023-01-01T23:00:00+00:00",
+            "bars": 111
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-08-14T14:30:00+00:00",
+            "end_utc": "2023-08-15T16:00:00+00:00",
+            "bars": 103
+          }
+        ]
+      },
+      "transitions": {
+        "neutral->range": 20527,
+        "range->neutral": 20447,
+        "trend->neutral": 9000,
+        "neutral->trend": 8919,
+        "range->trend": 838,
+        "trend->range": 757
+      }
+    },
+    "swing": {
+      "states": {
+        "range": {
+          "segment_count": 7777,
+          "mean_bars": 9.901,
+          "median_bars": 4.0,
+          "p90_bars": 26.0,
+          "p99_bars": 75.0,
+          "max_bars": 172,
+          "mean_days": 0.103134,
+          "median_days": 0.041667,
+          "p90_days": 0.270833,
+          "p99_days": 0.78125,
+          "max_days": 1.791667
+        },
+        "trend": {
+          "segment_count": 5618,
+          "mean_bars": 7.241,
+          "median_bars": 2.0,
+          "p90_bars": 19.0,
+          "p99_bars": 67.0,
+          "max_bars": 127,
+          "mean_days": 0.075429,
+          "median_days": 0.020833,
+          "p90_days": 0.197917,
+          "p99_days": 0.697917,
+          "max_days": 1.322917
+        },
+        "neutral": {
+          "segment_count": 13338,
+          "mean_bars": 7.214,
+          "median_bars": 3.0,
+          "p90_bars": 17.0,
+          "p99_bars": 66.0,
+          "max_bars": 209,
+          "mean_days": 0.075142,
+          "median_days": 0.03125,
+          "p90_days": 0.177083,
+          "p99_days": 0.6875,
+          "max_days": 2.177083
+        }
+      },
+      "top_segments": {
+        "range": [
+          {
+            "state": "range",
+            "start_utc": "2023-03-03T02:00:00+00:00",
+            "end_utc": "2023-03-04T20:45:00+00:00",
+            "bars": 172
+          },
+          {
+            "state": "range",
+            "start_utc": "2023-06-12T03:15:00+00:00",
+            "end_utc": "2023-06-13T15:00:00+00:00",
+            "bars": 144
+          },
+          {
+            "state": "range",
+            "start_utc": "2023-12-30T12:45:00+00:00",
+            "end_utc": "2023-12-31T17:45:00+00:00",
+            "bars": 117
+          },
+          {
+            "state": "range",
+            "start_utc": "2025-05-31T14:15:00+00:00",
+            "end_utc": "2025-06-01T18:00:00+00:00",
+            "bars": 112
+          },
+          {
+            "state": "range",
+            "start_utc": "2022-11-25T18:45:00+00:00",
+            "end_utc": "2022-11-26T22:15:00+00:00",
+            "bars": 111
+          },
+          {
+            "state": "range",
+            "start_utc": "2023-09-05T17:15:00+00:00",
+            "end_utc": "2023-09-06T20:30:00+00:00",
+            "bars": 110
+          },
+          {
+            "state": "range",
+            "start_utc": "2025-12-23T12:00:00+00:00",
+            "end_utc": "2025-12-24T15:00:00+00:00",
+            "bars": 109
+          },
+          {
+            "state": "range",
+            "start_utc": "2023-08-24T11:45:00+00:00",
+            "end_utc": "2023-08-25T14:30:00+00:00",
+            "bars": 108
+          },
+          {
+            "state": "range",
+            "start_utc": "2023-08-27T09:15:00+00:00",
+            "end_utc": "2023-08-28T12:00:00+00:00",
+            "bars": 108
+          },
+          {
+            "state": "range",
+            "start_utc": "2023-10-30T16:15:00+00:00",
+            "end_utc": "2023-10-31T19:00:00+00:00",
+            "bars": 108
+          }
+        ],
+        "trend": [
+          {
+            "state": "trend",
+            "start_utc": "2020-02-04T10:15:00+00:00",
+            "end_utc": "2020-02-05T17:45:00+00:00",
+            "bars": 127
+          },
+          {
+            "state": "trend",
+            "start_utc": "2020-02-10T23:45:00+00:00",
+            "end_utc": "2020-02-12T07:15:00+00:00",
+            "bars": 127
+          },
+          {
+            "state": "trend",
+            "start_utc": "2023-06-20T03:15:00+00:00",
+            "end_utc": "2023-06-21T10:45:00+00:00",
+            "bars": 127
+          },
+          {
+            "state": "trend",
+            "start_utc": "2026-01-28T11:15:00+00:00",
+            "end_utc": "2026-01-29T14:45:00+00:00",
+            "bars": 111
+          },
+          {
+            "state": "trend",
+            "start_utc": "2024-07-14T02:00:00+00:00",
+            "end_utc": "2024-07-15T05:00:00+00:00",
+            "bars": 109
+          },
+          {
+            "state": "trend",
+            "start_utc": "2025-05-07T11:45:00+00:00",
+            "end_utc": "2025-05-08T14:15:00+00:00",
+            "bars": 107
+          },
+          {
+            "state": "trend",
+            "start_utc": "2025-06-08T22:00:00+00:00",
+            "end_utc": "2025-06-10T00:00:00+00:00",
+            "bars": 105
+          },
+          {
+            "state": "trend",
+            "start_utc": "2023-02-14T19:00:00+00:00",
+            "end_utc": "2023-02-15T20:00:00+00:00",
+            "bars": 101
+          },
+          {
+            "state": "trend",
+            "start_utc": "2022-03-26T20:45:00+00:00",
+            "end_utc": "2022-03-27T21:15:00+00:00",
+            "bars": 99
+          },
+          {
+            "state": "trend",
+            "start_utc": "2024-05-19T19:15:00+00:00",
+            "end_utc": "2024-05-20T19:30:00+00:00",
+            "bars": 98
+          }
+        ],
+        "neutral": [
+          {
+            "state": "neutral",
+            "start_utc": "2021-01-06T16:00:00+00:00",
+            "end_utc": "2021-01-08T20:00:00+00:00",
+            "bars": 209
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2021-01-03T08:30:00+00:00",
+            "end_utc": "2021-01-05T03:45:00+00:00",
+            "bars": 174
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-09-22T01:00:00+00:00",
+            "end_utc": "2023-09-23T18:00:00+00:00",
+            "bars": 165
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-07-28T09:45:00+00:00",
+            "end_utc": "2023-07-30T00:00:00+00:00",
+            "bars": 154
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-08-25T17:45:00+00:00",
+            "end_utc": "2023-08-27T05:15:00+00:00",
+            "bars": 143
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2021-04-22T13:30:00+00:00",
+            "end_utc": "2021-04-23T23:30:00+00:00",
+            "bars": 137
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2021-05-26T00:00:00+00:00",
+            "end_utc": "2021-05-27T08:30:00+00:00",
+            "bars": 131
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2023-08-11T14:45:00+00:00",
+            "end_utc": "2023-08-12T22:00:00+00:00",
+            "bars": 126
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2022-07-04T09:30:00+00:00",
+            "end_utc": "2022-07-05T16:30:00+00:00",
+            "bars": 125
+          },
+          {
+            "state": "neutral",
+            "start_utc": "2020-08-01T04:30:00+00:00",
+            "end_utc": "2020-08-02T11:00:00+00:00",
+            "bars": 123
+          }
+        ]
+      },
+      "transitions": {
+        "range->neutral": 7753,
+        "neutral->range": 7743,
+        "neutral->trend": 5595,
+        "trend->neutral": 5584,
+        "trend->range": 34,
+        "range->trend": 23
+      }
+    }
+  }
+}

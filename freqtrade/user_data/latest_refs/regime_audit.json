@@ -3,54 +3,54 @@
   "features_path": "",
   "label_counts": {
     "intraday": {
-      "range_label": 84104,
-      "rows_total": 214087,
-      "trend_label": 33659
+      "range_label": 84065,
+      "rows_total": 213991,
+      "trend_label": 33641
     },
     "swing": {
-      "range_label": 77045,
-      "rows_total": 214087,
-      "trend_label": 40713
+      "range_label": 76999,
+      "rows_total": 213991,
+      "trend_label": 40681
     }
   },
-  "out_dir": "regime_audit/regime_daily_20260214",
-  "overrides_path": "regime_audit/regime_daily_20260214/mode_threshold_overrides.json",
+  "out_dir": "regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z",
+  "overrides_path": "regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z/mode_threshold_overrides.json",
   "pair": "ETH/USDT",
   "recommended_thresholds": {
     "intraday": {
-      "adx_enter_max": 33.6724,
+      "adx_enter_max": 33.6888,
       "adx_exit_max": 43.662,
       "bbw_1h_pct_max": 79.7619,
-      "bbwp_l_max": 73.0159,
+      "bbwp_l_max": 73.4127,
       "bbwp_m_max": 74.6032,
       "bbwp_s_max": 75.3968,
-      "ema_dist_max_frac": 0.016311,
+      "ema_dist_max_frac": 0.01631,
       "os_dev_persist_bars": 24,
       "os_dev_rvol_max": 1.3104,
       "vol_spike_mult": 1.7746
     },
     "swing": {
-      "adx_enter_max": 33.1189,
+      "adx_enter_max": 33.1334,
       "adx_exit_max": 42.3028,
       "bbw_1h_pct_max": 77.7778,
       "bbwp_l_max": 71.8254,
       "bbwp_m_max": 72.2222,
       "bbwp_s_max": 73.0159,
-      "ema_dist_max_frac": 0.015092,
+      "ema_dist_max_frac": 0.015072,
       "os_dev_persist_bars": 12,
       "os_dev_rvol_max": 1.3225,
-      "vol_spike_mult": 1.8029
+      "vol_spike_mult": 1.8034
     }
   },
-  "report_path": "regime_audit/regime_daily_20260214/report.json",
-  "run_id": "regime_daily_20260214",
+  "report_path": "regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z/report.json",
+  "run_id": "regime_independent_verbose_20200101_20260213_20260215T1251Z",
   "run_type": "regime_audit",
   "status": "completed",
   "step_word": "RUN_COMPLETE",
   "timeframe": "15m",
-  "timerange": "20200101-20260214",
-  "transitions_csv_path": "",
-  "transitions_json_path": "",
-  "updated_utc": "2026-02-14T08:33:20.234944+00:00",
-  "verbose_path": ""
+  "timerange": "20200101-20260213",
+  "transitions_csv_path": "regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z/transition_events.csv",
+  "transitions_json_path": "regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z/transition_events.json",
+  "updated_utc": "2026-02-15T12:51:50.481418+00:00",
+  "verbose_path": "regime_audit/regime_independent_verbose_20200101_20260213_20260215T1251Z/per_candle_verbose.csv"
 }

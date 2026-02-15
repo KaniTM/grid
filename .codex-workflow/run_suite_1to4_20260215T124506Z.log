@@ -1,0 +1,5 @@
+[suite-1to4] start ts=20260215T124506Z timerange=20200101-20260213
+[suite-1to4] run label=strict_baseline_step6b run_id=wf_step6B_attr_20260215T124506Z strategy=GridBrainV1 mode_path=user_data/regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json
+[wf-supervisor] run_id=wf_step6B_attr_20260215T124506Z max_attempts=8
+[wf-supervisor] cmd=python3 /home/kani/grid-ml-system/freqtrade/scripts/run-user-walkforward.py --timerange 20200101-20260213 --window-days 14 --step-days 14 --min-window-days 7 --pair ETH/USDT --exchange binance --timeframe 15m --config-path /freqtrade/user_data/config.json --strategy GridBrainV1 --strategy-path /freqtrade/user_data/strategies --data-dir /freqtrade/user_data/data/binance --fee-pct 0.10 --max-orders-per-side 40 --run-id wf_step6B_attr_20260215T124506Z --mode-thresholds-path user_data/regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json --heartbeat-sec 30 --stalled-heartbeats-max 20 --fail-on-window-error --resume
+[wf-supervisor] attempt=1/8 start=2026-02-15T12:45:06.984080+00:00

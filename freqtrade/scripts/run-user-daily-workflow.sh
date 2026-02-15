@@ -24,6 +24,9 @@ Environment overrides (common):
   SYNC_TIMERANGE="20200101-20260214"  # needed for SYNC_MODE=full
   SYNC_START_DAY="20200101"       # needed for SYNC_MODE=prepend
   SYNC_END_DAY="20260214"
+  SYNC_RUN_ID="data_sync_daily_20260214"
+  SYNC_USE_SUPERVISOR=1
+  SYNC_SUPERVISOR_MAX_ATTEMPTS=5
   SYNC_STALLED_HEARTBEATS_MAX=10
   EXPORT_LATEST_RUNS=6
   KEEP_WALKFORWARD_RUNS=0         # if >0, prune old run dirs
@@ -32,10 +35,15 @@ Environment overrides (common):
 Research profile overrides:
   REGIME_TIMERANGE="20200101-20260214"
   REGIME_RUN_ID="regime_daily_20260214"
+  REGIME_USE_SUPERVISOR=1
+  REGIME_SUPERVISOR_MAX_ATTEMPTS=5
   REGIME_STALLED_HEARTBEATS_MAX=10
   WF_TIMERANGE="20200101-20260214"
   WF_RUN_ID="wf_daily_eth_14d"
+  WF_MODE_THRESHOLDS_PATH="user_data/regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json"
   WF_STALLED_HEARTBEATS_MAX=10
+  WF_USE_SUPERVISOR=1
+  WF_SUPERVISOR_MAX_ATTEMPTS=5
 EOF
 }
 
@@ -84,6 +92,13 @@ SYNC_TIMERANGE="${SYNC_TIMERANGE:-}"
 SYNC_START_DAY="${SYNC_START_DAY:-}"
 SYNC_END_DAY="${SYNC_END_DAY:-}"
 SYNC_BOOTSTRAP_START="${SYNC_BOOTSTRAP_START:-20200101}"
+SYNC_RUN_ID="${SYNC_RUN_ID:-data_sync_daily_${TODAY_UTC}}"
+SYNC_USE_SUPERVISOR="${SYNC_USE_SUPERVISOR:-1}"
+SYNC_SUPERVISOR_MAX_ATTEMPTS="${SYNC_SUPERVISOR_MAX_ATTEMPTS:-5}"
+SYNC_SUPERVISOR_RETRY_DELAY_SEC="${SYNC_SUPERVISOR_RETRY_DELAY_SEC:-20}"
+SYNC_SUPERVISOR_RETRY_BACKOFF_MULT="${SYNC_SUPERVISOR_RETRY_BACKOFF_MULT:-1.5}"
+SYNC_SUPERVISOR_MAX_RETRY_DELAY_SEC="${SYNC_SUPERVISOR_MAX_RETRY_DELAY_SEC:-300}"
+SYNC_SUPERVISOR_POLL_SEC="${SYNC_SUPERVISOR_POLL_SEC:-10}"
 
 EXPORT_LATEST_RUNS="${EXPORT_LATEST_RUNS:-6}"
 
@@ -98,6 +113,12 @@ REGIME_HEARTBEAT_SEC="${REGIME_HEARTBEAT_SEC:-60}"
 REGIME_STALLED_HEARTBEATS_MAX="${REGIME_STALLED_HEARTBEATS_MAX:-0}"
 REGIME_EMIT_FEATURES="${REGIME_EMIT_FEATURES:-0}"
 REGIME_EMIT_VERBOSE="${REGIME_EMIT_VERBOSE:-0}"
+REGIME_USE_SUPERVISOR="${REGIME_USE_SUPERVISOR:-1}"
+REGIME_SUPERVISOR_MAX_ATTEMPTS="${REGIME_SUPERVISOR_MAX_ATTEMPTS:-5}"
+REGIME_SUPERVISOR_RETRY_DELAY_SEC="${REGIME_SUPERVISOR_RETRY_DELAY_SEC:-20}"
+REGIME_SUPERVISOR_RETRY_BACKOFF_MULT="${REGIME_SUPERVISOR_RETRY_BACKOFF_MULT:-1.5}"
+REGIME_SUPERVISOR_MAX_RETRY_DELAY_SEC="${REGIME_SUPERVISOR_MAX_RETRY_DELAY_SEC:-300}"
+REGIME_SUPERVISOR_POLL_SEC="${REGIME_SUPERVISOR_POLL_SEC:-10}"
 
 WF_PAIR="${WF_PAIR:-ETH/USDT}"
 WF_EXCHANGE="${WF_EXCHANGE:-binance}"
@@ -126,8 +147,14 @@ WF_SKIP_BACKTESTING="${WF_SKIP_BACKTESTING:-0}"
 WF_FAIL_ON_WINDOW_ERROR="${WF_FAIL_ON_WINDOW_ERROR:-0}"
 WF_BACKTESTING_EXTRA="${WF_BACKTESTING_EXTRA:-}"
 WF_SIM_EXTRA="${WF_SIM_EXTRA:-}"
-WF_MODE_THRESHOLDS_PATH="${WF_MODE_THRESHOLDS_PATH:-}"
+WF_MODE_THRESHOLDS_PATH="${WF_MODE_THRESHOLDS_PATH:-user_data/regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json}"
 WF_REGIME_THRESHOLD_PROFILE="${WF_REGIME_THRESHOLD_PROFILE:-}"
+WF_USE_SUPERVISOR="${WF_USE_SUPERVISOR:-1}"
+WF_SUPERVISOR_MAX_ATTEMPTS="${WF_SUPERVISOR_MAX_ATTEMPTS:-5}"
+WF_SUPERVISOR_RETRY_DELAY_SEC="${WF_SUPERVISOR_RETRY_DELAY_SEC:-20}"
+WF_SUPERVISOR_RETRY_BACKOFF_MULT="${WF_SUPERVISOR_RETRY_BACKOFF_MULT:-1.5}"
+WF_SUPERVISOR_MAX_RETRY_DELAY_SEC="${WF_SUPERVISOR_MAX_RETRY_DELAY_SEC:-300}"
+WF_SUPERVISOR_POLL_SEC="${WF_SUPERVISOR_POLL_SEC:-10}"
 
 KEEP_WALKFORWARD_RUNS="${KEEP_WALKFORWARD_RUNS:-0}"
 KEEP_REGIME_RUNS="${KEEP_REGIME_RUNS:-0}"
@@ -173,6 +200,7 @@ run_sync() {
         --bootstrap-start "${SYNC_BOOTSTRAP_START}"
         --heartbeat-sec "${SYNC_HEARTBEAT_SEC}"
         --stalled-heartbeats-max "${SYNC_STALLED_HEARTBEATS_MAX}"
+        --run-id "${SYNC_RUN_ID}"
     )
     if [[ -n "${SYNC_END_DAY}" ]]; then
         cmd+=(--end-day "${SYNC_END_DAY}")
@@ -191,8 +219,30 @@ run_sync() {
         cmd+=(--start-day "${SYNC_START_DAY}")
     fi
 
-    echo "[daily] sync command: ${cmd[*]}"
-    "${cmd[@]}"
+    if [[ "${SYNC_USE_SUPERVISOR}" == "1" ]]; then
+        local state_file="user_data/run_state/data_sync/${SYNC_RUN_ID}/state.json"
+        local sup_cmd=(
+            python3 scripts/run-user-state-supervisor.py
+            --run-label "data-sync:${SYNC_RUN_ID}"
+            --state-file "${state_file}"
+            --max-attempts "${SYNC_SUPERVISOR_MAX_ATTEMPTS}"
+            --retry-delay-sec "${SYNC_SUPERVISOR_RETRY_DELAY_SEC}"
+            --retry-backoff-mult "${SYNC_SUPERVISOR_RETRY_BACKOFF_MULT}"
+            --max-retry-delay-sec "${SYNC_SUPERVISOR_MAX_RETRY_DELAY_SEC}"
+            --poll-sec "${SYNC_SUPERVISOR_POLL_SEC}"
+            --complete-word RUN_COMPLETE
+            --complete-word RUN_COMPLETE_WITH_ERRORS
+            --complete-status completed
+            --complete-status completed_with_errors
+            --
+            "${cmd[@]}"
+        )
+        echo "[daily] sync supervisor command: ${sup_cmd[*]}"
+        "${sup_cmd[@]}"
+    else
+        echo "[daily] sync command: ${cmd[*]}"
+        "${cmd[@]}"
+    fi
 }
 
 run_regime_audit() {
@@ -211,8 +261,28 @@ run_regime_audit() {
     if [[ "${REGIME_EMIT_VERBOSE}" == "1" ]]; then
         cmd+=(--emit-verbose)
     fi
-    echo "[daily] regime command: ${cmd[*]}"
-    "${cmd[@]}"
+    if [[ "${REGIME_USE_SUPERVISOR}" == "1" ]]; then
+        local state_file="user_data/regime_audit/${REGIME_RUN_ID}/_state/state.json"
+        local sup_cmd=(
+            python3 scripts/run-user-state-supervisor.py
+            --run-label "regime-audit:${REGIME_RUN_ID}"
+            --state-file "${state_file}"
+            --max-attempts "${REGIME_SUPERVISOR_MAX_ATTEMPTS}"
+            --retry-delay-sec "${REGIME_SUPERVISOR_RETRY_DELAY_SEC}"
+            --retry-backoff-mult "${REGIME_SUPERVISOR_RETRY_BACKOFF_MULT}"
+            --max-retry-delay-sec "${REGIME_SUPERVISOR_MAX_RETRY_DELAY_SEC}"
+            --poll-sec "${REGIME_SUPERVISOR_POLL_SEC}"
+            --complete-word RUN_COMPLETE
+            --complete-status completed
+            --
+            "${cmd[@]}"
+        )
+        echo "[daily] regime supervisor command: ${sup_cmd[*]}"
+        "${sup_cmd[@]}"
+    else
+        echo "[daily] regime command: ${cmd[*]}"
+        "${cmd[@]}"
+    fi
 }
 
 find_latest_mode_overrides() {
@@ -282,8 +352,25 @@ run_walkforward() {
     if [[ -n "${mode_thresholds}" ]]; then
         cmd+=(--mode-thresholds-path "${mode_thresholds}")
     fi
-    echo "[daily] walkforward command: ${cmd[*]}"
-    "${cmd[@]}"
+    if [[ "${WF_USE_SUPERVISOR}" == "1" ]]; then
+        local wf_args=("${cmd[@]:2}")
+        local sup_cmd=(
+            python3 scripts/run-user-walkforward-supervisor.py
+            --user-data user_data
+            --max-attempts "${WF_SUPERVISOR_MAX_ATTEMPTS}"
+            --retry-delay-sec "${WF_SUPERVISOR_RETRY_DELAY_SEC}"
+            --retry-backoff-mult "${WF_SUPERVISOR_RETRY_BACKOFF_MULT}"
+            --max-retry-delay-sec "${WF_SUPERVISOR_MAX_RETRY_DELAY_SEC}"
+            --poll-sec "${WF_SUPERVISOR_POLL_SEC}"
+            --
+            "${wf_args[@]}"
+        )
+        echo "[daily] walkforward supervisor command: ${sup_cmd[*]}"
+        "${sup_cmd[@]}"
+    else
+        echo "[daily] walkforward command: ${cmd[*]}"
+        "${cmd[@]}"
+    fi
 }
 
 run_export() {

@@ -1,10 +1,10 @@
 {
   "category": "tuning_shortlist",
-  "delta_sum_pnl_quote": -905.3783178543019,
-  "json_path": "walkforward/wf_tuning_shortlist_osdev_persist_v1_20260214T104332Z.json",
-  "markdown_path": "walkforward/wf_tuning_shortlist_osdev_persist_v1_20260214T104332Z.md",
-  "run_a": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
-  "run_b": "wf_exp_osdev_persist_20200101_20260213_v1",
+  "delta_sum_pnl_quote": -29.357827371691542,
+  "json_path": "walkforward/wf_tune_shortlist_router_vs_bbwp_20260215T011318Z.json",
+  "markdown_path": "walkforward/wf_tune_shortlist_router_vs_bbwp_20260215T011318Z.md",
+  "run_a": "wf_exp_router_fast_20200101_20260213_v2_strict",
+  "run_b": "wf_exp_bbwp_plus3_20200101_20260213_v2_strictfix2",
   "run_type": "tuning_shortlist",
-  "updated_utc": "2026-02-14T10:43:32.327314+00:00"
+  "updated_utc": "2026-02-15T01:13:18.133605+00:00"
 }
