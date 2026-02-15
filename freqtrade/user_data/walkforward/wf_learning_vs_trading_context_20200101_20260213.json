@@ -1,0 +1,40 @@
+{
+  "generated_utc": "2026-02-15T13:05:05.322410+00:00",
+  "timerange": "20200101-20260213",
+  "baseline_run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
+  "learning_context": {
+    "note": "This baseline walkforward is fixed-threshold evaluation (no in-run parameter fitting).",
+    "calibration_source_report": "freqtrade/user_data/regime_audit/regime_calib_long_20200101_20251101_v1/report.json",
+    "calibration_period_utc": {
+      "start": "2020-01-01 00:00:00+00:00",
+      "end": "2025-10-31 23:45:00+00:00"
+    }
+  },
+  "execution_activity": {
+    "total_action_bars": 213601,
+    "starts": 644,
+    "holds": 112088,
+    "stops": 100869,
+    "fills": 338,
+    "mode_paused_bars_approx": 199647,
+    "mode_paused_share_approx": 0.934672590484127,
+    "active_or_eligible_bars_approx": 13954,
+    "active_or_eligible_share_approx": 0.06532740951587306,
+    "total_action_days": 2225.0104166666665,
+    "active_or_eligible_days_approx": 145.35416666666666
+  },
+  "independent_market_regime": {
+    "intraday": {
+      "range_share": 0.39284362426457187,
+      "neutral_share": 0.4498740601240239,
+      "trend_share": 0.15720754611175236,
+      "nontrend_share": 0.8427176843885957
+    },
+    "swing": {
+      "range_share": 0.3598235439808216,
+      "neutral_share": 0.4496217130626989,
+      "trend_share": 0.19010612595856835,
+      "nontrend_share": 0.8094452570435205
+    }
+  }
+}

@@ -22,6 +22,8 @@ user_data/walkforward/**
 !user_data/walkforward/**/summary.json
 !user_data/walkforward/**/windows.csv
 !user_data/walkforward/*AB_compare*.json
+!user_data/walkforward/*learning_vs_trading_context*.json
+!user_data/walkforward/*learning_vs_trading_context*.md
 !user_data/walkforward/*tuning_shortlist*.json
 !user_data/walkforward/*tuning_shortlist*.md
 
