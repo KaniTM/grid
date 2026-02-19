@@ -8,3 +8,12 @@ handoff_bundle_*.tar.gz
 # Local python environment for freqtrade (kept outside git)
 freqtrade/.venv/
 freqtrade/freqtrade.egg-info/
+
+# Raw data directories to keep out of git
+freqtrade/user_data/walkforward/
+freqtrade/user_data/walkforward_runtime_plans/
+freqtrade/user_data/portable_results/
+
+# Backtest archives (keep .last_result for tooling)
+freqtrade/user_data/backtest_results/*
+!freqtrade/user_data/backtest_results/.last_result.json
