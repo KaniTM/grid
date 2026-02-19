@@ -67,6 +67,9 @@ env/
 .vscode
 .pytest_cache/
 .mypy_cache/
+
+# Local artifacts to keep summaries/plans outside git
+local_artifacts/
 # Freqtrade-derived ignores from gitignore_disabled
 freqtrade/config*.json
 freqtrade/*.sqlite
