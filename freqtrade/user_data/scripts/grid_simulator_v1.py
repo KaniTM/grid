@@ -372,7 +372,7 @@ def _sorted_reason_counts(counter: Dict[str, int]) -> Dict[str, int]:
 
 def _normalize_router_mode(value: object, default: str = "unknown") -> str:
     mode = str(value or "").strip().lower()
-    if mode in ("intraday", "swing", "pause"):
+    if mode in ("intraday", "swing", "pause", "neutral_choppy"):
         return mode
     return str(default or "unknown")
 
@@ -691,6 +691,9 @@ def simulate_grid(
         for od in open_orders:
             if od.status != "open":
                 continue
+            if od.level_index < 0 or od.level_index > n_levels:
+                remaining.append(od)
+                continue
 
             if od.side == "buy":
                 fill = (l <= od.price) if touch_fill else (o > od.price and c < od.price)
@@ -733,7 +736,7 @@ def simulate_grid(
                     sell_px = float(levels[i + 1])
                     open_orders.append(OrderSim("sell", sell_px, od.qty_base, i + 1))
             else:
-                if i - 1 >= 0:
+                if i - 1 >= 0 and i - 1 <= n_levels:
                     buy_px = float(levels[i - 1])
                     open_orders.append(OrderSim("buy", buy_px, od.qty_base, i - 1))
 
@@ -904,6 +907,9 @@ def simulate_grid_replay(
             ((active_plan.get("regime_router") or {}).get("desired_mode")),
             default="unknown",
         )
+        runtime_state = active_plan.get("runtime_state") or {}
+        mode_at_entry = runtime_state.get("mode_at_entry") or runtime_state.get("mode") or active_mode
+        mode_at_exit = runtime_state.get("mode_at_exit") or mode_at_entry
         _increment_reason(mode_plan_counts, active_mode, 1)
         _increment_reason(mode_desired_counts, desired_mode, 1)
 
@@ -1046,6 +1052,8 @@ def simulate_grid_replay(
                     "start_block_reasons": [str(x) for x in plan_start_block_reasons],
                     "plan_index": int(plan_idx),
                     "plan_time_utc": str(active_plan.get("_plan_time")),
+                    "mode_at_entry": mode_at_entry,
+                    "mode_at_exit": mode_at_exit,
                 }
             )
 
@@ -1068,6 +1076,9 @@ def simulate_grid_replay(
                     "start_counterfactual_single": cf_single,
                     "start_counterfactual_combo": cf_combo,
                     "start_counterfactual_required": cf_required_text,
+                    "mode_at_entry": mode_at_entry,
+                    "mode_at_exit": mode_at_exit,
+                    "stop_reason": stop_reason,
                 }
             )
 
@@ -1103,13 +1114,14 @@ def simulate_grid_replay(
                         od.status = "canceled"
                     open_orders = []
                     rebuild_count += 1
-                    events.append(
-                        {
-                            "ts": ts,
-                            "type": "REBUILD",
-                            "plan_index": int(plan_idx),
-                        }
-                    )
+                events.append(
+                    {
+                        "ts": ts,
+                        "type": "REBUILD",
+                        "plan_index": int(plan_idx),
+                        "mode_at_entry": mode_at_entry,
+                    }
+                )
 
                 desired = build_desired_ladder(
                     levels=levels,
@@ -1129,6 +1141,7 @@ def simulate_grid_replay(
                         "type": "SEED",
                         "orders": len(desired),
                         "plan_index": int(plan_idx),
+                        "mode_at_entry": mode_at_entry,
                     }
                 )
             elif soft_adjust:
@@ -1153,6 +1166,9 @@ def simulate_grid_replay(
 
         for od in open_orders:
             if od.status != "open":
+                continue
+            if od.level_index < 0 or od.level_index > n_levels:
+                remaining.append(od)
                 continue
 
             if od.side == "buy":
@@ -1200,7 +1216,7 @@ def simulate_grid_replay(
                     sell_px = float(levels[i + 1])
                     open_orders.append(OrderSim("sell", sell_px, od.qty_base, i + 1))
             else:
-                if i - 1 >= 0:
+                if i - 1 >= 0 and i - 1 <= n_levels:
                     buy_px = float(levels[i - 1])
                     open_orders.append(OrderSim("buy", buy_px, od.qty_base, i - 1))
 
