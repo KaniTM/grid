@@ -656,10 +656,18 @@ def check_mode_router_handoff_behavior() -> None:
     _require(st6.get("active_mode") == "swing", "router should switch to swing after persistence when not running")
     _require(bool(st6.get("switched")), "router should report swing handoff")
 
-    brain.regime_router_force_mode = "pause"
+    brain.regime_router_force_mode = "neutral_choppy"
     st7 = brain._regime_router_state(pair, t0 + 6300, intraday_features)
-    _require(st7.get("active_mode") == "pause", "forced pause mode should override score-based selection")
+    _require(
+        st7.get("active_mode") == "neutral_choppy",
+        "forced neutral_choppy mode should override score-based selection",
+    )
     _require(st7.get("target_reason") == "forced_mode", "forced mode reason should be explicit")
+
+    brain.regime_router_force_mode = "pause"
+    st8 = brain._regime_router_state(pair, t0 + 7200, intraday_features)
+    _require(st8.get("active_mode") == "pause", "forced pause mode should override score-based selection")
+    _require(st8.get("target_reason") == "forced_mode", "forced mode reason should be explicit")
 
     print("[regression] check: regime router mode selection + handoff OK")
 

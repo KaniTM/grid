@@ -22,6 +22,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
+from long_run_monitor import LongRunMonitor, MonitorConfig
 
 
 def q(text: str) -> str:
@@ -241,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable run-state marker files (state.json + events.jsonl).",
     )
+    ap.add_argument(
+        "--enable-liveness",
+        action="store_true",
+        help="Print liveness + state marker lines and enable optional stall detection.",
+    )
+    ap.add_argument(
+        "--stall-threshold-sec",
+        type=int,
+        default=0,
+        help="If set >0, raises when liveness output is idle for this many seconds.",
+    )
     return ap
 
 
@@ -281,6 +293,21 @@ def main() -> int:
             dry_run=int(bool(args.dry_run)),
         )
         run_state.event("RUN_START", run_id=run_id, mode=str(args.mode), tasks_total=int(total))
+    else:
+        run_state_dir = user_data_dir / "run_state" / "data_sync" / run_id
+
+    monitor = LongRunMonitor(
+        MonitorConfig(
+            run_id=run_id,
+            run_type="data_sync",
+            total_steps=total,
+            enabled=args.enable_liveness,
+            state_dir=(run_state_dir if not args.disable_run_state else None),
+            stall_threshold_sec=args.stall_threshold_sec,
+        ),
+        run_state=run_state if args.enable_liveness else None,
+    )
+    monitor.start(message=f"mode={args.mode}", total_steps=total)
 
     failures: List[str] = []
     completed = 0
@@ -369,6 +396,8 @@ def main() -> int:
                     last_task=f"{pair}|{timeframe}",
                     last_task_status="skip",
                 )
+            monitor.event("TASK_SKIP", task_index=int(i), pair=str(pair), timeframe=str(timeframe), reason=str(skip_reason))
+            monitor.progress(done=completed, stage="TASK_SKIP", total=total, message=skip_reason)
             continue
 
         print(
@@ -445,6 +474,14 @@ def main() -> int:
                     after_min=after_min or "",
                     after_max=after_max or "",
                 )
+            monitor.event(
+                "TASK_DONE",
+                task_index=int(i),
+                pair=str(pair),
+                timeframe=str(timeframe),
+                status="ok",
+                rows_delta=int(after_rows - before_rows),
+            )
         except KeyboardInterrupt:
             task_status = "interrupted"
             if run_state is not None:
@@ -465,6 +502,13 @@ def main() -> int:
                     last_task_status="interrupted",
                 )
             terminal_state_written = True
+            monitor.event(
+                "INTERRUPTED",
+                task_index=int(i),
+                pair=str(pair),
+                timeframe=str(timeframe),
+                tasks_completed=int(completed),
+            )
             raise
         except Exception as exc:
             msg = f"pair={pair} tf={timeframe} error={exc}"
@@ -493,6 +537,13 @@ def main() -> int:
                     timeframe=str(timeframe),
                     error=str(exc),
                 )
+            monitor.event(
+                "TASK_ERROR",
+                task_index=int(i),
+                pair=str(pair),
+                timeframe=str(timeframe),
+                error=str(exc),
+            )
             if args.fail_on_task_error:
                 if run_state is not None:
                     run_state.update(
@@ -514,6 +565,7 @@ def main() -> int:
                 raise
         finally:
             completed += 1
+            monitor.progress(done=completed, stage="TASK_PROGRESS", message=f"{pair}|{timeframe}")
             if run_state is not None and (not terminal_state_written):
                 run_state.update(
                     status="running",
@@ -579,6 +631,7 @@ def main() -> int:
     }
     latest_ref = publish_latest_ref(user_data_dir, "data_sync", latest_payload)
     print(f"[data-sync] latest_ref wrote {latest_ref}", flush=True)
+    monitor.complete(final_word, message=f"failures={len(failures)}", return_code=rc)
     return int(rc)
 
 

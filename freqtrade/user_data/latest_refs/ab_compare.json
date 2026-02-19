@@ -1,20 +1,20 @@
 {
-  "A_run_id": "wf_step6_long_B_audit_20200101_20260213_fresh_20260214T032806Z",
-  "B_run_id": "wf_exp_bbwp_plus3_20200101_20260213_v2_strictfix2",
+  "A_run_id": "wf_step6B_attr_debug_20260215T124506Z",
+  "B_run_id": "wf_step6B_attr_debug_20260215T124506Z",
   "category": "ab_compare",
   "delta_B_minus_A": {
-    "avg_pnl_pct": -0.08075724825836861,
+    "avg_pnl_pct": 0.0,
     "max_gain_pct": 0.0,
     "max_loss_pct": 0.0,
     "median_pnl_pct": 0.0,
-    "profit_factor": -0.16410565679181,
-    "sum_pnl_quote": -129.21159721338938,
-    "win_rate": 0.6250000000000036,
+    "profit_factor": 0.0,
+    "sum_pnl_quote": 0.0,
+    "win_rate": 0.0,
     "windows_failed": 0.0,
     "windows_ok": 0.0,
     "windows_total": 0.0
   },
-  "out_path": "walkforward/wf_AB_compare_20200101_20260213_step6B_vs_bbwp_plus3_v2_strictfix2_20260215T101255Z.json",
+  "out_path": "walkforward/wf_AB_compare_20200101_20260213_20260216T232734Z.json",
   "run_type": "ab_compare",
-  "updated_utc": "2026-02-15T10:12:55.429404+00:00"
+  "updated_utc": "2026-02-16T23:27:34.186181+00:00"
 }

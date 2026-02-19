@@ -1,0 +1,10 @@
+# Local Codex workflow artifacts
+.codex-workflow/
+
+# Local status snapshots / bundles we don't want committed
+not_pushed_manifest_*.txt
+handoff_bundle_*.tar.gz
+
+# Local python environment for freqtrade (kept outside git)
+freqtrade/.venv/
+freqtrade/freqtrade.egg-info/

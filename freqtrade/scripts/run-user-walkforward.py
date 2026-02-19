@@ -29,6 +29,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
+from long_run_monitor import LongRunMonitor, MonitorConfig
 
 
 @dataclass
@@ -877,6 +878,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable _state marker files (state.json + events.jsonl).",
     )
+    ap.add_argument(
+        "--enable-liveness",
+        action="store_true",
+        help="Print liveness + state marker lines and optionally run stall hooks.",
+    )
+    ap.add_argument(
+        "--stall-threshold-sec",
+        type=int,
+        default=0,
+        help="If >0 and liveness enabled, raise when no progress for this many seconds.",
+    )
     return ap
 
 
@@ -936,6 +948,19 @@ def main() -> int:
             windows_total=int(len(windows)),
             runtime_plans_root_rel=str(plan_root_rel),
         )
+    monitor_state_dir = out_dir / "_state" if not args.disable_run_state else None
+    monitor = LongRunMonitor(
+        MonitorConfig(
+            run_id=run_id,
+            run_type="walkforward",
+            total_steps=int(len(windows)),
+            enabled=args.enable_liveness,
+            state_dir=monitor_state_dir,
+            stall_threshold_sec=args.stall_threshold_sec,
+        ),
+        run_state=run_state if args.enable_liveness else None,
+    )
+    monitor.start(message=f"timerange={args.timerange}", total_steps=len(windows))
 
     existing_rows_by_index: Dict[int, WindowResult] = {}
     if args.resume and summary_path.exists():
@@ -1013,6 +1038,11 @@ def main() -> int:
                 summary_path=str(summary_path),
                 previous_windows=int(len(existing_rows_by_index)),
             )
+        monitor.event(
+            "RESUME_SCAN_DONE",
+            summary_path=str(summary_path),
+            previous_windows=int(len(existing_rows_by_index)),
+        )
 
     env_exports: List[str] = []
     env_exports.append(f"export GRID_PLANS_ROOT_REL={q(str(plan_root_rel))}")
@@ -1053,6 +1083,12 @@ def main() -> int:
                 windows_total=int(len(windows)),
                 timerange=timerange,
             )
+        monitor.event(
+            "WINDOW_START",
+            window_index=int(idx),
+            windows_total=int(len(windows)),
+            timerange=timerange,
+        )
         existing_row = existing_rows_by_index.get(int(idx))
         if args.resume and existing_row and str(existing_row.status).lower() == "ok":
             result_file_exists = False
@@ -1085,21 +1121,21 @@ def main() -> int:
                 elif not args.carry_capital:
                     cur_quote = float(args.start_quote)
                     cur_base = float(args.start_base)
-                if not args.dry_run:
-                    summary_path_ckpt, csv_path_ckpt, agg_ckpt = write_outputs(out_dir, run_id, args, rows)
-                    print(
-                        f"[walkforward] checkpoint done={len(rows)}/{len(windows)} "
-                        f"ok={int(agg_ckpt.get('windows_ok', 0))} failed={int(agg_ckpt.get('windows_failed', 0))}",
-                        flush=True,
-                    )
-                    print(f"[walkforward] checkpoint wrote {summary_path_ckpt}", flush=True)
-                    print(f"[walkforward] checkpoint wrote {csv_path_ckpt}", flush=True)
-                else:
-                    print(
-                        f"[walkforward] checkpoint done={len(rows)}/{len(windows)} dry_run=1 (no files written)",
-                        flush=True,
-                    )
-                    agg_ckpt = aggregate(rows)
+            if not args.dry_run:
+                summary_path_ckpt, csv_path_ckpt, agg_ckpt = write_outputs(out_dir, run_id, args, rows)
+                print(
+                    f"[walkforward] checkpoint done={len(rows)}/{len(windows)} "
+                    f"ok={int(agg_ckpt.get('windows_ok', 0))} failed={int(agg_ckpt.get('windows_failed', 0))}",
+                    flush=True,
+                )
+                print(f"[walkforward] checkpoint wrote {summary_path_ckpt}", flush=True)
+                print(f"[walkforward] checkpoint wrote {csv_path_ckpt}", flush=True)
+            else:
+                print(
+                    f"[walkforward] checkpoint done={len(rows)}/{len(windows)} dry_run=1 (no files written)",
+                    flush=True,
+                )
+                agg_ckpt = aggregate(rows)
                 if run_state is not None:
                     run_state.event(
                         "WINDOW_RESUME_SKIP",
@@ -1107,18 +1143,30 @@ def main() -> int:
                         timerange=timerange,
                         result_file_exists=int(result_file_exists),
                     )
-                    run_state.update(
-                        status="running",
-                        step_word="WINDOW_DONE",
-                        last_window_index=int(idx),
-                        last_window_timerange=timerange,
-                        last_window_status="ok",
-                        windows_completed=int(len(rows)),
-                        windows_ok=int(agg_ckpt.get("windows_ok", 0)),
-                        windows_failed=int(agg_ckpt.get("windows_failed", 0)),
-                        pct_complete=_format_pct(len(rows), len(windows)),
-                    )
-                continue
+                run_state.update(
+                    status="running",
+                    step_word="WINDOW_DONE",
+                    last_window_index=int(idx),
+                    last_window_timerange=timerange,
+                    last_window_status="ok",
+                    windows_completed=int(len(rows)),
+                    windows_ok=int(agg_ckpt.get("windows_ok", 0)),
+                    windows_failed=int(agg_ckpt.get("windows_failed", 0)),
+                    pct_complete=_format_pct(len(rows), len(windows)),
+                )
+            monitor.event(
+                "WINDOW_RESUME_SKIP",
+                window_index=int(idx),
+                timerange=timerange,
+                result_file_exists=int(result_file_exists),
+            )
+            monitor.progress(
+                done=len(rows),
+                stage="WINDOW_RESUME_SKIP",
+                total=len(windows),
+                message=timerange,
+            )
+            continue
 
         print(
             f"[walkforward] window {idx}/{len(windows)} timerange={timerange} "
@@ -1340,6 +1388,12 @@ def main() -> int:
                     timerange=timerange,
                     windows_completed=int(len(rows)),
                 )
+            monitor.event(
+                "INTERRUPTED",
+                window_index=int(idx),
+                timerange=timerange,
+                windows_completed=int(len(rows)),
+            )
             raise
         except Exception as exc:
             row.status = "error"
@@ -1371,8 +1425,17 @@ def main() -> int:
                     last_error_window_index=int(idx),
                     last_error_timerange=timerange,
                     last_error_transient=transient,
-                    last_error_report_file=str(err_report),
-                )
+                last_error_report_file=str(err_report),
+            )
+            monitor.event(
+                "WINDOW_ERROR",
+                window_index=int(idx),
+                timerange=timerange,
+                stage=window_stage,
+                error=row.error,
+                error_transient=transient,
+                error_report_file=str(err_report),
+            )
             if not args.carry_capital:
                 cur_quote = float(args.start_quote)
                 cur_base = float(args.start_base)
@@ -1432,6 +1495,14 @@ def main() -> int:
                     last_error_report_file=str(row.error_report_file or ""),
                 )
             run_state.update(**update_payload)
+        monitor.event(
+            "WINDOW_DONE",
+            window_index=int(idx),
+            timerange=timerange,
+            status=str(row.status),
+            plans_file_count=int(row.plans_file_count or 0),
+        )
+        monitor.progress(done=done, stage=f"WINDOW_{idx:03d}", total=len(windows), message=timerange)
 
         if args.fail_on_window_error and str(row.status).lower() != "ok":
             print(
@@ -1511,6 +1582,7 @@ def main() -> int:
         }
         latest_ref = publish_latest_ref(user_data_dir, "walkforward", latest_payload)
         print(f"[walkforward] latest_ref wrote {latest_ref}", flush=True)
+    monitor.complete(final_word, message=f"windows_ok={int(agg.get('windows_ok', 0))}", return_code=rc)
     return int(rc)
 
 

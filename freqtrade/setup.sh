@@ -111,6 +111,12 @@ function updateenv() {
         echo "Failed installing Freqtrade"
         exit 1
     fi
+    echo "Installing development helpers (ruff + pytest)"
+    ${PIP} install --upgrade ruff pytest
+    if [ $? -ne 0 ]; then
+        echo "Failed installing ruff/pytest"
+        exit 1
+    fi
 
     echo "Installing freqUI"
     freqtrade install-ui

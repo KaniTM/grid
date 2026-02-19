@@ -7,15 +7,39 @@ Outputs:
 - Recommended intraday/swing gate thresholds.
 """
 
+# ruff: noqa
+
 from __future__ import annotations
+
 
 import argparse
 import json
+import math
 import os
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from freqtrade.exchange import timeframe_to_minutes
+
+
+CAL_WINDOW_DAYS_DEFAULT = 180
+ER_LOOKBACK = 20
+CHOP_LOOKBACK = 20
+ATR_PERIOD = 20
+ADX_PERIOD = 14
+CONTAINMENT_LOOKBACK_BARS = 96  # 24h window on 15m candles
+SCORE_ENTER_QUANTILE = 0.70
+SCORE_EXIT_QUANTILE = 0.55
+SCORE_PERSISTENCE_DEFAULT = 4
+FEATURE_HORIZON_MAP = {
+    "er_15m": "15m",
+    "chop_15m": "15m",
+    "atr_pct_15m": "15m",
+    "adx_4h": "4h",
+}
 
 
 def find_ohlcv_file(data_dir: str, pair: str, timeframe: str) -> str:
@@ -82,6 +106,59 @@ def bb_width(close: pd.Series, window: int = 20, stds: float = 2.0) -> pd.Series
     upper = mid + (stds * sd)
     lower = mid - (stds * sd)
     return (upper - lower) / mid.replace(0.0, np.nan)
+
+
+def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    hl = high - low
+    hc = (high - close.shift(1)).abs()
+    lc = (low - close.shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+
+def efficiency_ratio_series(series: pd.Series, period: int) -> pd.Series:
+    out = pd.Series(np.nan, index=series.index)
+    values = pd.to_numeric(series, errors="coerce").astype(float)
+    if len(values) < (period + 1):
+        return out
+    for i in range(period, len(values)):
+        window = values.iloc[i - period : i + 1]
+        if window.isna().any():
+            continue
+        change = abs(window.iloc[-1] - window.iloc[0])
+        volatility = window.diff().abs().sum()
+        if volatility <= 0:
+            continue
+        out.iloc[i] = change / volatility
+    return out
+
+
+def choppiness_index_series(high: pd.Series, low: pd.Series, atr: pd.Series, period: int) -> pd.Series:
+    out = pd.Series(np.nan, index=high.index)
+    highs = pd.to_numeric(high, errors="coerce").astype(float)
+    lows = pd.to_numeric(low, errors="coerce").astype(float)
+    atr_vals = pd.to_numeric(atr, errors="coerce").astype(float)
+    if len(highs) < period or len(lows) < period or len(atr_vals) < period:
+        return out
+    for i in range(period - 1, len(highs)):
+        hwin = highs.iloc[i - period + 1 : i + 1]
+        lwin = lows.iloc[i - period + 1 : i + 1]
+        atr_win = atr_vals.iloc[i - period + 1 : i + 1]
+        if hwin.isna().any() or lwin.isna().any() or atr_win.isna().any():
+            continue
+        total_atr = float(atr_win.sum())
+        range_high = float(hwin.max())
+        range_low = float(lwin.min())
+        price_range = range_high - range_low
+        if total_atr <= 0 or price_range <= 0:
+            continue
+        try:
+            ratio = total_atr / price_range
+            score = 100.0 * math.log10(ratio) / math.log10(period)
+        except Exception:
+            continue
+        out.iloc[i] = score
+    return out
 
 
 def adx_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -155,9 +232,16 @@ def resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame:
 
 def build_feature_frame(df_15m: pd.DataFrame, bbwp_lookback: int) -> pd.DataFrame:
     df = df_15m.copy()
+    df["atr_15m"] = atr_series(df["high"], df["low"], df["close"], ATR_PERIOD)
+    df["atr_pct_15m"] = df["atr_15m"] / df["close"].replace({0.0: np.nan})
     df["rvol_15m"] = df["volume"] / df["volume"].rolling(20, min_periods=20).mean()
     df["bb_width_15m"] = bb_width(df["close"], window=20, stds=2.0)
     df["bbwp_15m_pct"] = rolling_percentile_last(df["bb_width_15m"], bbwp_lookback)
+
+    df["high_24h"] = df["high"].rolling(CONTAINMENT_LOOKBACK_BARS, min_periods=1).max()
+    df["low_24h"] = df["low"].rolling(CONTAINMENT_LOOKBACK_BARS, min_periods=1).min()
+    df["close_in_24h_box"] = df["close"].between(df["low_24h"], df["high_24h"])
+    df["containment_pct"] = df["close_in_24h_box"].rolling(CONTAINMENT_LOOKBACK_BARS, min_periods=1).mean()
 
     df_1h = resample_ohlcv(df_15m, "1h")
     df_1h["ema50_1h"] = df_1h["close"].ewm(span=50, adjust=False).mean()
@@ -166,6 +250,7 @@ def build_feature_frame(df_15m: pd.DataFrame, bbwp_lookback: int) -> pd.DataFram
     df_1h["vol_ratio_1h"] = df_1h["volume"] / df_1h["volume"].rolling(20, min_periods=20).mean()
     df_1h["bb_width_1h"] = bb_width(df_1h["close"], window=20, stds=2.0)
     df_1h["bbwp_1h_pct"] = rolling_percentile_last(df_1h["bb_width_1h"], bbwp_lookback)
+    df_1h["adx_1h"] = adx_wilder(df_1h["high"], df_1h["low"], df_1h["close"], period=ADX_PERIOD)
 
     df_4h = resample_ohlcv(df_15m, "4h")
     df_4h["adx_4h"] = adx_wilder(df_4h["high"], df_4h["low"], df_4h["close"], period=14)
@@ -183,6 +268,9 @@ def build_feature_frame(df_15m: pd.DataFrame, bbwp_lookback: int) -> pd.DataFram
             "rvol_15m",
             "bb_width_15m",
             "bbwp_15m_pct",
+            "atr_15m",
+            "atr_pct_15m",
+            "containment_pct",
         ]
     ].copy()
     feat = pd.merge_asof(
@@ -194,6 +282,7 @@ def build_feature_frame(df_15m: pd.DataFrame, bbwp_lookback: int) -> pd.DataFram
                 "vol_ratio_1h",
                 "bb_width_1h",
                 "bbwp_1h_pct",
+                "adx_1h",
             ]
         ].sort_values("date"),
         on="date",
@@ -206,6 +295,8 @@ def build_feature_frame(df_15m: pd.DataFrame, bbwp_lookback: int) -> pd.DataFram
         direction="backward",
     )
     feat["bb_width_1h_pct"] = feat["bbwp_1h_pct"]
+    feat["er_15m"] = efficiency_ratio_series(df["close"], ER_LOOKBACK)
+    feat["chop_15m"] = choppiness_index_series(df["high"], df["low"], df["atr_15m"], CHOP_LOOKBACK)
     return feat
 
 
@@ -253,6 +344,51 @@ def qval(series: pd.Series, q: float, fallback: float) -> float:
     return float(vals.quantile(q))
 
 
+def assign_non_trend_mask(
+    adx_pct: pd.Series,
+    enter_pct: float = 55.0,
+    exit_pct: float = 65.0,
+    veto_pct: float = 70.0,
+) -> pd.Series:
+    series = pd.to_numeric(adx_pct, errors="coerce")
+    mask = np.zeros(len(series), dtype=bool)
+    current = False
+    for pos, val in enumerate(series):
+        if not np.isfinite(val):
+            current = False
+        elif val >= veto_pct:
+            current = False
+        elif current:
+            current = val < exit_pct
+        else:
+            current = val <= enter_pct
+        mask[pos] = current
+    return pd.Series(mask, index=series.index)
+
+
+def percentile_stats(series: pd.Series) -> Dict[str, Optional[float]]:
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if len(vals) == 0:
+        return {}
+    return {
+        "p10": float(vals.quantile(0.10)),
+        "p50": float(vals.quantile(0.50)),
+        "p90": float(vals.quantile(0.90)),
+    }
+
+
+def normalize_series(series: pd.Series, stats: Dict[str, Optional[float]]) -> pd.Series:
+    if not stats:
+        return pd.Series(np.nan, index=series.index)
+    p10 = stats.get("p10")
+    p90 = stats.get("p90")
+    if p10 is None or p90 is None or p90 <= p10:
+        return pd.Series(np.nan, index=series.index)
+    vals = pd.to_numeric(series, errors="coerce")
+    norm = (vals - float(p10)) / float(p90 - p10)
+    return norm.clip(0.0, 1.0)
+
+
 def feature_quantiles(df: pd.DataFrame, mask: pd.Series, features: List[str]) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     sub = df.loc[mask, features]
@@ -291,10 +427,17 @@ def recommend_mode_thresholds(df: pd.DataFrame, prefix: str, defaults: Dict[str,
 
 
 def label_counts(df: pd.DataFrame, prefix: str) -> Dict[str, int]:
+    def label_sum(col_name: str) -> int:
+        if col_name not in df:
+            return 0
+        return int((df[col_name] == 1).sum())
+
     return {
         "rows_total": int(len(df)),
-        "range_label": int((df[f"{prefix}_range_label"] == 1).sum()),
-        "trend_label": int((df[f"{prefix}_trend_label"] == 1).sum()),
+        "range_label": label_sum(f"{prefix}_range_label"),
+        "trend_label": label_sum(f"{prefix}_trend_label"),
+        "non_trend_range_label": label_sum(f"{prefix}_non_trend_range_label"),
+        "neutral_choppy_label": label_sum(f"{prefix}_neutral_choppy_label"),
     }
 
 
@@ -306,6 +449,8 @@ def add_verbose_states(feat: pd.DataFrame, prefixes: List[str]) -> pd.DataFrame:
         f_eff = f"{prefix}_fwd_eff"
         range_col = f"{prefix}_range_label"
         trend_col = f"{prefix}_trend_label"
+        non_trend_range_col = f"{prefix}_non_trend_range_label"
+        neutral_choppy_col = f"{prefix}_neutral_choppy_label"
 
         valid_col = f"{prefix}_label_valid"
         state_col = f"{prefix}_state"
@@ -318,13 +463,30 @@ def add_verbose_states(feat: pd.DataFrame, prefixes: List[str]) -> pd.DataFrame:
             & pd.to_numeric(out[f_eff], errors="coerce").notna()
         )
 
+        if non_trend_range_col in out:
+            non_trend_range_vals = out[non_trend_range_col].astype(bool)
+        else:
+            non_trend_range_vals = pd.Series(False, index=out.index)
+        if neutral_choppy_col in out:
+            neutral_choppy_vals = out[neutral_choppy_col].astype(bool)
+        else:
+            neutral_choppy_vals = pd.Series(False, index=out.index)
+
         state = np.where(
             ~out[valid_col],
             "unlabeled",
             np.where(
                 out[trend_col] == 1,
                 "trend",
-                np.where(out[range_col] == 1, "range", "neutral"),
+                np.where(
+                    neutral_choppy_vals,
+                    "neutral_choppy",
+                    np.where(
+                        non_trend_range_vals,
+                        "non_trend_range",
+                        np.where(out[range_col] == 1, "range", "neutral"),
+                    ),
+                ),
             ),
         )
         out[state_col] = state
@@ -374,6 +536,8 @@ def extract_transition_events(
             f"{prefix}_fwd_eff": float(row[f"{prefix}_fwd_eff"]) if pd.notna(row[f"{prefix}_fwd_eff"]) else None,
             f"{prefix}_range_label": int(row[f"{prefix}_range_label"]) if pd.notna(row[f"{prefix}_range_label"]) else None,
             f"{prefix}_trend_label": int(row[f"{prefix}_trend_label"]) if pd.notna(row[f"{prefix}_trend_label"]) else None,
+            f"{prefix}_non_trend_range_label": int(row[f"{prefix}_non_trend_range_label"]) if f"{prefix}_non_trend_range_label" in row and pd.notna(row[f"{prefix}_non_trend_range_label"]) else None,
+            f"{prefix}_neutral_choppy_label": int(row[f"{prefix}_neutral_choppy_label"]) if f"{prefix}_neutral_choppy_label" in row and pd.notna(row[f"{prefix}_neutral_choppy_label"]) else None,
         }
         for col in feature_cols:
             val = row[col] if col in row else None
@@ -395,6 +559,21 @@ def transition_counts(events: List[Dict[str, object]]) -> Dict[str, int]:
     return {k: int(v) for k, v in sorted(out.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))}
 
 
+def median_state_run_length(df: pd.DataFrame, prefix: str, state: str) -> Optional[int]:
+    state_col = f"{prefix}_state"
+    run_len_col = f"{prefix}_state_run_len"
+    if state_col not in df or run_len_col not in df:
+        return None
+    mask = df[state_col] == state
+    values = pd.to_numeric(df.loc[mask, run_len_col], errors="coerce")
+    if values.empty:
+        return None
+    median_val = float(np.nanmedian(values))
+    if math.isnan(median_val):
+        return None
+    return int(round(median_val))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pair", required=True, help="e.g. ETH/USDT")
@@ -403,6 +582,32 @@ def main() -> None:
     ap.add_argument("--timerange", default=None, help="YYYYMMDD-YYYYMMDD (optional)")
     ap.add_argument("--bbwp-lookback", type=int, default=252)
     ap.add_argument("--out", required=True, help="output json path")
+    ap.add_argument(
+        "--cal-window-days",
+        type=float,
+        default=CAL_WINDOW_DAYS_DEFAULT,
+        help="rolling window (in days) used to compute ER/CHOP/ADX/ATR percentiles",
+    )
+    ap.add_argument("--artifact-root", default="/freqtrade/user_data/artifacts", help="base folder for artifacts")
+    ap.add_argument("--artifact-run-id", default=None, help="run id under artifact root (auto-generated when omitted)")
+    ap.add_argument(
+        "--score-enter-quantile",
+        type=float,
+        default=SCORE_ENTER_QUANTILE,
+        help="quantile used for recommended enter score",
+    )
+    ap.add_argument(
+        "--score-exit-quantile",
+        type=float,
+        default=SCORE_EXIT_QUANTILE,
+        help="quantile used for recommended exit score",
+    )
+    ap.add_argument(
+        "--score-persistence-bars",
+        type=int,
+        default=SCORE_PERSISTENCE_DEFAULT,
+        help="persistence (in 15m bars) for score hysteresis",
+    )
     ap.add_argument("--emit-features-csv", default=None, help="optional feature dump csv path")
     ap.add_argument("--emit-verbose-csv", default=None, help="optional per-candle verbose audit csv path")
     ap.add_argument("--emit-transitions-csv", default=None, help="optional transition events csv path")
@@ -441,6 +646,7 @@ def main() -> None:
 
     feature_cols = [
         "adx_4h",
+        "adx_1h",
         "ema_dist_frac_1h",
         "bb_width_1h_pct",
         "bbwp_15m_pct",
@@ -448,10 +654,189 @@ def main() -> None:
         "bbwp_4h_pct",
         "vol_ratio_1h",
         "rvol_15m",
+        "er_15m",
+        "chop_15m",
+        "atr_pct_15m",
+        "containment_pct",
     ]
     valid = feat.dropna(subset=feature_cols).copy()
     if len(valid) == 0:
         raise ValueError("No valid rows after feature construction.")
+
+    tf_minutes = max(1, timeframe_to_minutes(args.timeframe))
+    bars_per_day = max(1, int(round((24 * 60) / tf_minutes)))
+    cal_window_bars = max(1, int(round(args.cal_window_days * bars_per_day)))
+    window = valid.tail(cal_window_bars)
+
+    valid["er_pct_15m"] = rolling_percentile_last(valid["er_15m"], cal_window_bars)
+    valid["chop_pct_15m"] = rolling_percentile_last(valid["chop_15m"], cal_window_bars)
+    valid["adx_pct_4h"] = rolling_percentile_last(valid["adx_4h"], cal_window_bars)
+    valid["adx_pct_1h"] = rolling_percentile_last(valid["adx_1h"], cal_window_bars)
+    valid["atr_pct_pct"] = rolling_percentile_last(valid["atr_pct_15m"], cal_window_bars)
+
+    valid["intraday_non_trend_mask"] = assign_non_trend_mask(valid["adx_pct_1h"])
+    valid["swing_non_trend_mask"] = assign_non_trend_mask(valid["adx_pct_4h"])
+
+
+    # Neutral/choppy detection inside the non-trend regime.
+    chop_condition = (
+        (valid["chop_15m"] >= 61.8)
+        | (valid["chop_pct_15m"] >= 70.0)
+    )
+    er_condition = valid["er_pct_15m"] <= 40.0
+    containment_condition = valid["containment_pct"] >= 0.65
+    # Default "neutral/choppy" contract: high chop, low ER, and sustained containment.
+    neutral_choppy_base = chop_condition & er_condition & containment_condition
+    neutral_choppy_base = neutral_choppy_base.fillna(False).astype(bool)
+
+    valid["intraday_neutral_choppy_label"] = neutral_choppy_base & valid["intraday_non_trend_mask"]
+    valid["swing_neutral_choppy_label"] = neutral_choppy_base & valid["swing_non_trend_mask"]
+
+    valid["intraday_non_trend_range_label"] = (
+        valid["intraday_range_label"].astype(bool)
+        & valid["intraday_non_trend_mask"]
+        & (~valid["intraday_neutral_choppy_label"])
+    )
+    valid["swing_non_trend_range_label"] = (
+        valid["swing_range_label"].astype(bool)
+        & valid["swing_non_trend_mask"]
+        & (~valid["swing_neutral_choppy_label"])
+    )
+
+    er_stats = percentile_stats(window["er_15m"])
+    chop_stats = percentile_stats(window["chop_15m"])
+    atr_stats = percentile_stats(window["atr_pct_15m"])
+    adx_stats = percentile_stats(window["adx_4h"])
+
+    er_norm = normalize_series(valid["er_15m"], er_stats)
+    chop_norm = normalize_series(valid["chop_15m"], chop_stats)
+    atr_norm = normalize_series(valid["atr_pct_15m"], atr_stats)
+    adx_norm = normalize_series(valid["adx_4h"], adx_stats)
+
+    bbwp_stats = percentile_stats(window["bbwp_15m_pct"])
+    valid["volatility_allowed"] = (
+        (valid["bbwp_15m_pct"] >= 20.0)
+        & (valid["bbwp_15m_pct"] <= 60.0)
+    )
+    valid["volatility_veto"] = valid["bbwp_15m_pct"] >= 85.0
+    atr_non_dead = valid["atr_pct_pct"] >= 15.0
+    valid["dead_vol_veto"] = (valid["bbwp_15m_pct"] <= 10.0) & (~atr_non_dead)
+    valid["volatility_ready"] = (
+        valid["volatility_allowed"]
+        & (~valid["volatility_veto"])
+        & (~valid["dead_vol_veto"])
+    )
+
+    volatility_component = valid["volatility_ready"].astype(float).fillna(0.0)
+
+    score_series = (
+        0.30 * (1.0 - er_norm)
+        + 0.30 * chop_norm
+        + 0.25 * (1.0 - adx_norm)
+        + 0.10 * atr_norm
+        + 0.05 * volatility_component
+    )
+    valid["chop_score"] = score_series
+
+    score_enter = qval(score_series, args.score_enter_quantile, SCORE_ENTER_QUANTILE)
+    score_exit = qval(score_series, args.score_exit_quantile, SCORE_EXIT_QUANTILE)
+    score_stats = percentile_stats(score_series.dropna())
+
+    artifact_run_id = str(args.artifact_run_id or "").strip()
+    if not artifact_run_id:
+        artifact_run_id = datetime.now(timezone.utc).strftime("regime_bands_%Y%m%dT%H%M%SZ")
+    artifact_root = Path(args.artifact_root or "/freqtrade/user_data/artifacts").resolve()
+    artifact_dir = artifact_root / "regime_bands" / artifact_run_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "neutral_bands.json"
+
+    feature_entries = [
+        {
+            "pair": args.pair,
+            "horizon": "15m",
+            "features": {
+                "er_15m": er_stats,
+                "chop_15m": chop_stats,
+                "atr_pct_15m": atr_stats,
+            },
+            "enter_score": score_enter,
+            "exit_score": score_exit,
+            "persistence_bars": int(args.score_persistence_bars),
+        },
+        {
+            "pair": args.pair,
+            "horizon": "4h",
+            "features": {
+                "adx_4h": adx_stats,
+            },
+            "enter_score": score_enter,
+            "exit_score": score_exit,
+            "persistence_bars": int(args.score_persistence_bars),
+        },
+    ]
+
+    verbose = add_verbose_states(valid, prefixes=["intraday", "swing"])
+
+    persistence_recs: Dict[str, Dict[str, Optional[int]]] = {}
+    for prefix in ("intraday", "swing"):
+        persistence_recs[prefix] = {
+            "non_trend_range_bars": median_state_run_length(verbose, prefix, "non_trend_range"),
+            "neutral_choppy_bars": median_state_run_length(verbose, prefix, "neutral_choppy"),
+        }
+
+    # Open decision defaults (entry/exit/veto percentiles) for the new neutral/choppy gating.
+    hysteresis_bands = {
+        "intraday": {
+            "adx": {
+                "enter_pct": 55,
+                "enter_value": qval(window["adx_1h"], 0.55, intraday_defaults["adx_enter_max"]),
+                "exit_pct": 65,
+                "exit_value": qval(window["adx_1h"], 0.65, intraday_defaults["adx_exit_max"]),
+                "veto_pct": 70,
+                "veto_value": qval(window["adx_1h"], 0.70, intraday_defaults["adx_exit_max"]),
+            },
+            "bbwp": {
+                "entry_min_pct": 20,
+                "entry_min_value": qval(window["bbwp_15m_pct"], 0.20, 30.0),
+                "exit_max_pct": 60,
+                "exit_max_value": qval(window["bbwp_15m_pct"], 0.60, 60.0),
+                "veto_pct": 85,
+                "veto_value": qval(window["bbwp_15m_pct"], 0.85, 85.0),
+                "dead_vol_pct": 10,
+                "dead_vol_value": qval(window["bbwp_15m_pct"], 0.10, 10.0),
+                "dead_vol_atr_pct": 15.0,
+            },
+            "atr_pct": {
+                "non_dead_pct": 15,
+                "non_dead_value": qval(window["atr_pct_15m"], 0.15, 0.0015),
+            },
+        },
+        "swing": {
+            "adx": {
+                "enter_pct": 55,
+                "enter_value": qval(window["adx_4h"], 0.55, swing_defaults["adx_enter_max"]),
+                "exit_pct": 65,
+                "exit_value": qval(window["adx_4h"], 0.65, swing_defaults["adx_exit_max"]),
+                "veto_pct": 70,
+                "veto_value": qval(window["adx_4h"], 0.70, swing_defaults["adx_exit_max"]),
+            },
+            "bbwp": {
+                "entry_min_pct": 20,
+                "entry_min_value": qval(window["bbwp_15m_pct"], 0.20, 30.0),
+                "exit_max_pct": 60,
+                "exit_max_value": qval(window["bbwp_15m_pct"], 0.60, 60.0),
+                "veto_pct": 85,
+                "veto_value": qval(window["bbwp_15m_pct"], 0.85, 85.0),
+                "dead_vol_pct": 10,
+                "dead_vol_value": qval(window["bbwp_15m_pct"], 0.10, 10.0),
+                "dead_vol_atr_pct": 15.0,
+            },
+            "atr_pct": {
+                "non_dead_pct": 15,
+                "non_dead_value": qval(window["atr_pct_15m"], 0.15, 0.0015),
+            },
+        },
+    }
 
     verbose = add_verbose_states(valid, prefixes=["intraday", "swing"])
 
@@ -532,15 +917,21 @@ def main() -> None:
                 "range": int((verbose["intraday_state"] == "range").sum()),
                 "trend": int((verbose["intraday_state"] == "trend").sum()),
                 "neutral": int((verbose["intraday_state"] == "neutral").sum()),
+                "non_trend_range": int((verbose["intraday_state"] == "non_trend_range").sum()),
+                "neutral_choppy": int((verbose["intraday_state"] == "neutral_choppy").sum()),
                 "unlabeled": int((verbose["intraday_state"] == "unlabeled").sum()),
             },
             "swing": {
                 "range": int((verbose["swing_state"] == "range").sum()),
                 "trend": int((verbose["swing_state"] == "trend").sum()),
                 "neutral": int((verbose["swing_state"] == "neutral").sum()),
+                "non_trend_range": int((verbose["swing_state"] == "non_trend_range").sum()),
+                "neutral_choppy": int((verbose["swing_state"] == "neutral_choppy").sum()),
                 "unlabeled": int((verbose["swing_state"] == "unlabeled").sum()),
             },
         },
+        "hysteresis_bands": hysteresis_bands,
+        "persistence_recommendations": persistence_recs,
         "transition_counts": {
             "intraday": transition_counts(intraday_events),
             "swing": transition_counts(swing_events),
@@ -556,7 +947,40 @@ def main() -> None:
             "intraday": recommend_mode_thresholds(valid, "intraday", intraday_defaults),
             "swing": recommend_mode_thresholds(valid, "swing", swing_defaults),
         },
+        "regime_bands": {
+            "artifact_path": str(artifact_path),
+            "artifact_run_id": artifact_run_id,
+            "cal_window_days": float(args.cal_window_days),
+            "cal_window_bars": int(cal_window_bars),
+            "enter_score": float(score_enter),
+            "exit_score": float(score_exit),
+            "persistence_bars": int(args.score_persistence_bars),
+        },
+        "chop_score": {
+            "p10": score_stats.get("p10"),
+            "p50": score_stats.get("p50"),
+            "p90": score_stats.get("p90"),
+            "enter_quantile": float(args.score_enter_quantile),
+            "exit_quantile": float(args.score_exit_quantile),
+        },
     }
+
+    artifact_payload: Dict[str, Any] = {
+        "meta": {
+            "pair": args.pair,
+            "timeframe": args.timeframe,
+            "run_id": artifact_run_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "cal_window_days": float(args.cal_window_days),
+            "cal_window_bars": int(cal_window_bars),
+            "feature_horizons": FEATURE_HORIZON_MAP,
+        },
+        "entries": feature_entries,
+        "hysteresis_bands": hysteresis_bands,
+        "persistence_recommendations": persistence_recs,
+    }
+    with artifact_path.open("w", encoding="utf-8") as f:
+        json.dump(artifact_payload, f, indent=2, sort_keys=True)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
@@ -567,6 +991,9 @@ def main() -> None:
             "date",
             "close",
             "adx_4h",
+            "adx_1h",
+            "adx_pct_4h",
+            "adx_pct_1h",
             "ema_dist_frac_1h",
             "bb_width_1h_pct",
             "bbwp_15m_pct",
@@ -574,8 +1001,20 @@ def main() -> None:
             "bbwp_4h_pct",
             "vol_ratio_1h",
             "rvol_15m",
+            "containment_pct",
+            "volatility_allowed",
+            "volatility_veto",
+            "dead_vol_veto",
+            "volatility_ready",
+            "er_15m",
+            "er_pct_15m",
+            "chop_15m",
+            "chop_pct_15m",
+            "atr_pct_15m",
             "intraday_range_label",
             "intraday_trend_label",
+            "intraday_non_trend_range_label",
+            "intraday_neutral_choppy_label",
             "intraday_fwd_abs_ret",
             "intraday_fwd_span",
             "intraday_fwd_eff",
@@ -583,11 +1022,14 @@ def main() -> None:
             "intraday_transition",
             "swing_range_label",
             "swing_trend_label",
+            "swing_non_trend_range_label",
+            "swing_neutral_choppy_label",
             "swing_fwd_abs_ret",
             "swing_fwd_span",
             "swing_fwd_eff",
             "swing_state",
             "swing_transition",
+            "chop_score",
         ]
         os.makedirs(os.path.dirname(args.emit_features_csv), exist_ok=True)
         verbose[keep].to_csv(args.emit_features_csv, index=False)
@@ -620,7 +1062,8 @@ def main() -> None:
         print(f"Wrote transition events csv: {args.emit_transitions_csv}", flush=True)
     if args.emit_transitions_json:
         print(f"Wrote transition events json: {args.emit_transitions_json}", flush=True)
-    print("Recommended thresholds:", json.dumps(report["recommended_thresholds"], indent=2), flush=True)
+        print("Recommended thresholds:", json.dumps(report["recommended_thresholds"], indent=2), flush=True)
+    print(f"Wrote regime bands artifact: {artifact_path}", flush=True)
 
 
 if __name__ == "__main__":
