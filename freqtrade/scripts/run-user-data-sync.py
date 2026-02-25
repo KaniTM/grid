@@ -70,6 +70,14 @@ def _format_pct(done: int, total: int) -> str:
     return f"{(100.0 * float(done) / float(total)):.2f}%"
 
 
+def emit_run_marker(label: str, **meta: object) -> None:
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "marker": label,
+    }
+    payload.update(meta)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
 def _probe_file(path: Optional[Path]) -> Dict[str, object]:
     if path is None:
         return {}
@@ -296,6 +304,14 @@ def main() -> int:
     else:
         run_state_dir = user_data_dir / "run_state" / "data_sync" / run_id
 
+    emit_run_marker(
+        "RUN_START",
+        run_id=run_id,
+        mode=args.mode,
+        tasks_total=total,
+        user_data=str(user_data_dir),
+    )
+
     monitor = LongRunMonitor(
         MonitorConfig(
             run_id=run_id,
@@ -311,6 +327,8 @@ def main() -> int:
 
     failures: List[str] = []
     completed = 0
+    executed_tasks = 0
+    skipped_tasks = 0
     task_records: List[Dict[str, object]] = []
     for i, (pair, timeframe) in enumerate(tasks, start=1):
         pct = _format_pct(i - 1, total)
@@ -358,8 +376,8 @@ def main() -> int:
             timerange = f"{target_start}-{prepend_end}"
 
         if skip_reason:
-            completed += 1
             task_status = "skip"
+            next_completed = completed + 1
             task_records.append(
                 {
                     "pair": str(pair),
@@ -379,6 +397,7 @@ def main() -> int:
                 f"status=skip reason={skip_reason}",
                 flush=True,
             )
+            skipped_tasks += 1
             if run_state is not None:
                 run_state.event(
                     "TASK_SKIP",
@@ -390,14 +409,21 @@ def main() -> int:
                 run_state.update(
                     status="running",
                     step_word="TASK_DONE",
-                    tasks_completed=int(completed),
+                    tasks_completed=int(next_completed),
                     tasks_failed=int(len(failures)),
-                    pct_complete=_format_pct(completed, total),
+                    tasks_executed=int(executed_tasks),
+                    tasks_skipped=int(skipped_tasks),
+                    pct_complete=_format_pct(executed_tasks, total),
                     last_task=f"{pair}|{timeframe}",
                     last_task_status="skip",
                 )
             monitor.event("TASK_SKIP", task_index=int(i), pair=str(pair), timeframe=str(timeframe), reason=str(skip_reason))
-            monitor.progress(done=completed, stage="TASK_SKIP", total=total, message=skip_reason)
+            monitor.progress(
+                done=executed_tasks,
+                stage="TASK_SKIP",
+                total=total,
+                message=f"{skip_reason} executed={executed_tasks} skipped={skipped_tasks}",
+            )
             continue
 
         print(
@@ -422,7 +448,9 @@ def main() -> int:
         if args.no_parallel_download:
             dl_cmd = f"{dl_cmd} --no-parallel-download"
 
+        attempted_work = False
         try:
+            attempted_work = True
             run_compose_inner(
                 root_dir,
                 args.service,
@@ -497,7 +525,9 @@ def main() -> int:
                     step_word="INTERRUPTED",
                     tasks_completed=int(completed),
                     tasks_failed=int(len(failures)),
-                    pct_complete=_format_pct(completed, total),
+                    tasks_executed=int(executed_tasks),
+                    tasks_skipped=int(skipped_tasks),
+                    pct_complete=_format_pct(executed_tasks, total),
                     last_task=f"{pair}|{timeframe}",
                     last_task_status="interrupted",
                 )
@@ -508,6 +538,13 @@ def main() -> int:
                 pair=str(pair),
                 timeframe=str(timeframe),
                 tasks_completed=int(completed),
+            )
+            emit_run_marker(
+                "RUN_ABORTED",
+                run_id=run_id,
+                mode=args.mode,
+                reason="keyboard_interrupt",
+                task=f"{pair}|{timeframe}",
             )
             raise
         except Exception as exc:
@@ -545,13 +582,19 @@ def main() -> int:
                 error=str(exc),
             )
             if args.fail_on_task_error:
+                print(
+                    f"[data-sync] fail-on-task-error triggered pair={pair} tf={timeframe}",
+                    flush=True,
+                )
                 if run_state is not None:
                     run_state.update(
                         status="failed",
                         step_word="RUN_FAILED",
                         tasks_completed=int(completed),
                         tasks_failed=int(len(failures)),
-                        pct_complete=_format_pct(completed, total),
+                        tasks_executed=int(executed_tasks),
+                        tasks_skipped=int(skipped_tasks),
+                        pct_complete=_format_pct(executed_tasks, total),
                         last_task=f"{pair}|{timeframe}",
                         last_task_status="error",
                     )
@@ -562,23 +605,39 @@ def main() -> int:
                         task_index=int(i),
                     )
                     terminal_state_written = True
+                emit_run_marker(
+                    "RUN_FAILED",
+                    run_id=run_id,
+                    mode=args.mode,
+                    reason="fail_on_task_error",
+                    task=f"{pair}|{timeframe}",
+                    failures=len(failures),
+                )
                 raise
         finally:
             completed += 1
-            monitor.progress(done=completed, stage="TASK_PROGRESS", message=f"{pair}|{timeframe}")
+            if attempted_work:
+                executed_tasks += 1
+            monitor.progress(
+                done=executed_tasks,
+                stage="TASK_PROGRESS",
+                message=f"{pair}|{timeframe} executed={executed_tasks} skipped={skipped_tasks}",
+            )
             if run_state is not None and (not terminal_state_written):
                 run_state.update(
                     status="running",
                     step_word=("TASK_ERROR" if task_status == "error" else "TASK_DONE"),
                     tasks_completed=int(completed),
                     tasks_failed=int(len(failures)),
-                    pct_complete=_format_pct(completed, total),
+                    tasks_executed=int(executed_tasks),
+                    tasks_skipped=int(skipped_tasks),
+                    pct_complete=_format_pct(executed_tasks, total),
                     last_task=f"{pair}|{timeframe}",
                     last_task_status=str(task_status),
                 )
 
     print(
-        f"[data-sync] done completed={completed}/{total} pct={_format_pct(completed, total)} failures={len(failures)}",
+        f"[data-sync] done completed={completed}/{total} pct={_format_pct(executed_tasks, total)} failures={len(failures)}",
         flush=True,
     )
     for item in failures:
@@ -599,7 +658,9 @@ def main() -> int:
             step_word=final_word,
             tasks_completed=int(completed),
             tasks_failed=int(len(failures)),
-            pct_complete=_format_pct(completed, total),
+            tasks_executed=int(executed_tasks),
+            tasks_skipped=int(skipped_tasks),
+            pct_complete=_format_pct(executed_tasks, total),
             return_code=int(rc),
         )
         run_state.event(
@@ -610,6 +671,18 @@ def main() -> int:
             tasks_completed=int(completed),
             tasks_failed=int(len(failures)),
         )
+    emit_run_marker(
+        "RUN_COMPLETE",
+        run_id=run_id,
+        mode=args.mode,
+        status=final_status,
+        tasks_total=total,
+        tasks_completed=completed,
+        tasks_executed=executed_tasks,
+        tasks_skipped=skipped_tasks,
+        tasks_failed=len(failures),
+        return_code=int(rc),
+    )
     latest_payload = {
         "run_type": "data_sync",
         "run_id": str(run_id),
@@ -623,6 +696,8 @@ def main() -> int:
         "tasks_total": int(total),
         "tasks_completed": int(completed),
         "tasks_failed": int(len(failures)),
+        "tasks_executed": int(executed_tasks),
+        "tasks_skipped": int(skipped_tasks),
         "tasks": task_records,
         "run_state_dir": rel_payload_path(
             user_data_dir,

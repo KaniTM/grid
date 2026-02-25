@@ -2,6 +2,8 @@
 # flake8: noqa: F401
 # isort: skip_file
 # ruff: noqa
+from dataclasses import dataclass
+
 # --- Do not remove these imports ---
 import json
 import math
@@ -18,9 +20,98 @@ from freqtrade.configuration import Configuration as Config
 from freqtrade.strategy import IStrategy, informative
 import talib.abstract as ta
 from technical import qtpylib
+from core.enums import BlockReason, MaterialityClass
+
+LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
+REQUIRED_OHLC_COLUMNS = ("date", "open", "high", "low", "close", "volume")
+FEATURE_CONTRACT_COLUMNS = (
+    "close",
+    "high",
+    "low",
+    "atr_15m",
+    "rsi_15m",
+    "bb_mid_15m",
+    "bb_mid_1h",
+    "bb_mid_4h",
+    "adx_4h",
+    "vwap_15m",
+)
 
 
-class GridBrainV1(IStrategy):
+def _normalize_runtime_value(value: object) -> object:
+    if isinstance(value, (np.generic,)):
+        return value.item()
+    if isinstance(value, (np.ndarray,)):
+        return value.tolist()
+    if isinstance(value, list):
+        return [_normalize_runtime_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_normalize_runtime_value(v) for v in value)
+    if isinstance(value, dict):
+        return {str(k): _normalize_runtime_value(v) for k, v in value.items()}
+    if isinstance(value, (int, float, str, bool)):
+        return value
+    return str(value)
+
+
+@dataclass(frozen=True)
+class GridBrainRuntimeSnapshot:
+    timestamp: int
+    knobs: Dict[str, object]
+    lookbacks: Dict[str, int]
+
+    @classmethod
+    def from_strategy(
+        cls, strategy: "GridBrainV1Core", lookback_summary: "GridBrainLookbackSummary"
+    ) -> "GridBrainRuntimeSnapshot":
+        knobs: Dict[str, object] = {}
+        for name, value in vars(strategy.__class__).items():
+            if name.startswith("_"):
+                continue
+            if name in ("__module__", "__doc__", "INTERFACE_VERSION"):
+                continue
+            if callable(value):
+                continue
+            knobs[name] = _normalize_runtime_value(value)
+        knobs["timeframe"] = getattr(strategy, "timeframe", None)
+        lookbacks = dict(lookback_summary.lookbacks) if lookback_summary else {}
+        return cls(
+            timestamp=int(datetime.now(timezone.utc).timestamp()),
+            knobs=knobs,
+            lookbacks=lookbacks,
+        )
+
+    def as_dict(self) -> Dict[str, object]:
+        return {"timestamp": self.timestamp, "knobs": self.knobs, "lookbacks": self.lookbacks}
+
+
+@dataclass(frozen=True)
+class GridBrainLookbackSummary:
+    lookbacks: Dict[str, int]
+    buffer: int
+
+    @classmethod
+    def from_strategy(cls, strategy: "GridBrainV1Core", buffer: int) -> "GridBrainLookbackSummary":
+        lookbacks: Dict[str, int] = {}
+        if buffer < 0:
+            buffer = 0
+        for attr in dir(strategy.__class__):
+            if attr.startswith("_"):
+                continue
+            if not attr.endswith(LOOKBACK_SUFFIXES):
+                continue
+            value = getattr(strategy.__class__, attr, None)
+            if isinstance(value, (int, float)):
+                lookbacks[attr] = max(int(math.ceil(float(value))), 1)
+        return cls(lookbacks=lookbacks, buffer=buffer)
+
+    def required_candles(self) -> int:
+        if not self.lookbacks:
+            return self.buffer
+        return int(max(self.lookbacks.values()) + self.buffer)
+
+
+class GridBrainV1Core(IStrategy):
     """
     GridBrainV1 (Brain-only) — outputs a GridPlan JSON every 15m candle.
     - Does NOT trade.
@@ -42,6 +133,14 @@ class GridBrainV1(IStrategy):
         self._neutral_bands_loaded = False
         self._neutral_bands_map: Dict[Tuple[str, str], Dict[str, object]] = {}
         self._neutral_bands_run_id = self._determine_regime_bands_run_id()
+        self._feature_contract_logged_pairs: Dict[str, bool] = {}
+        self._lookback_summary = GridBrainLookbackSummary.from_strategy(
+            self, buffer=self.lookback_buffer
+        )
+        self.startup_candle_count = max(self._lookback_summary.required_candles(), 1)
+        self._runtime_snapshot = GridBrainRuntimeSnapshot.from_strategy(
+            self, self._lookback_summary
+        )
 
     INTERFACE_VERSION = 3
     STOP_REASON_TREND_ADX = "STOP_TREND_ADX"
@@ -60,10 +159,26 @@ class GridBrainV1(IStrategy):
     trailing_stop = False
 
     process_only_new_candles = True
+    lookback_buffer: int = 32
 
-    # Need enough candles for 7d lookback on 15m:
-    # 7 * 24 * 4 = 672  (plus buffer)
-    startup_candle_count: int = 800
+    # startup will be computed based on the heaviest lookback + buffer
+    startup_candle_count: int = 1
+
+    # Data quality enforcement (Section 4.2)
+    data_quality_expected_candle_seconds: int = 900
+    data_quality_gap_multiplier: float = 1.5
+    data_quality_max_stale_minutes: float = 60.0
+    data_quality_zero_volume_streak_bars: int = 4
+
+    # Materiality Before Churn thresholds (Section 3.6)
+    materiality_epoch_bars: int = 2
+    materiality_box_mid_shift_max_step_frac: float = 0.5
+    materiality_box_width_change_pct: float = 5.0
+    materiality_tp_shift_max_step_frac: float = 0.75
+    materiality_sl_shift_max_step_frac: float = 0.75
+
+    poc_acceptance_enabled: bool = True
+    poc_acceptance_lookback_bars: int = 8
 
     # ========= v1 locked defaults =========
     # Box builder (15m)
@@ -369,6 +484,13 @@ class GridBrainV1(IStrategy):
     _box_state_by_pair: Dict[str, Dict[str, object]] = {}
     _box_rebuild_bars_since_by_pair: Dict[str, int] = {}
     _neutral_box_break_bars_by_pair: Dict[str, int] = {}
+    _box_signature_by_pair: Dict[str, str] = {}
+    _data_quality_issues_by_pair: Dict[str, Dict[str, object]] = {}
+    _materiality_epoch_bar_count_by_pair: Dict[str, int] = {}
+    _last_width_pct_by_pair: Dict[str, float] = {}
+    _last_tp_price_by_pair: Dict[str, float] = {}
+    _last_sl_price_by_pair: Dict[str, float] = {}
+    _poc_acceptance_crossed_by_pair: Dict[str, bool] = {}
     _plan_guard_decision_count_by_pair: Dict[str, int] = {}
     _external_mode_thresholds_path_cache: Optional[str] = None
     _external_mode_thresholds_mtime_cache: float = -1.0
@@ -443,6 +565,98 @@ class GridBrainV1(IStrategy):
             return None
 
     @staticmethod
+    def _box_signature(lo: float, hi: float, lookback: int, pad: float) -> str:
+        if lo is None or hi is None or pad is None:
+            return f"{lo}-{hi}-{lookback}-{pad}"
+        return f"{lo:.8f}:{hi:.8f}:{lookback}:{pad:.8f}"
+
+    @staticmethod
+    def _poc_cross_detected(df: DataFrame, poc: Optional[float], lookback: int) -> bool:
+        if poc is None or lookback <= 0 or df is None or df.empty:
+            return False
+        bars = min(len(df), lookback)
+        if bars <= 0:
+            return False
+        window = df.iloc[-bars:]
+        for _, row in window.iterrows():
+            open_val = GridBrainV1Core._safe_float(row.get("open"))
+            close_val = GridBrainV1Core._safe_float(row.get("close"))
+            if open_val is None or close_val is None:
+                continue
+            if (open_val < poc < close_val) or (open_val > poc > close_val):
+                return True
+        return False
+
+    @staticmethod
+    def _derive_box_block_reasons(fvg_state: Dict[str, object]) -> List[BlockReason]:
+        reasons: List[BlockReason] = []
+        if not fvg_state:
+            return reasons
+        if bool(fvg_state.get("straddle_veto", False)):
+            reasons.append(BlockReason.BLOCK_BOX_STRADDLE_FVG_EDGE)
+        if bool(fvg_state.get("defensive_conflict", False)):
+            reasons.append(BlockReason.BLOCK_BOX_STRADDLE_FVG_AVG)
+        session_conflict = bool(fvg_state.get("session_inside_block", False)) or bool(
+            fvg_state.get("session_pause_active", False)
+        )
+        if session_conflict:
+            reasons.append(BlockReason.BLOCK_BOX_STRADDLE_SESSION_FVG_AVG)
+        return reasons
+
+    def _append_reason(self, reasons: List[BlockReason], reason: BlockReason) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    def _run_data_quality_checks(self, dataframe: DataFrame, pair: str) -> Dict[str, object]:
+        reasons: List[BlockReason] = []
+        details: Dict[str, object] = {}
+        ok = True
+        ts = pd.to_datetime(dataframe["date"], utc=True, errors="coerce")
+        details["last_timestamp"] = ts.iloc[-1].isoformat() if len(ts) and pd.notna(ts.iloc[-1]) else None
+        if ts.isnull().any():
+            ok = False
+            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
+        if ts.duplicated().any():
+            ok = False
+            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
+        if not ts.is_monotonic_increasing:
+            ok = False
+            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
+        if len(ts) >= 2:
+            diffs = ts.diff().dt.total_seconds().iloc[1:]
+            threshold = float(self.data_quality_expected_candle_seconds) * float(self.data_quality_gap_multiplier)
+            if (diffs > threshold).any():
+                ok = False
+                self._append_reason(reasons, BlockReason.BLOCK_DATA_GAP)
+                details["gap_detected_secs"] = float(max(diffs))
+        if len(ts) >= 1 and pd.notna(ts.iloc[-1]):
+            now_ts = datetime.now(timezone.utc)
+            stale_secs = (now_ts - ts.iloc[-1]).total_seconds()
+            details["stale_secs"] = float(stale_secs)
+            if stale_secs >= float(self.data_quality_max_stale_minutes) * 60.0:
+                ok = False
+                self._append_reason(reasons, BlockReason.BLOCK_DATA_GAP)
+        zero_check = int(max(0, self.data_quality_zero_volume_streak_bars))
+        if zero_check > 0 and len(dataframe) >= zero_check:
+            tail_vol = pd.to_numeric(dataframe["volume"].iloc[-zero_check:], errors="coerce").fillna(0.0)
+            if tail_vol.eq(0.0).all():
+                ok = False
+                self._append_reason(reasons, BlockReason.BLOCK_ZERO_VOL_ANOMALY)
+        last = dataframe.iloc[-1]
+        bb_mid_1h = self._safe_float(last.get("bb_mid_1h"))
+        bb_mid_4h = self._safe_float(last.get("bb_mid_4h"))
+        if bb_mid_1h is None or bb_mid_4h is None:
+            ok = False
+            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
+        data_quality_entry = {
+            "ok": bool(ok),
+            "reasons": reasons,
+            "details": details,
+        }
+        self._data_quality_issues_by_pair[pair] = data_quality_entry
+        return data_quality_entry
+
+    @staticmethod
     def _percentile(series: pd.Series, percentile: float, lookback: int) -> Optional[float]:
         if lookback <= 0 or series is None or percentile < 0 or percentile > 100:
             return None
@@ -453,6 +667,20 @@ class GridBrainV1(IStrategy):
         if window.empty:
             return None
         return float(np.percentile(window, percentile))
+
+    def _poc_acceptance_status(
+        self, pair: str, df: DataFrame, poc: Optional[float]
+    ) -> bool:
+        if not self.poc_acceptance_enabled:
+            return True
+        if bool(self._poc_acceptance_crossed_by_pair.get(pair, False)):
+            return True
+        if poc is None or df is None or df.empty:
+            return False
+        if self._poc_cross_detected(df, poc, self.poc_acceptance_lookback_bars):
+            self._poc_acceptance_crossed_by_pair[pair] = True
+            return True
+        return False
 
     @staticmethod
     def _efficiency_ratio(series: pd.Series, period: int) -> Optional[float]:
@@ -467,6 +695,123 @@ class GridBrainV1(IStrategy):
         if volatility is None or volatility <= 0:
             return None
         return float(change) / float(volatility)
+
+    def _atomic_write_file(self, path: str, payload: str) -> None:
+        tmp_path = f"{path}.tmp"
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+    def _evaluate_materiality(
+        self,
+        pair: str,
+        mid: float,
+        width_pct: float,
+        step_price: float,
+        tp_price: float,
+        sl_price: float,
+        hard_stop: bool,
+        action: str,
+    ) -> Dict[str, object]:
+        entry: Dict[str, object] = {}
+        prev_mid = self._last_mid_by_pair.get(pair)
+        prev_width = self._last_width_pct_by_pair.get(pair)
+        prev_step = self._last_box_step_by_pair.get(pair)
+        prev_tp = self._last_tp_price_by_pair.get(pair)
+        prev_sl = self._last_sl_price_by_pair.get(pair)
+        epoch_count = int(self._materiality_epoch_bar_count_by_pair.get(pair, 0) + 1)
+        entry["epoch_counter"] = epoch_count
+        allow_epoch = epoch_count >= max(1, int(self.materiality_epoch_bars))
+        delta_mid_steps = 0.0
+        delta_width_pct = 0.0
+        delta_tp_steps = 0.0
+        delta_sl_steps = 0.0
+        if prev_mid is not None and step_price > 0:
+            delta_mid_steps = abs(mid - prev_mid) / step_price
+        if prev_width is not None:
+            delta_width_pct = abs(width_pct - prev_width)
+        if prev_tp is not None and step_price > 0:
+            delta_tp_steps = abs(tp_price - prev_tp) / step_price
+        if prev_sl is not None and step_price > 0:
+            delta_sl_steps = abs(sl_price - prev_sl) / step_price
+        entry["delta_mid_steps"] = float(delta_mid_steps)
+        entry["delta_width_pct"] = float(delta_width_pct)
+        entry["delta_tp_steps"] = float(delta_tp_steps)
+        entry["delta_sl_steps"] = float(delta_sl_steps)
+        material_delta = bool(
+            delta_mid_steps >= float(self.materiality_box_mid_shift_max_step_frac)
+            or delta_width_pct >= float(self.materiality_box_width_change_pct)
+            or delta_tp_steps >= float(self.materiality_tp_shift_max_step_frac)
+            or delta_sl_steps >= float(self.materiality_sl_shift_max_step_frac)
+        )
+        reasons: List[str] = []
+        mat_class = MaterialityClass.NOOP
+        publish = False
+        if hard_stop or action == "STOP":
+            mat_class = MaterialityClass.HARDSTOP
+            reasons.append("REPLAN_HARD_STOP_OVERRIDE")
+            publish = True
+        elif material_delta:
+            mat_class = MaterialityClass.MATERIAL
+            reasons.append("REPLAN_MATERIAL_BOX_CHANGE")
+            publish = True
+        elif allow_epoch or prev_mid is None:
+            mat_class = MaterialityClass.SOFT
+            reasons.append("REPLAN_NOOP_MINOR_DELTA")
+            publish = True
+        else:
+            mat_class = MaterialityClass.NOOP
+            reasons.append("REPLAN_NOOP_MINOR_DELTA")
+            publish = False
+        entry["class"] = mat_class
+        entry["reasons"] = reasons
+        entry["publish"] = publish
+        if publish:
+            self._materiality_epoch_bar_count_by_pair[pair] = 0
+        else:
+            self._materiality_epoch_bar_count_by_pair[pair] = epoch_count
+        return entry
+    def _validate_feature_contract(self, dataframe: DataFrame, pair: str) -> bool:
+        if len(dataframe) < self.startup_candle_count:
+            return False
+
+        missing_columns = [c for c in FEATURE_CONTRACT_COLUMNS if c not in dataframe.columns]
+        if missing_columns:
+            if not self._feature_contract_logged_pairs.get(pair):
+                self._log_feature_contract_violation(pair, missing_columns, [])
+            self._feature_contract_logged_pairs[pair] = True
+            return False
+
+        last = dataframe.iloc[-1]
+        nan_columns = [c for c in FEATURE_CONTRACT_COLUMNS if pd.isna(last.get(c))]
+        if nan_columns:
+            if not self._feature_contract_logged_pairs.get(pair):
+                self._log_feature_contract_violation(pair, [], nan_columns)
+            self._feature_contract_logged_pairs[pair] = True
+            return False
+
+        if self._feature_contract_logged_pairs.get(pair):
+            self._feature_contract_logged_pairs[pair] = False
+        return True
+
+    def _log_feature_contract_violation(
+        self, pair: str, missing_columns: List[str], nan_columns: List[str]
+    ) -> None:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "module": "GridBrainV1Core",
+            "level": "warning",
+            "pair": pair,
+            "startup_required": int(self.startup_candle_count),
+            "missing_columns": missing_columns,
+            "nan_columns": nan_columns,
+        }
+        print(json.dumps(payload, sort_keys=True))
 
     @staticmethod
     def _choppiness_index(highs: pd.Series, lows: pd.Series, atr: pd.Series, period: int) -> Optional[float]:
@@ -581,7 +926,7 @@ class GridBrainV1(IStrategy):
         exit_min: float,
         rising_bars_required: int,
     ) -> bool:
-        adx = GridBrainV1._safe_float(adx_value)
+        adx = self._safe_float(adx_value)
         if adx is None:
             return False
         rb = int(max(int(rising_bars_required), 1))
@@ -597,9 +942,9 @@ class GridBrainV1(IStrategy):
         rising_bars_required: int,
         early_margin: float = 2.0,
     ) -> bool:
-        adx = GridBrainV1._safe_float(adx_value)
-        plus_di = GridBrainV1._safe_float(plus_di_value)
-        minus_di = GridBrainV1._safe_float(minus_di_value)
+        adx = self._safe_float(adx_value)
+        plus_di = self._safe_float(plus_di_value)
+        minus_di = self._safe_float(minus_di_value)
         if adx is None or plus_di is None or minus_di is None:
             return False
         if not bool(minus_di > plus_di):
@@ -1328,6 +1673,9 @@ class GridBrainV1(IStrategy):
         plan: dict,
         base_plan_hash: Optional[str] = None,
     ) -> None:
+        if hasattr(self, "_runtime_snapshot"):
+            plan["runtime_config"] = self._runtime_snapshot.as_dict()
+
         out_dir = self._plan_dir(exchange_name, pair)
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1369,10 +1717,8 @@ class GridBrainV1(IStrategy):
                 self._last_plan_base_hash_by_pair[pair] = base_plan_hash
             return
 
-        with open(latest_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-        with open(archive_path, "w", encoding="utf-8") as f:
-            f.write(payload)
+        self._atomic_write_file(latest_path, payload)
+        self._atomic_write_file(archive_path, payload)
 
         self._last_plan_hash_by_pair[pair] = payload_hash
         if base_plan_hash is not None:
@@ -2700,8 +3046,14 @@ class GridBrainV1(IStrategy):
                 self._history_emit_end_ts_by_pair[pair] = int(frame_end_ts)
             return dataframe
 
+        if not self._validate_feature_contract(dataframe, pair):
+            return dataframe
+
         last = dataframe.iloc[-1]
         close = float(last["close"])
+        data_quality = self._run_data_quality_checks(dataframe, pair)
+        data_quality_ok = bool(data_quality.get("ok", True))
+        data_quality_reasons = data_quality.get("reasons", [])
         rsi = self._safe_float(last.get("rsi_15m"))
         vwap = self._safe_float(last.get("vwap_15m"))
         gate_cfg = self._gate_profile_values()
@@ -3110,6 +3462,7 @@ class GridBrainV1(IStrategy):
             vrvp_box_ok = bool(vrvp_dist_frac <= self.vrvp_poc_outside_box_max_frac)
 
         candidate_mid = float((hi_p + lo_p) / 2.0) if (hi_p + lo_p) else 0.0
+        candidate_signature = self._box_signature(lo_p, hi_p, used_lb, pad)
         candidate_box = {
             "lo": float(lo_p),
             "hi": float(hi_p),
@@ -3127,6 +3480,16 @@ class GridBrainV1(IStrategy):
             "box_ok": bool(vrvp_box_ok),
         }
         stored_box = self._box_state_by_pair.get(pair)
+        stored_signature = self._box_signature_by_pair.get(pair)
+        if stored_signature is None and stored_box is not None:
+            stored_signature = self._box_signature(
+                float(stored_box.get("lo", lo_p)),
+                float(stored_box.get("hi", hi_p)),
+                int(stored_box.get("used_lookback", used_lb)),
+                float(stored_box.get("pad", pad)),
+            )
+            self._box_signature_by_pair[pair] = stored_signature
+        signature_changed = stored_signature != candidate_signature
         bars_since = int(self._box_rebuild_bars_since_by_pair.get(pair, 0) or 0)
         shift_frac = None
         if stored_box is not None:
@@ -3150,6 +3513,9 @@ class GridBrainV1(IStrategy):
             }
             active_vrvp = candidate_vrvp
             self._box_state_by_pair[pair] = dict(active_box)
+            self._box_signature_by_pair[pair] = candidate_signature
+            if signature_changed:
+                self._poc_acceptance_crossed_by_pair.pop(pair, None)
             self._box_rebuild_bars_since_by_pair[pair] = 0
             box_rebuild_wait_bars = 0
         else:
@@ -3170,6 +3536,9 @@ class GridBrainV1(IStrategy):
         vrvp_box_shift = float(active_vrvp.get("box_shift_applied", 0.0) or 0.0)
         vrvp_box_ok = bool(active_vrvp.get("box_ok", True))
         box_rebuild_shift_frac = shift_frac
+
+        final_vrvp_poc = self._safe_float(active_vrvp.get("poc"))
+        poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, final_vrvp_poc)
 
         # Quartiles
         mid = (hi_p + lo_p) / 2.0
@@ -3360,6 +3729,7 @@ class GridBrainV1(IStrategy):
         fvg_fresh_pause = bool(fvg_state.get("fresh_defensive_pause", False))
         session_fvg_pause_active = bool(fvg_state.get("session_pause_active", False))
         session_fvg_inside_block = bool(fvg_state.get("session_inside_block", False))
+        box_block_reasons = self._derive_box_block_reasons(fvg_state)
 
         tp_candidates = {
             "base_tp": float(tp_price),
@@ -3712,6 +4082,8 @@ class GridBrainV1(IStrategy):
             start_gate_ok = bool(rule_range_ok)
         else:
             start_gate_ok = bool(core_gates_ok and gate_ratio_ok)
+        if not data_quality_ok:
+            start_gate_ok = False
         start_signal = bool(start_gate_ok and price_in_box and rsi_ok)
         start_blocked = bool(start_signal and (reclaim_active or cooldown_active))
         failed_core_gates = [name for name, ok in gate_checks if (name in core_gate_names) and (not ok)]
@@ -3741,6 +4113,12 @@ class GridBrainV1(IStrategy):
             start_block_reasons.append("stop_rule_active")
         if raw_stop_rule and (not stop_rule):
             start_block_reasons.append("stop_rule_suppressed_by_min_runtime")
+        if box_block_reasons:
+            start_block_reasons.extend([str(x) for x in box_block_reasons])
+        if self.poc_acceptance_enabled and not poc_acceptance_satisfied:
+            start_block_reasons.append(str(BlockReason.BLOCK_NO_POC_ACCEPTANCE))
+        if not data_quality_ok:
+            start_block_reasons.extend([str(x) for x in data_quality_reasons])
         start_block_reasons = list(dict.fromkeys(start_block_reasons))
 
         # ---- Action (final) ----
@@ -3785,6 +4163,16 @@ class GridBrainV1(IStrategy):
         cooldown_active_now = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
         stop_reason_flags_raw_active = [k for k, v in stop_reason_flags_raw.items() if bool(v)]
         stop_reason_flags_applied_active = stop_reason_flags_raw_active if bool(stop_rule) else []
+        materiality_info = self._evaluate_materiality(
+            pair,
+            mid,
+            width_pct,
+            step_price,
+            tp_price_plan,
+            sl_price,
+            hard_stop,
+            action,
+        )
 
         plan = {
             "ts": ts,
@@ -3833,6 +4221,12 @@ class GridBrainV1(IStrategy):
             # NEW: reference price for initial ladder decisions
             "price_ref": {"close": float(close), "vwap_15m": vwap},
 
+            "data_quality": {
+                "ok": bool(data_quality_ok),
+                "reasons": [str(x) for x in data_quality_reasons],
+                "details": data_quality.get("details", {}),
+            },
+
             "range": {
                 "low": float(lo_p),
                 "high": float(hi_p),
@@ -3856,6 +4250,14 @@ class GridBrainV1(IStrategy):
                         "skipped": bool(box_rebuild_skipped),
                         "wait_bars": int(box_rebuild_wait_bars),
                         "shift_frac": float(box_rebuild_shift_frac) if box_rebuild_shift_frac is not None else None,
+                    },
+                },
+                "validation": {
+                    "blockers": [str(x) for x in box_block_reasons],
+                    "poc_acceptance": {
+                        "required": bool(self.poc_acceptance_enabled),
+                        "satisfied": bool(poc_acceptance_satisfied),
+                        "lookback_bars": int(self.poc_acceptance_lookback_bars),
                     },
                 },
                 "micro_vap": {
@@ -3935,6 +4337,16 @@ class GridBrainV1(IStrategy):
                     "breakout_risk_high": bool(ml_breakout_risk_high),
                     "quick_tp_candidate": ml_quick_tp_candidate,
                 },
+            },
+            "materiality": {
+                "class": str(materiality_info.get("class", MaterialityClass.NOOP)),
+                "publish": bool(materiality_info.get("publish", False)),
+                "reasons": [str(x) for x in materiality_info.get("reasons", [])],
+                "epoch_counter": int(materiality_info.get("epoch_counter", 0)),
+                "delta_mid_steps": float(materiality_info.get("delta_mid_steps", 0.0)),
+                "delta_width_pct": float(materiality_info.get("delta_width_pct", 0.0)),
+                "delta_tp_steps": float(materiality_info.get("delta_tp_steps", 0.0)),
+                "delta_sl_steps": float(materiality_info.get("delta_sl_steps", 0.0)),
             },
             "grid": {
                 "n_levels": int(n_levels),
@@ -4358,7 +4770,7 @@ class GridBrainV1(IStrategy):
         base_hash_changed = bool(last_base_hash is None or (base_plan_hash != last_base_hash))
 
         # Write plan once per base candle timestamp
-        if base_hash_changed:
+        if base_hash_changed and bool(materiality_info.get("publish", False)):
             should_write = False
             if candle_ts is not None:
                 last_written = self._last_written_ts_by_pair.get(pair)
@@ -4382,6 +4794,9 @@ class GridBrainV1(IStrategy):
         # Cache mid for shift detection next candle
         self._last_mid_by_pair[pair] = float(mid)
         self._last_box_step_by_pair[pair] = float(step_price)
+        self._last_width_pct_by_pair[pair] = float(width_pct)
+        self._last_tp_price_by_pair[pair] = float(tp_price_plan)
+        self._last_sl_price_by_pair[pair] = float(sl_price)
 
         return dataframe
 
@@ -4393,3 +4808,8 @@ class GridBrainV1(IStrategy):
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["exit_long"] = 0
         return dataframe
+
+
+class GridBrainV1(GridBrainV1Core):
+    """Legacy alias for GridBrainV1Core to keep imports stable."""
+    pass

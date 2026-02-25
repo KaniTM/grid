@@ -2,10 +2,55 @@ import argparse
 import json
 import os
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+SOURCE_PATH = Path(__file__).resolve()
+MODULE_NAME = "grid_simulator_v1"
+
+
+def log_event(level: str, message: str, plan: Optional[Dict] = None, **meta: object) -> None:
+    payload: Dict[str, object] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": str(level).upper(),
+        "module": MODULE_NAME,
+        "source_path": str(SOURCE_PATH),
+        "message": message,
+    }
+    if plan is not None:
+        payload["plan_context"] = _plan_context(plan)
+    payload.update(meta)
+    print(json.dumps(payload, sort_keys=True))
+
+
+def _log_plan_marker(
+    label: str, plan: Optional[Dict], level: str = "debug", **meta: object
+) -> None:
+    log_event(level, label, plan=plan, **meta)
+
+
+# -----------------------------
+# Plan helpers
+# -----------------------------
+def _plan_context(plan: Optional[Dict]) -> Dict[str, object]:
+    if not plan:
+        return {}
+    out: Dict[str, object] = {}
+    path = plan.get("_plan_path") or plan.get("plan_path") or plan.get("path")
+    if path:
+        out["plan_path"] = str(path)
+    ts = plan.get("ts") or plan.get("candle_time_utc")
+    if ts:
+        out["plan_ts"] = str(ts)
+    try:
+        out["plan_keys"] = sorted(plan.keys())
+    except Exception:
+        pass
+    return out
 
 
 # -----------------------------
@@ -24,6 +69,13 @@ def find_ohlcv_file(data_dir: str, pair: str, timeframe: str) -> str:
             if pair_fs.lower() in low and f"-{timeframe}".lower() in low:
                 candidates.append(os.path.join(root, fn))
     if not candidates:
+        log_event(
+            "error",
+            "missing_ohlcv",
+            data_dir=data_dir,
+            pair=pair,
+            timeframe=timeframe,
+        )
         raise FileNotFoundError(f"No OHLCV file found for {pair} {timeframe} under {data_dir}")
 
     pref = [".feather", ".parquet", ".json.gz", ".json", ".csv.gz", ".csv"]
@@ -46,12 +98,14 @@ def load_ohlcv(path: str) -> pd.DataFrame:
     elif low.endswith(".csv"):
         df = pd.read_csv(path)
     else:
+        log_event("error", "unsupported_ohlcv_format", path=path)
         raise ValueError(f"Unsupported file format: {path}")
 
     # Normalize column names
     cols = {c.lower(): c for c in df.columns}
     date_col = cols.get("date") or cols.get("timestamp") or cols.get("datetime")
     if not date_col:
+        log_event("error", "missing_date_column", path=path, columns=df.columns.tolist())
         raise ValueError(f"Could not find date/timestamp column in {path}. Columns: {df.columns.tolist()}")
 
     df = df.rename(columns={date_col: "date"})
@@ -80,6 +134,7 @@ def filter_timerange(df: pd.DataFrame, timerange: Optional[str]) -> pd.DataFrame
     if not timerange:
         return df
     if "-" not in timerange:
+        log_event("error", "invalid_timerange", value=timerange)
         raise ValueError("timerange must look like YYYYMMDD-YYYYMMDD")
     a, b = timerange.split("-", 1)
     start = pd.to_datetime(a, format="%Y%m%d", utc=True)
@@ -100,38 +155,75 @@ def parse_start_at(start_at: Optional[str], plan: Dict) -> Optional[pd.Timestamp
 
     s = start_at.strip().lower()
     if s == "plan":
-        ct = plan.get("candle_time_utc")
-        if ct:
+        for key in ("candle_time_utc", "candle_ts", "ts"):
+            value = plan.get(key)
+            if value is None:
+                continue
             try:
-                return pd.to_datetime(ct, utc=True)
+                resolved = pd.to_datetime(value, utc=True)
+                _log_plan_marker(
+                    "parse_start_at_plan",
+                    plan,
+                    level="debug",
+                    requested="plan",
+                    resolved=str(resolved),
+                    plan_key=key,
+                )
+                return resolved
             except Exception:
-                pass
-        cts = plan.get("candle_ts")
-        if cts is not None:
-            try:
-                return pd.to_datetime(int(cts), unit="s", utc=True)
-            except Exception:
-                pass
-        # fallback: plan["ts"] (write time, not candle time)
-        pts = plan.get("ts")
-        if pts:
-            try:
-                return pd.to_datetime(pts, utc=True)
-            except Exception:
-                pass
+                continue
+        _log_plan_marker(
+            "parse_start_at_plan",
+            plan,
+            level="warning",
+            requested="plan",
+            resolved=None,
+        )
         return None
 
     # numeric formats
     if s.isdigit():
         if len(s) == 8:
-            return pd.to_datetime(s, format="%Y%m%d", utc=True)
+            resolved = pd.to_datetime(s, format="%Y%m%d", utc=True)
+            _log_plan_marker(
+                "parse_start_at_numeric",
+                plan,
+                level="debug",
+                requested=start_at,
+                resolved=str(resolved),
+                format="YYYYMMDD",
+            )
+            return resolved
         if len(s) == 12:
-            return pd.to_datetime(s, format="%Y%m%d%H%M", utc=True)
+            resolved = pd.to_datetime(s, format="%Y%m%d%H%M", utc=True)
+            _log_plan_marker(
+                "parse_start_at_numeric",
+                plan,
+                level="debug",
+                requested=start_at,
+                resolved=str(resolved),
+                format="YYYYMMDDHHMM",
+            )
+            return resolved
 
     # ISO-ish
     try:
-        return pd.to_datetime(start_at, utc=True)
+        resolved = pd.to_datetime(start_at, utc=True)
+        _log_plan_marker(
+            "parse_start_at_iso",
+            plan,
+            level="debug",
+            requested=start_at,
+            resolved=str(resolved),
+        )
+        return resolved
     except Exception:
+        _log_plan_marker(
+            "parse_start_at_error",
+            plan,
+            level="error",
+            requested=start_at,
+        )
         raise ValueError("Unsupported --start-at. Use 'plan', YYYYMMDD, YYYYMMDDHHMM, or ISO timestamp.")
 
 
@@ -178,14 +270,41 @@ def extract_rung_weights(plan: Dict, n_levels: int) -> Optional[List[float]]:
         rb = g.get("rung_density_bias", {}) or {}
         ws = rb.get("weights_by_level_index")
         if ws is None:
+            log_event(
+                "warning",
+                "missing_rung_weights",
+                plan_ts=str(plan.get("ts") or plan.get("candle_time_utc") or ""),
+                n_levels=n_levels,
+            )
             return None
         vals = [max(float(x), 0.0) for x in ws]
         if len(vals) != n_levels + 1:
+            log_event(
+                "warning",
+                "rung_weight_length_mismatch",
+                plan_ts=str(plan.get("ts") or plan.get("candle_time_utc") or ""),
+                expected=n_levels + 1,
+                actual=len(vals),
+            )
             return None
         if not any(v > 0 for v in vals):
+            log_event(
+                "warning",
+                "rung_weights_all_zero",
+                plan_ts=str(plan.get("ts") or plan.get("candle_time_utc") or ""),
+                n_levels=n_levels,
+                **_plan_context(plan),
+            )
             return None
         return vals
-    except Exception:
+    except Exception as exc:
+        log_event(
+            "error",
+            "rung_weight_parse_failed",
+            plan_ts=str(plan.get("ts") or plan.get("candle_time_utc") or ""),
+            error=str(exc),
+            **_plan_context(plan),
+        )
         return None
 
 
@@ -197,19 +316,34 @@ def normalized_side_weights(indices: List[int], rung_weights: Optional[List[floa
     vals = [max(float(rung_weights[i]), 0.0) if 0 <= i < len(rung_weights) else 0.0 for i in indices]
     s = float(sum(vals))
     if s <= 0:
+        log_event(
+            "warning",
+            "normalized_weights_zero_sum",
+            indices=indices,
+            rung_weights=list(rung_weights or []),
+        )
         return [1.0 / len(indices)] * len(indices)
     return [float(v / s) for v in vals]
 
 
 def plan_signature(plan: Dict) -> Tuple:
-    r = plan["range"]
-    g = plan["grid"]
-    return (
-        round(float(r["low"]), 12),
-        round(float(r["high"]), 12),
-        int(g["n_levels"]),
-        round(float(g["step_price"]), 12),
-    )
+    try:
+        r = plan["range"]
+        g = plan["grid"]
+        return (
+            round(float(r["low"]), 12),
+            round(float(r["high"]), 12),
+            int(g["n_levels"]),
+            round(float(g["step_price"]), 12),
+        )
+    except Exception as exc:
+        log_event(
+            "error",
+            "plan_signature_failed",
+            error=str(exc),
+            **_plan_context(plan),
+        )
+        raise
 
 
 def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
@@ -222,7 +356,16 @@ def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
         frac = float(new_plan.get("update_policy", {}).get("soft_adjust_max_step_frac", 0.5))
         tol = frac * step
         return abs(new_low - prev_low) <= tol and abs(new_high - prev_high) <= tol
-    except Exception:
+    except Exception as exc:
+        prev_ctx = _plan_context(prev_plan)
+        new_ctx = _plan_context(new_plan)
+        log_event(
+            "warning",
+            "soft_adjust_exception",
+            error=str(exc),
+            prev_plan_path=prev_ctx.get("plan_path"),
+            plan_path=new_ctx.get("plan_path"),
+        )
         return False
 
 
@@ -240,9 +383,15 @@ def extract_exit_levels(plan: Dict) -> Tuple[Optional[float], Optional[float]]:
         ex = plan.get("exit", {}) or {}
         tp = _safe_float(ex.get("tp_price"), default=None)
         sl = _safe_float(ex.get("sl_price"), default=None)
-    except Exception:
+    except Exception as exc:
         tp = None
         sl = None
+        log_event(
+            "warning",
+            "extract_exit_levels_failed",
+            error=str(exc),
+            **_plan_context(plan),
+        )
 
     if tp is None or sl is None:
         try:
@@ -310,6 +459,11 @@ def load_plan_sequence(plan_path: str, plans_dir: Optional[str] = None) -> List[
         except Exception:
             continue
         if "range" not in plan or "grid" not in plan:
+            log_event(
+                "warning",
+                "plan_missing_range_or_grid",
+                plan_path=str(p),
+            )
             continue
         pt = plan_effective_time(plan)
         if pt is None:

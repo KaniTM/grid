@@ -31,6 +31,10 @@ from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
 from long_run_monitor import LongRunMonitor, MonitorConfig
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FREQTRADE_ROOT = REPO_ROOT / "freqtrade"
+DEFAULT_USER_DATA = FREQTRADE_ROOT / "user_data"
+
 
 @dataclass
 class WindowResult:
@@ -137,6 +141,78 @@ def parse_day_timerange(timerange: str) -> Tuple[datetime, datetime]:
 
 def fmt_day(dt: datetime) -> str:
     return dt.strftime("%Y%m%d")
+
+
+def _resolve_repo_path(value: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        return Path(text)
+    candidate = Path(text)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (REPO_ROOT / candidate).resolve()
+
+
+def emit_run_marker(label: str, **meta: object) -> None:
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "marker": label,
+    }
+    payload.update(meta)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _collect_resume_mismatches(
+    existing_args: Dict[str, object],
+    current_args: argparse.Namespace,
+) -> Tuple[List[Tuple[str, object, object]], List[Tuple[str, object, object]]]:
+    compare_keys = (
+        "window_days",
+        "step_days",
+        "min_window_days",
+        "pair",
+        "exchange",
+        "timeframe",
+        "strategy",
+        "strategy_path",
+        "data_dir",
+        "config_path",
+        "start_quote",
+        "start_base",
+        "carry_capital",
+        "fee_pct",
+        "max_orders_per_side",
+        "close_on_stop",
+        "reverse_fill",
+        "regime_threshold_profile",
+        "mode_thresholds_path",
+        "backtesting_extra",
+        "sim_extra",
+    )
+    core_resume_keys = {
+        "window_days",
+        "step_days",
+        "min_window_days",
+        "pair",
+        "exchange",
+        "timeframe",
+        "strategy",
+        "strategy_path",
+    }
+    trim_keys = {"mode_thresholds_path", "strategy_path", "config_path", "data_dir"}
+    mismatches: List[Tuple[str, object, object]] = []
+    for key in compare_keys:
+        cur = getattr(current_args, key, None)
+        prev = existing_args.get(key, None)
+        if key in trim_keys:
+            cur = str(cur or "").strip()
+            prev = str(prev or "").strip()
+        if cur != prev:
+            mismatches.append((key, cur, prev))
+
+    fatal_mismatches = [m for m in mismatches if m[0] in core_resume_keys]
+    optional_mismatches = [m for m in mismatches if m[0] not in core_resume_keys]
+    return fatal_mismatches, optional_mismatches
 
 
 def _safe_path_fragment(text: str) -> str:
@@ -827,10 +903,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--close-on-stop", action="store_true")
     ap.add_argument("--reverse-fill", action="store_true")
 
-    ap.add_argument("--config-path", default="/freqtrade/user_data/config.json")
+    ap.add_argument("--config-path", default=str(DEFAULT_USER_DATA / "config.json"))
     ap.add_argument("--strategy", default="GridBrainV1")
-    ap.add_argument("--strategy-path", default="/freqtrade/user_data/strategies")
-    ap.add_argument("--data-dir", default="/freqtrade/user_data/data/binance")
+    ap.add_argument("--strategy-path", default=str(DEFAULT_USER_DATA / "strategies"))
+    ap.add_argument("--data-dir", default=str(DEFAULT_USER_DATA / "data" / "binance"))
 
     ap.add_argument("--run-id", default=None, help="Output subdir under user_data/walkforward")
     ap.add_argument("--service", default="freqtrade", help="docker compose service")
@@ -905,8 +981,9 @@ def main() -> int:
             "Use --allow-overlap to override."
         )
 
-    root_dir = Path(__file__).resolve().parents[1]
-    user_data_dir = root_dir / "user_data"
+    freqtrade_root = Path(__file__).resolve().parents[1]
+    root_dir = freqtrade_root
+    user_data_dir = DEFAULT_USER_DATA
     if not user_data_dir.is_dir():
         raise FileNotFoundError(f"user_data directory not found: {user_data_dir}")
 
@@ -914,6 +991,15 @@ def main() -> int:
     windows = iter_windows(start, end, args.window_days, args.step_days, args.min_window_days)
     if not windows:
         raise ValueError("No windows produced. Adjust timerange/window-days/step-days.")
+    config_path = _resolve_repo_path(args.config_path)
+    strategy_path = _resolve_repo_path(args.strategy_path)
+    data_dir = _resolve_repo_path(args.data_dir)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file missing (--config-path): {config_path}")
+    if not strategy_path.is_dir():
+        raise FileNotFoundError(f"Strategy path missing or invalid (--strategy-path): {strategy_path}")
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Data directory missing (--data-dir): {data_dir}")
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("wf_%Y%m%dT%H%M%SZ")
     out_dir = user_data_dir / "walkforward" / run_id
@@ -961,6 +1047,14 @@ def main() -> int:
         run_state=run_state if args.enable_liveness else None,
     )
     monitor.start(message=f"timerange={args.timerange}", total_steps=len(windows))
+    emit_run_marker(
+        "RUN_START",
+        run_id=run_id,
+        timerange=str(args.timerange),
+        windows_total=len(windows),
+        user_data=str(user_data_dir),
+        runtime_plans_root_rel=str(plan_root_rel),
+    )
 
     existing_rows_by_index: Dict[int, WindowResult] = {}
     if args.resume and summary_path.exists():
@@ -986,36 +1080,25 @@ def main() -> int:
                     "Resume refused: timerange mismatch is not an extension from the same start.\n"
                     f"current={cur_timerange!r} previous={prev_timerange!r}"
                 )
-        compare_keys = (
-            "window_days",
-            "step_days",
-            "min_window_days",
-            "pair",
-            "exchange",
-            "timeframe",
-            "start_quote",
-            "start_base",
-            "carry_capital",
-            "fee_pct",
-            "max_orders_per_side",
-            "close_on_stop",
-            "reverse_fill",
-            "regime_threshold_profile",
-            "mode_thresholds_path",
-        )
-        mismatches: List[str] = []
-        for key in compare_keys:
-            cur = getattr(args, key, None)
-            prev = existing_args.get(key, None)
-            if key in ("mode_thresholds_path",):
-                cur = str(cur or "").strip()
-                prev = str(prev or "").strip()
-            if cur != prev:
-                mismatches.append(f"{key}: current={cur!r} previous={prev!r}")
-        if mismatches:
+        fatal_mismatches, optional_mismatches = _collect_resume_mismatches(existing_args, args)
+
+        def _format_mismatch(entry: Tuple[str, object, object]) -> str:
+            key, cur, prev = entry
+            return f"{key}: current={cur!r} previous={prev!r}"
+
+        if fatal_mismatches:
             raise RuntimeError(
                 "Resume refused: existing summary args mismatch current args.\n"
-                + "\n".join(mismatches)
+                + "\n".join(_format_mismatch(m) for m in fatal_mismatches)
+            )
+        if optional_mismatches:
+            warning_lines = ", ".join(
+                f"{m[0]}(current={m[1]!r} prev={m[2]!r})" for m in optional_mismatches
+            )
+            print(
+                "[walkforward] resume warning optional args changed: "
+                f"{warning_lines}",
+                flush=True,
             )
         if timerange_extended:
             print(
@@ -1191,13 +1274,13 @@ def main() -> int:
                 if src_plan_dir.exists():
                     shutil.rmtree(src_plan_dir)
                 backtesting_inner = (
-                    f"freqtrade backtesting "
-                    f"--config {q(args.config_path)} "
-                    f"--strategy {q(args.strategy)} "
-                    f"--strategy-path {q(args.strategy_path)} "
-                    f"--timerange {q(timerange)} "
-                    f"--timeframe {q(args.timeframe)} "
-                    f"--datadir {q(args.data_dir)} "
+                f"freqtrade backtesting "
+                f"--config {q(str(config_path))} "
+                f"--strategy {q(args.strategy)} "
+                f"--strategy-path {q(str(strategy_path))} "
+                f"--timerange {q(timerange)} "
+                f"--timeframe {q(args.timeframe)} "
+                f"--datadir {q(str(data_dir))} "
                     f"--cache none"
                 )
                 if args.backtesting_extra.strip():
@@ -1278,7 +1361,7 @@ def main() -> int:
                 f"python /freqtrade/user_data/scripts/grid_simulator_v1.py "
                 f"--pair {q(args.pair)} "
                 f"--timeframe {q(args.timeframe)} "
-                f"--data-dir {q(args.data_dir)} "
+                f"--data-dir {q(str(data_dir))} "
                 f"--plan {q(plan_window_latest_container)} "
                 f"--plans-dir {q(plan_window_dir_container)} "
                 f"--replay-plans "
@@ -1393,6 +1476,13 @@ def main() -> int:
                 window_index=int(idx),
                 timerange=timerange,
                 windows_completed=int(len(rows)),
+            )
+            emit_run_marker(
+                "RUN_ABORTED",
+                run_id=run_id,
+                timerange=timerange,
+                window_index=int(idx),
+                reason="keyboard_interrupt",
             )
             raise
         except Exception as exc:
@@ -1516,6 +1606,13 @@ def main() -> int:
                     timerange=timerange,
                     error=str(row.error or ""),
                 )
+            emit_run_marker(
+                "RUN_FAILED",
+                run_id=run_id,
+                reason="fail_on_window_error",
+                window_index=int(idx),
+                timerange=timerange,
+            )
             break
 
     agg = aggregate(rows)
@@ -1560,6 +1657,17 @@ def main() -> int:
             windows_ok=int(agg.get("windows_ok", 0)),
             windows_failed=int(agg.get("windows_failed", 0)),
         )
+    emit_run_marker(
+        "RUN_COMPLETE",
+        run_id=run_id,
+        status=final_status,
+        step_word=final_word,
+        windows_completed=int(len(rows)),
+        windows_ok=int(agg.get("windows_ok", 0)),
+        windows_failed=int(agg.get("windows_failed", 0)),
+        pct_complete=_format_pct(len(rows), len(windows)),
+        return_code=int(rc),
+    )
 
     if not args.dry_run:
         summary_out = out_dir / "summary.json"

@@ -3,11 +3,48 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
+DEFAULT_USER_DATA_DIR="${ROOT_DIR}/user_data"
+USER_DATA_DIR="${USER_DATA_DIR:-${DEFAULT_USER_DATA_DIR}}"
+
+resolve_repo_path() {
+    local candidate="${1:-}"
+    if [[ -z "${candidate}" ]]; then
+        echo ""
+        return
+    fi
+    if [[ "${candidate}" == /* ]]; then
+        echo "${candidate}"
+    else
+        echo "${ROOT_DIR}/${candidate}"
+    fi
+}
+
+resolve_user_data_path() {
+    local candidate="${1:-}"
+    if [[ -z "${candidate}" ]]; then
+        echo ""
+        return
+    fi
+    if [[ "${candidate}" == /* ]]; then
+        echo "${candidate}"
+        return
+    fi
+    echo "${USER_DATA_DIR}/${candidate}"
+}
+
+if [[ ! -d "${USER_DATA_DIR}" ]]; then
+    echo "[daily] user_data directory missing: ${USER_DATA_DIR}" >&2
+    exit 1
+fi
+if [[ ! -f "${USER_DATA_DIR}/config.json" ]]; then
+    echo "[daily] user_data config.json missing: ${USER_DATA_DIR}/config.json" >&2
+    exit 1
+fi
 
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/run-user-daily-workflow.sh [--profile light|research] [--cleanup conservative|full]
+  scripts/run-user-daily-workflow.sh [--profile light|research] [--cleanup conservative|full] [--user-data DIR]
 
 Profiles:
   light     Sync + export + cleanup. Run stage is skipped.
@@ -40,7 +77,7 @@ Research profile overrides:
   REGIME_STALLED_HEARTBEATS_MAX=10
   WF_TIMERANGE="20200101-20260214"
   WF_RUN_ID="wf_daily_eth_14d"
-  WF_MODE_THRESHOLDS_PATH="user_data/regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json"
+  WF_MODE_THRESHOLDS_PATH="regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json"
   WF_STALLED_HEARTBEATS_MAX=10
   WF_USE_SUPERVISOR=1
   WF_SUPERVISOR_MAX_ATTEMPTS=5
@@ -60,6 +97,10 @@ while (($# > 0)); do
             CLEANUP_MODE="${2:-}"
             shift 2
             ;;
+        --user-data)
+            USER_DATA_DIR="${2:-}"
+            shift 2
+            ;;
         --help|-h)
             usage
             exit 0
@@ -71,6 +112,28 @@ while (($# > 0)); do
             ;;
     esac
 done
+
+USER_DATA_DIR="$(resolve_repo_path "${USER_DATA_DIR}")"
+if [[ -z "${USER_DATA_DIR}" ]]; then
+    echo "[daily] --user-data cannot be empty" >&2
+    exit 1
+fi
+if [[ ! -d "${USER_DATA_DIR}" ]]; then
+    echo "[daily] user_data directory missing: ${USER_DATA_DIR}" >&2
+    exit 1
+fi
+if [[ ! -f "${USER_DATA_DIR}/config.json" ]]; then
+    echo "[daily] user_data config.json missing: ${USER_DATA_DIR}/config.json" >&2
+    exit 1
+fi
+if [[ ! -d "${USER_DATA_DIR}/strategies" ]]; then
+    echo "[daily] user_data strategies directory missing: ${USER_DATA_DIR}/strategies" >&2
+    exit 1
+fi
+if [[ ! -d "${USER_DATA_DIR}/data" ]]; then
+    echo "[daily] user_data data directory missing: ${USER_DATA_DIR}/data" >&2
+    exit 1
+fi
 
 if [[ "${PROFILE}" != "light" && "${PROFILE}" != "research" ]]; then
     echo "Invalid --profile: ${PROFILE}" >&2
@@ -147,7 +210,7 @@ WF_SKIP_BACKTESTING="${WF_SKIP_BACKTESTING:-0}"
 WF_FAIL_ON_WINDOW_ERROR="${WF_FAIL_ON_WINDOW_ERROR:-0}"
 WF_BACKTESTING_EXTRA="${WF_BACKTESTING_EXTRA:-}"
 WF_SIM_EXTRA="${WF_SIM_EXTRA:-}"
-WF_MODE_THRESHOLDS_PATH="${WF_MODE_THRESHOLDS_PATH:-user_data/regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json}"
+WF_MODE_THRESHOLDS_PATH="${WF_MODE_THRESHOLDS_PATH:-regime_audit/regime_calib_long_20200101_20251101_v1/mode_threshold_overrides.json}"
 WF_REGIME_THRESHOLD_PROFILE="${WF_REGIME_THRESHOLD_PROFILE:-}"
 WF_USE_SUPERVISOR="${WF_USE_SUPERVISOR:-1}"
 WF_SUPERVISOR_MAX_ATTEMPTS="${WF_SUPERVISOR_MAX_ATTEMPTS:-5}"
@@ -193,6 +256,7 @@ run_sync() {
 
     local cmd=(
         python3 scripts/run-user-data-sync.py
+        --user-data "${USER_DATA_DIR}"
         --pairs "${pairs_arr[@]}"
         --timeframes "${tfs_arr[@]}"
         --mode "${SYNC_MODE}"
@@ -220,7 +284,7 @@ run_sync() {
     fi
 
     if [[ "${SYNC_USE_SUPERVISOR}" == "1" ]]; then
-        local state_file="user_data/run_state/data_sync/${SYNC_RUN_ID}/state.json"
+        local state_file="$(resolve_user_data_path "run_state/data_sync/${SYNC_RUN_ID}/state.json")"
         local sup_cmd=(
             python3 scripts/run-user-state-supervisor.py
             --run-label "data-sync:${SYNC_RUN_ID}"
@@ -248,6 +312,7 @@ run_sync() {
 run_regime_audit() {
     local cmd=(
         python3 scripts/run-user-regime-audit.py
+        --user-data "${USER_DATA_DIR}"
         --pair "${REGIME_PAIR}"
         --timeframe "${REGIME_TIMEFRAME}"
         --timerange "${REGIME_TIMERANGE}"
@@ -262,7 +327,7 @@ run_regime_audit() {
         cmd+=(--emit-verbose)
     fi
     if [[ "${REGIME_USE_SUPERVISOR}" == "1" ]]; then
-        local state_file="user_data/regime_audit/${REGIME_RUN_ID}/_state/state.json"
+        local state_file="$(resolve_user_data_path "regime_audit/${REGIME_RUN_ID}/_state/state.json")"
         local sup_cmd=(
             python3 scripts/run-user-state-supervisor.py
             --run-label "regime-audit:${REGIME_RUN_ID}"
@@ -287,7 +352,7 @@ run_regime_audit() {
 
 find_latest_mode_overrides() {
     local latest=""
-    latest="$(ls -1t user_data/regime_audit/*/mode_threshold_overrides.json 2>/dev/null | head -n1 || true)"
+    latest="$(ls -1t "${USER_DATA_DIR}/regime_audit/"*/mode_threshold_overrides.json 2>/dev/null | head -n1 || true)"
     if [[ -n "${latest}" ]]; then
         printf '%s\n' "${latest}"
     fi
@@ -301,6 +366,7 @@ run_walkforward() {
 
     local cmd=(
         python3 scripts/run-user-walkforward.py
+        --user-data "${USER_DATA_DIR}"
         --timerange "${WF_TIMERANGE}"
         --window-days "${WF_WINDOW_DAYS}"
         --step-days "${WF_STEP_DAYS}"
@@ -350,13 +416,16 @@ run_walkforward() {
         cmd+=(--regime-threshold-profile "${WF_REGIME_THRESHOLD_PROFILE}")
     fi
     if [[ -n "${mode_thresholds}" ]]; then
-        cmd+=(--mode-thresholds-path "${mode_thresholds}")
+        mode_thresholds="$(resolve_user_data_path "${mode_thresholds}")"
+        if [[ -n "${mode_thresholds}" ]]; then
+            cmd+=(--mode-thresholds-path "${mode_thresholds}")
+        fi
     fi
     if [[ "${WF_USE_SUPERVISOR}" == "1" ]]; then
         local wf_args=("${cmd[@]:2}")
         local sup_cmd=(
             python3 scripts/run-user-walkforward-supervisor.py
-            --user-data user_data
+            --user-data "${USER_DATA_DIR}"
             --max-attempts "${WF_SUPERVISOR_MAX_ATTEMPTS}"
             --retry-delay-sec "${WF_SUPERVISOR_RETRY_DELAY_SEC}"
             --retry-backoff-mult "${WF_SUPERVISOR_RETRY_BACKOFF_MULT}"
@@ -376,7 +445,7 @@ run_walkforward() {
 run_export() {
     local cmd=(
         python3 scripts/export-portable-results.py
-        --user-data user_data
+        --user-data "${USER_DATA_DIR}"
         --latest-runs "${EXPORT_LATEST_RUNS}"
     )
     echo "[daily] export command: ${cmd[*]}"
@@ -406,7 +475,7 @@ append_pin_args() {
 run_cleanup() {
     local cmd=(
         python3 scripts/manage-user-artifacts.py
-        --user-data user_data
+        --user-data "${USER_DATA_DIR}"
         --apply
     )
     if [[ "${CLEANUP_MODE}" == "conservative" ]]; then

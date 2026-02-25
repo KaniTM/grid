@@ -1,7 +1,7 @@
-from GridBrainV1 import GridBrainV1
+from GridBrainV1 import GridBrainV1Core
 
 
-class GridBrainV1NoFVG(GridBrainV1):
+class GridBrainV1NoFVG(GridBrainV1Core):
     """GridBrain variant for controlled experiments with FVG gate disabled."""
 
     fvg_enabled = False

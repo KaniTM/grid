@@ -3,6 +3,8 @@ import json
 import os
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -11,6 +13,48 @@ try:
     import ccxt  # optional, only needed for --mode ccxt
 except Exception:
     ccxt = None
+
+SOURCE_PATH = Path(__file__).resolve()
+MODULE_NAME = "grid_executor_v1"
+
+
+def log_event(level: str, message: str, plan: Optional[Dict] = None, **meta: object) -> None:
+    payload: Dict[str, object] = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": str(level).upper(),
+        "module": MODULE_NAME,
+        "source_path": str(SOURCE_PATH),
+        "message": message,
+    }
+    if plan is not None:
+        payload["plan_context"] = _plan_context(plan)
+    payload.update(meta)
+    print(json.dumps(payload, sort_keys=True))
+
+
+def _log_plan_marker(
+    label: str, plan: Optional[Dict], level: str = "debug", **meta: object
+) -> None:
+    log_event(level, label, plan=plan, **meta)
+
+
+# -----------------------------
+# Plan helpers
+# -----------------------------
+def _plan_context(plan: Optional[Dict]) -> Dict[str, object]:
+    if not plan:
+        return {}
+    out: Dict[str, object] = {}
+    path = plan.get("_plan_path") or plan.get("plan_path") or plan.get("path")
+    if path:
+        out["plan_path"] = str(path)
+    if plan.get("ts"):
+        out["plan_ts"] = str(plan.get("ts"))
+    try:
+        out["plan_keys"] = sorted(plan.keys())
+    except Exception:
+        pass
+    return out
 
 
 # -----------------------------
@@ -81,14 +125,33 @@ def plan_signature(plan: Dict) -> Tuple:
     Signature used to detect material plan changes.
     IMPORTANT: do NOT include `action` (prevents churn).
     """
-    r = plan["range"]
-    g = plan["grid"]
-    return (
-        round(float(r["low"]), 12),
-        round(float(r["high"]), 12),
-        int(g["n_levels"]),
-        round(float(g["step_price"]), 12),
-    )
+    try:
+        r = plan["range"]
+        g = plan["grid"]
+        signature = (
+            round(float(r["low"]), 12),
+            round(float(r["high"]), 12),
+            int(g["n_levels"]),
+            round(float(g["step_price"]), 12),
+        )
+        _log_plan_marker(
+            "plan_signature",
+            plan,
+            level="debug",
+            range_low=float(r["low"]) if r.get("low") is not None else None,
+            range_high=float(r["high"]) if r.get("high") is not None else None,
+            n_levels=int(g["n_levels"]) if g.get("n_levels") is not None else None,
+            step_price=float(g["step_price"]) if g.get("step_price") is not None else None,
+        )
+        return signature
+    except Exception as exc:
+        log_event(
+            "error",
+            "plan_signature_failed",
+            error=str(exc),
+            **_plan_context(plan),
+        )
+        raise
 
 
 def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
@@ -105,7 +168,18 @@ def soft_adjust_ok(prev_plan: Dict, new_plan: Dict) -> bool:
         frac = float(new_plan.get("update_policy", {}).get("soft_adjust_max_step_frac", 0.5))
         tol = frac * step
         return abs(new_low - prev_low) <= tol and abs(new_high - prev_high) <= tol
-    except Exception:
+    except Exception as exc:
+        prev_ctx = _plan_context(prev_plan)
+        new_ctx = _plan_context(new_plan)
+        log_event(
+            "warning",
+            "soft_adjust_exception",
+            error=str(exc),
+            prev_plan_ts=prev_ctx.get("plan_ts"),
+            new_plan_ts=new_ctx.get("plan_ts"),
+            prev_plan_path=prev_ctx.get("plan_path"),
+            plan_path=new_ctx.get("plan_path"),
+        )
         return False
 
 
@@ -181,8 +255,23 @@ def _extract_rung_weights(plan: Dict, n_levels: int) -> Optional[List[float]]:
             return None
         if not any(v > 0 for v in vals):
             return None
-        return vals
-    except Exception:
+        normalized = [float(v) for v in vals]
+        _log_plan_marker(
+            "rung_weights",
+            plan,
+            level="debug",
+            n_levels=n_levels,
+            weights=normalized,
+        )
+        return normalized
+    except Exception as exc:
+        log_event(
+            "warning",
+            "extract_rung_weights_failed",
+            error=str(exc),
+            n_levels=n_levels,
+            **_plan_context(plan),
+        )
         return None
 
 

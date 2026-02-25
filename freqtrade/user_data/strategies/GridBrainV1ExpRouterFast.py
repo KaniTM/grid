@@ -1,7 +1,7 @@
-from GridBrainV1 import GridBrainV1
+from GridBrainV1 import GridBrainV1Core
 
 
-class GridBrainV1ExpRouterFast(GridBrainV1):
+class GridBrainV1ExpRouterFast(GridBrainV1Core):
     """
     Experiment variant:
     - Faster mode-switch persistence

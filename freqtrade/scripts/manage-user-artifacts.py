@@ -16,6 +16,7 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from latest_refs import collect_latest_run_pins
@@ -177,7 +178,7 @@ def _extract_end_balances(result_path: Path) -> Tuple[Optional[float], Optional[
 def hydrate_walkforward_summaries(
     user_data: Path,
     apply: bool,
-) -> Tuple[Dict[str, object], Set[str]]:
+) -> Tuple[Dict[str, object], Set[str], Dict[str, List[Dict[str, object]]]]:
     wf_dir = user_data / "walkforward"
     out = {
         "runs_checked": 0,
@@ -188,9 +189,10 @@ def hydrate_walkforward_summaries(
         "summaries_updated": 0,
     }
     blocked_runs: Set[str] = set()
+    blocked_window_details: Dict[str, List[Dict[str, object]]] = defaultdict(list)
 
     if not wf_dir.is_dir():
-        return out, blocked_runs
+        return out, blocked_runs, {}
 
     for summary_path in sorted(wf_dir.glob("*/summary.json")):
         run_dir = summary_path.parent
@@ -227,6 +229,15 @@ def hydrate_walkforward_summaries(
             else:
                 out["windows_still_missing"] = int(out["windows_still_missing"]) + 1
                 run_missing_after += 1
+                idx = int(row.get("index") or 0)
+                blocked_window_details[run_dir.name].append(
+                    {
+                        "index": idx,
+                        "timerange": str(row.get("timerange") or ""),
+                        "result_path": str(result_path),
+                        "size_bytes": path_size(result_path),
+                    }
+                )
 
         if run_missing_after > 0:
             blocked_runs.add(run_dir.name)
@@ -234,14 +245,22 @@ def hydrate_walkforward_summaries(
             summary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             out["summaries_updated"] = int(out["summaries_updated"]) + 1
 
-    return out, blocked_runs
+    return out, blocked_runs, dict(blocked_window_details)
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--user-data", default="user_data")
-    ap.add_argument("--apply", action="store_true", help="Delete selected artifacts. Default is dry-run.")
-    ap.add_argument("--json", action="store_true", help="Print machine-readable JSON summary.")
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete selected artifacts. Default is dry-run.",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
     ap.add_argument(
         "--list-limit",
         type=int,
@@ -252,11 +271,24 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--prune-pycache", action="store_true", default=True)
     ap.add_argument("--no-prune-pycache", action="store_false", dest="prune_pycache")
     ap.add_argument("--prune-backtest-results", action="store_true", default=True)
-    ap.add_argument("--no-prune-backtest-results", action="store_false", dest="prune_backtest_results")
+    ap.add_argument("--prune-backtest-results", action="store_true", default=True)
+    ap.add_argument(
+        "--no-prune-backtest-results",
+        action="store_false",
+        dest="prune_backtest_results",
+    )
     ap.add_argument("--prune-grid-plan-archives", action="store_true", default=True)
-    ap.add_argument("--no-prune-grid-plan-archives", action="store_false", dest="prune_grid_plan_archives")
+    ap.add_argument(
+        "--no-prune-grid-plan-archives",
+        action="store_false",
+        dest="prune_grid_plan_archives",
+    )
     ap.add_argument("--prune-walkforward-raw", action="store_true", default=True)
-    ap.add_argument("--no-prune-walkforward-raw", action="store_false", dest="prune_walkforward_raw")
+    ap.add_argument(
+        "--no-prune-walkforward-raw",
+        action="store_false",
+        dest="prune_walkforward_raw",
+    )
     ap.add_argument("--prune-regime-verbose", action="store_true", default=True)
     ap.add_argument("--no-prune-regime-verbose", action="store_false", dest="prune_regime_verbose")
     ap.add_argument("--prune-portable-nonlatest", action="store_true", default=False)
@@ -264,7 +296,10 @@ def parse_args() -> argparse.Namespace:
         "--hydrate-walkforward-balances",
         action="store_true",
         default=True,
-        help="Populate missing end_quote/end_base in walkforward summaries from per-window result json.",
+        help=(
+            "Populate missing end_quote/end_base in walkforward summaries from "
+            "per-window result json."
+        ),
     )
     ap.add_argument(
         "--no-hydrate-walkforward-balances",
@@ -340,9 +375,14 @@ def main() -> int:
     candidates: Dict[Path, Candidate] = {}
     hydration_info: Dict[str, object] = {}
     blocked_walkforward_runs: Set[str] = set()
+    blocked_window_details: Dict[str, List[Dict[str, object]]] = {}
 
     if args.hydrate_walkforward_balances:
-        hydration_info, blocked_walkforward_runs = hydrate_walkforward_summaries(
+        (
+            hydration_info,
+            blocked_walkforward_runs,
+            blocked_window_details,
+        ) = hydrate_walkforward_summaries(
             user_data=user_data,
             apply=bool(args.apply),
         )
@@ -435,7 +475,45 @@ def main() -> int:
         item["bytes"] += int(c.bytes_size)
 
     walkforward_runs = [d.name for d in _latest_run_dirs(user_data / "walkforward")]
-    walkforward_raw_prunable_runs = sorted([name for name in walkforward_runs if name not in blocked_walkforward_runs])
+    walkforward_raw_prunable_runs = sorted(
+        [name for name in walkforward_runs if name not in blocked_walkforward_runs]
+    )
+
+    blocked_window_details_summary: Dict[str, Dict[str, object]] = {}
+    if blocked_window_details:
+        blocked_window_details_summary = {}
+        for run, items in blocked_window_details.items():
+            total_bytes = sum(int(w.get("size_bytes") or 0) for w in items)
+            blocked_window_details_summary[run] = {
+                "count": len(items),
+                "size_bytes": int(total_bytes),
+                "windows": items,
+            }
+
+    blocked_run_stats: List[Dict[str, object]] = []
+    for run_id, windows in blocked_window_details.items():
+        total_run_bytes = sum(int(w.get("size_bytes") or 0) for w in windows)
+        blocked_run_stats.append(
+            {
+                "run_id": run_id,
+                "windows": len(windows),
+                "size_bytes": int(total_run_bytes),
+            }
+        )
+
+    blocked_candidates: List[Dict[str, object]] = []
+    for run_id, windows in blocked_window_details.items():
+        for window in windows:
+            blocked_candidates.append(
+                {
+                    "run_id": run_id,
+                    "index": int(window.get("index") or 0),
+                    "timerange": str(window.get("timerange") or ""),
+                    "result_path": str(window.get("result_path") or ""),
+                    "size_bytes": int(window.get("size_bytes") or 0),
+                    "reason": "missing_end_balances",
+                }
+            )
 
     summary = {
         "mode": "apply" if args.apply else "dry-run",
@@ -453,6 +531,9 @@ def main() -> int:
         },
         "walkforward_hydration": hydration_info,
         "walkforward_blocked_runs": sorted(blocked_walkforward_runs),
+        "walkforward_blocked_window_details": blocked_window_details_summary,
+        "walkforward_blocked_run_stats": blocked_run_stats,
+        "blocked_candidates": blocked_candidates,
         "walkforward_raw_prunable_runs": walkforward_raw_prunable_runs,
         "reasons": reason_totals,
         "largest_candidates": [
@@ -497,6 +578,67 @@ def main() -> int:
                 f"count={len(walkforward_raw_prunable_runs)}",
                 flush=True,
             )
+            if blocked_window_details:
+                for run_id, windows in sorted(blocked_window_details.items()):
+                    total_run_bytes = sum(int(w.get("size_bytes") or 0) for w in windows)
+                    sample = ", ".join(
+                        f"{w.get('index') or 'n/a'}:{w.get('timerange') or 'n/a'}"
+                        for w in windows[:3]
+                    )
+                    print(
+                        f"[cleanup] blocked windows run={run_id} count={len(windows)} "
+                        f"bytes={bytes_h(total_run_bytes)} sample={sample or 'n/a'}",
+                        flush=True,
+                    )
+                    for window in windows[:3]:
+                        result_path = window.get("result_path") or ""
+                        size = bytes_h(int(window.get("size_bytes") or 0))
+                        print(
+                            f"[cleanup]   window idx={int(window.get('index') or 0)} "
+                            f"timerange={window.get('timerange') or 'n/a'} "
+                            f"size={size} path={result_path}",
+                            flush=True,
+                        )
+            if blocked_run_stats:
+                total_run_bytes = sum(int(r.get("size_bytes") or 0) for r in blocked_run_stats)
+                print(
+                    f"[cleanup] blocked_run_stats count={len(blocked_run_stats)} "
+                    f"bytes={bytes_h(total_run_bytes)}",
+                    flush=True,
+                )
+                for run_stats in blocked_run_stats[:5]:
+                    print(
+                        f"[cleanup] - run={run_stats['run_id']} windows={run_stats['windows']} "
+                        f"size={bytes_h(int(run_stats.get('size_bytes') or 0))}",
+                        flush=True,
+                    )
+                if len(blocked_run_stats) > 5:
+                    remaining_runs = len(blocked_run_stats) - 5
+                    print(
+                        f"[cleanup] - ... {remaining_runs} more blocked runs",
+                        flush=True,
+                    )
+        if blocked_candidates:
+            total_blocked_bytes = sum(int(c.get("size_bytes") or 0) for c in blocked_candidates)
+            print(
+                f"[cleanup] blocked_candidates count={len(blocked_candidates)} "
+                f"bytes={bytes_h(total_blocked_bytes)}",
+                flush=True,
+            )
+            for c in blocked_candidates[:5]:
+                print(
+                    f"[cleanup] - run={c['run_id']} idx={c['index']} "
+                    f"timerange={c['timerange'] or 'n/a'} "
+                    f"size={bytes_h(int(c['size_bytes'] or 0))} "
+                    f"path={c['result_path']} reason={c.get('reason')}",
+                    flush=True,
+                )
+            if len(blocked_candidates) > 5:
+                remaining = len(blocked_candidates) - 5
+                print(
+                    f"[cleanup] - ... {remaining} more blocked candidates",
+                    flush=True,
+                )
         if bool(args.auto_pin_latest_refs):
             print(
                 "[cleanup] auto_pinned "

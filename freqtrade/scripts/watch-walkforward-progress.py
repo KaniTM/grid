@@ -17,12 +17,16 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_USER_DATA = REPO_ROOT / "freqtrade" / "user_data"
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--user-data",
-        default="/home/kani/grid-ml-system/freqtrade/user_data",
-        help="Path to user_data directory.",
+        default=str(DEFAULT_USER_DATA),
+        help="Path to user_data directory (relative paths resolved from repo root).",
     )
     ap.add_argument("--run-id", action="append", required=True, help="Walkforward run-id (repeatable).")
     ap.add_argument("--interval-sec", type=int, default=10, help="Poll interval in seconds.")
@@ -61,17 +65,24 @@ def _terminal(status: str) -> bool:
 
 def main() -> int:
     args = build_parser().parse_args()
-    user_data = Path(args.user_data).resolve()
+    user_data = Path(args.user_data)
+    if not user_data.is_absolute():
+        user_data = (REPO_ROOT / user_data).resolve()
     interval = max(1, int(args.interval_sec))
     run_ids = [str(r).strip() for r in args.run_id if str(r).strip()]
     if not run_ids:
         raise ValueError("Provide at least one --run-id.")
+    if not user_data.is_dir():
+        raise FileNotFoundError(f"user_data directory not found: {user_data}")
+    walkforward_root = user_data / "walkforward"
+    if not walkforward_root.is_dir():
+        raise FileNotFoundError(f"walkforward directory missing under user_data: {walkforward_root}")
 
     last: Dict[str, Tuple] = {}
     while True:
         all_terminal = True
         for run_id in run_ids:
-            state_path = user_data / "walkforward" / run_id / "_state" / "state.json"
+            state_path = walkforward_root / run_id / "_state" / "state.json"
             if not state_path.exists():
                 sig = ("missing", 0, 0, "", 0, "", "", "")
                 if last.get(run_id) != sig:

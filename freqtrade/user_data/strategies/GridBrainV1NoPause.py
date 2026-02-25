@@ -1,7 +1,7 @@
-from GridBrainV1 import GridBrainV1
+from GridBrainV1 import GridBrainV1Core
 
 
-class GridBrainV1NoPause(GridBrainV1):
+class GridBrainV1NoPause(GridBrainV1Core):
     """
     Router fallback variant:
     keep mode routing active, but disable pause state so the router
