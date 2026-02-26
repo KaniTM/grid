@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 from core.enums import BlockReason, MaterialityClass, WarningCode
 from freqtrade.user_data.scripts import grid_executor_v1, grid_simulator_v1
-from freqtrade.user_data.strategies.GridBrainV1 import GridBrainV1Core
+from freqtrade.user_data.strategies.GridBrainV1 import GridBrainV1Core, MetaDriftGuard
 
 
 def test_box_signature_is_repeatable() -> None:
@@ -497,3 +497,121 @@ def test_executor_fill_bar_index_tracks_plan_clock() -> None:
     assert executor._next_fill_bar_index(plan_a) == 1
     assert executor._next_fill_bar_index(plan_b) == 2
     assert executor._next_fill_bar_index({}) == 3
+
+
+def test_meta_drift_guard_detects_hard_shift() -> None:
+    guard = MetaDriftGuard(window=64, smoothing_alpha=0.4)
+
+    def observe(payload: dict[str, float]) -> dict:
+        return guard.observe(
+            "PAIR/DRIFT",
+            payload,
+            min_samples=8,
+            eps=1e-6,
+            z_soft=2.0,
+            z_hard=3.0,
+            cusum_k_sigma=0.1,
+            cusum_soft=2.0,
+            cusum_hard=4.0,
+            ph_delta_sigma=0.1,
+            ph_soft=2.0,
+            ph_hard=4.0,
+            soft_min_channels=1,
+            hard_min_channels=1,
+        )
+
+    baseline = {
+        "atr_pct_15m": 0.01,
+        "rvol_15m": 1.0,
+        "spread_pct": 0.001,
+        "box_pos_abs_delta": 0.02,
+    }
+    snap = {}
+    for _ in range(24):
+        snap = observe(baseline)
+    assert snap["severity"] == "none"
+    shock = {
+        "atr_pct_15m": 0.05,
+        "rvol_15m": 4.0,
+        "spread_pct": 0.008,
+        "box_pos_abs_delta": 0.40,
+    }
+    for _ in range(3):
+        snap = observe(shock)
+    assert snap["drift_detected"] is True
+    assert snap["severity"] == "hard"
+    assert len(snap["drift_channels"]) >= 1
+
+
+def test_meta_drift_state_maps_to_actions() -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.meta_drift_guard_enabled = True
+    strategy.meta_drift_guard_window = 64
+    strategy.meta_drift_guard_min_samples = 8
+    strategy.meta_drift_guard_smoothing_alpha = 0.4
+    strategy.meta_drift_guard_eps = 1e-6
+    strategy.meta_drift_guard_z_soft = 2.0
+    strategy.meta_drift_guard_z_hard = 3.0
+    strategy.meta_drift_guard_cusum_k_sigma = 0.1
+    strategy.meta_drift_guard_cusum_soft = 2.0
+    strategy.meta_drift_guard_cusum_hard = 4.0
+    strategy.meta_drift_guard_ph_delta_sigma = 0.1
+    strategy.meta_drift_guard_ph_soft = 2.0
+    strategy.meta_drift_guard_ph_hard = 4.0
+    strategy.meta_drift_guard_soft_min_channels = 1
+    strategy.meta_drift_guard_hard_min_channels = 1
+    strategy.meta_drift_guard_spread_proxy_scale = 0.1
+    strategy._meta_drift_guard = MetaDriftGuard(
+        strategy.meta_drift_guard_window,
+        strategy.meta_drift_guard_smoothing_alpha,
+    )
+    strategy._meta_drift_prev_box_pos_by_pair = {}
+
+    stable = pd.Series({"high": 101.0, "low": 100.0, "spread_pct": 0.001})
+    for _ in range(24):
+        state = strategy._meta_drift_state(
+            "PAIR/STATE",
+            last_row=stable,
+            close=100.5,
+            atr_pct_15m=0.01,
+            rvol_15m=1.0,
+            box_position=0.45,
+            running_active=False,
+        )
+    assert state["severity"] == "none"
+    shock = pd.Series({"high": 110.0, "low": 90.0, "spread_pct": 0.008})
+    state_idle = strategy._meta_drift_state(
+        "PAIR/STATE",
+        last_row=shock,
+        close=100.0,
+        atr_pct_15m=0.05,
+        rvol_15m=4.0,
+        box_position=0.95,
+        running_active=False,
+    )
+    assert state_idle["drift_detected"] is True
+    assert state_idle["recommended_action"] in {"COOLDOWN_EXTEND", "PAUSE_STARTS"}
+
+    strategy._meta_drift_guard.reset_pair("PAIR/RUNNING")
+    strategy._meta_drift_prev_box_pos_by_pair.pop("PAIR/RUNNING", None)
+    for _ in range(24):
+        strategy._meta_drift_state(
+            "PAIR/RUNNING",
+            last_row=stable,
+            close=100.5,
+            atr_pct_15m=0.01,
+            rvol_15m=1.0,
+            box_position=0.40,
+            running_active=True,
+        )
+    state_running = strategy._meta_drift_state(
+        "PAIR/RUNNING",
+        last_row=shock,
+        close=100.0,
+        atr_pct_15m=0.05,
+        rvol_15m=4.0,
+        box_position=0.99,
+        running_active=True,
+    )
+    assert state_running["drift_detected"] is True
+    assert state_running["recommended_action"] in {"HARD_STOP", "PAUSE_STARTS"}

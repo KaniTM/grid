@@ -446,6 +446,24 @@ Catch sudden or gradual distribution changes not fully captured by standard gate
 - `BLOCK_META_DRIFT_SOFT`
 - `STOP_META_DRIFT_HARD`
 
+### Status update (2026-02-26)
+- Implemented in `GridBrainV1` using a smoothed, per-channel detector with z-score + CUSUM/Page-Hinkley style accumulators and minimum-sample gating.
+- Active channels:
+  - `atr_pct_15m`
+  - `rvol_15m`
+  - `spread_pct` (direct if available, proxy fallback)
+  - `box_pos_abs_delta`
+  - optional placeholders: `orderbook_imbalance`, `depth_thinning_score`
+- Planner outputs now include:
+  - `drift_detected`
+  - `drift_channels`
+  - `severity`
+  - `recommended_action`
+- Integration now enforces:
+  - soft drift -> `BLOCK_META_DRIFT_SOFT` (blocks START/REBUILD)
+  - hard drift while running -> stop path with `STOP_META_DRIFT_HARD`
+  - hard drift while idle -> cooldown extension recommendation path
+
 ---
 
 # 11) Phase-2: Regime Filters and Build Gates (Detailed)
@@ -2159,6 +2177,7 @@ This is the intended path to a system that is not only feature-rich, but **stabl
 - # 11) Phase-2: Regime Filters and Build Gates (Detailed)
 - # 13) Phase-4: Grid Sizing, START Filters, Targets, Risk
 - 2026-02-26 sync: `13.7` no-repeat/LSI guard moved from metadata-only to enforced behavior across simulator + executor, with regression tests.
+- 2026-02-26 sync: `#10 Meta Drift Guard` implemented (soft pause + hard-stop integration, drift outputs logged).
 
 ## 2.1 Brain / Planner (`GridBrainV1`)
 
@@ -2341,8 +2360,6 @@ At each 15m decision tick:
 15. Log decision + plan diff + events
 
 ---
-
-## 26.2 TODO (ordered by priority)
 1. # 12) Phase-3: Box Builder (Range Definition & Validation)
 
 This is the core of the grid planner and must remain deterministic and explainable.
@@ -2639,7 +2656,10 @@ Planner should log **all blockers**, not just first blocker.
 - Executor now uses plan clock (`runtime_state.clock_ts`, fallback `candle_ts`) to derive deterministic bar-index progression for the same cooldown semantics.
 
 ---
-4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch)
+
+## 26.2 TODO (ordered by priority)
+
+4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch) [DONE 2026-02-26]
 
 ## 10.1 Purpose
 
@@ -2670,6 +2690,8 @@ Catch sudden or gradual distribution changes not fully captured by standard gate
 ## 10.6 Reason Codes
 - `BLOCK_META_DRIFT_SOFT`
 - `STOP_META_DRIFT_HARD`
+
+Status: implemented (see Section 10 status update above and plan output `meta_drift` block).
 
 ---
 5. ## Step 12 — Live Execution Hardening
@@ -2743,5 +2765,3 @@ The best gains from this point forward come from:
 - `data/data_quality_assessor.py`
 
 ---
-
-> Model/reasoning note: Tasks 4, 5, 6, and 7 demand stronger reasoning or specialized modeling. I’ll flag them in chat before starting so you can decide if a different model or additional context is needed.

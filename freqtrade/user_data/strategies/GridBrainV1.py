@@ -20,7 +20,7 @@ from freqtrade.configuration import Configuration as Config
 from freqtrade.strategy import IStrategy, informative
 import talib.abstract as ta
 from technical import qtpylib
-from core.enums import BlockReason, MaterialityClass, WarningCode
+from core.enums import BlockReason, MaterialityClass, StopReason, WarningCode
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
 REQUIRED_OHLC_COLUMNS = ("date", "open", "high", "low", "close", "volume")
@@ -199,6 +199,181 @@ class EmpiricalCostCalibrator:
         return out
 
 
+class MetaDriftGuard:
+    """Lightweight per-pair drift detector using smoothed z-score + CUSUM/Page-Hinkley style accumulators."""
+
+    def __init__(self, window: int, smoothing_alpha: float) -> None:
+        self._window = max(int(window), 8)
+        self._alpha = float(np.clip(smoothing_alpha, 0.01, 1.0))
+        self._state_by_pair: Dict[str, Dict[str, object]] = {}
+
+    def reset_pair(self, pair: str) -> None:
+        self._state_by_pair.pop(pair, None)
+
+    def _pair_state(self, pair: str) -> Dict[str, object]:
+        state = self._state_by_pair.get(pair)
+        if state is None:
+            state = {
+                "bars_seen": 0,
+                "channels": {},
+            }
+            self._state_by_pair[pair] = state
+        return state
+
+    def observe(
+        self,
+        pair: str,
+        channels: Dict[str, Optional[float]],
+        *,
+        min_samples: int,
+        eps: float,
+        z_soft: float,
+        z_hard: float,
+        cusum_k_sigma: float,
+        cusum_soft: float,
+        cusum_hard: float,
+        ph_delta_sigma: float,
+        ph_soft: float,
+        ph_hard: float,
+        soft_min_channels: int,
+        hard_min_channels: int,
+    ) -> Dict[str, object]:
+        pair_state = self._pair_state(pair)
+        pair_state["bars_seen"] = int(pair_state.get("bars_seen", 0) + 1)
+        channels_state = pair_state.setdefault("channels", {})
+
+        channel_details: Dict[str, Dict[str, object]] = {}
+        ready_channels: List[str] = []
+        soft_channels: List[str] = []
+        hard_channels: List[str] = []
+
+        for name, raw in channels.items():
+            value = GridBrainV1Core._safe_float(raw)
+            state = channels_state.get(name)
+            if not isinstance(state, dict):
+                state = {
+                    "ema": None,
+                    "history": deque(maxlen=self._window),
+                    "cusum_pos": 0.0,
+                    "cusum_neg": 0.0,
+                    "ph_pos": 0.0,
+                    "ph_neg": 0.0,
+                }
+                channels_state[name] = state
+
+            if value is None or not np.isfinite(value):
+                channel_details[name] = {
+                    "available": False,
+                    "value": None,
+                    "smoothed": None,
+                    "baseline_mean": None,
+                    "baseline_std": None,
+                    "z_score": None,
+                    "cusum_score": None,
+                    "page_hinkley_score": None,
+                    "soft": False,
+                    "hard": False,
+                }
+                continue
+
+            prev_ema = GridBrainV1Core._safe_float(state.get("ema"))
+            ema = float(value) if prev_ema is None else float((self._alpha * value) + ((1.0 - self._alpha) * prev_ema))
+            history = state.get("history")
+            if not isinstance(history, deque) or history.maxlen != self._window:
+                history = deque(history if isinstance(history, (list, tuple, deque)) else [], maxlen=self._window)
+                state["history"] = history
+
+            baseline_ready = len(history) >= max(int(min_samples), 1)
+            baseline_mean = None
+            baseline_std = None
+            z_score = None
+            cusum_score = None
+            page_hinkley_score = None
+            soft_hit = False
+            hard_hit = False
+
+            if baseline_ready:
+                hist_arr = np.asarray(list(history), dtype=float)
+                if hist_arr.size > 0:
+                    baseline_mean = float(np.mean(hist_arr))
+                    baseline_std = float(max(np.std(hist_arr, ddof=1), max(float(eps), 1e-12)))
+                    delta = float(ema - baseline_mean)
+                    z_score = float(abs(delta) / baseline_std)
+
+                    cusum_pos = float(max(float(state.get("cusum_pos", 0.0)) + delta - (float(cusum_k_sigma) * baseline_std), 0.0))
+                    cusum_neg = float(max(float(state.get("cusum_neg", 0.0)) - delta - (float(cusum_k_sigma) * baseline_std), 0.0))
+                    state["cusum_pos"] = cusum_pos
+                    state["cusum_neg"] = cusum_neg
+                    cusum_score = float(max(cusum_pos, cusum_neg) / baseline_std)
+
+                    ph_pos = float(max(float(state.get("ph_pos", 0.0)) + delta - (float(ph_delta_sigma) * baseline_std), 0.0))
+                    ph_neg = float(max(float(state.get("ph_neg", 0.0)) - delta - (float(ph_delta_sigma) * baseline_std), 0.0))
+                    state["ph_pos"] = ph_pos
+                    state["ph_neg"] = ph_neg
+                    page_hinkley_score = float(max(ph_pos, ph_neg) / baseline_std)
+
+                    soft_hit = bool(
+                        z_score >= float(z_soft)
+                        or cusum_score >= float(cusum_soft)
+                        or page_hinkley_score >= float(ph_soft)
+                    )
+                    hard_hit = bool(
+                        z_score >= float(z_hard)
+                        or cusum_score >= float(cusum_hard)
+                        or page_hinkley_score >= float(ph_hard)
+                    )
+                    ready_channels.append(str(name))
+            else:
+                state["cusum_pos"] = 0.0
+                state["cusum_neg"] = 0.0
+                state["ph_pos"] = 0.0
+                state["ph_neg"] = 0.0
+
+            state["ema"] = float(ema)
+            history.append(float(ema))
+
+            if soft_hit:
+                soft_channels.append(str(name))
+            if hard_hit:
+                hard_channels.append(str(name))
+
+            channel_details[name] = {
+                "available": True,
+                "value": float(value),
+                "smoothed": float(ema),
+                "baseline_mean": baseline_mean,
+                "baseline_std": baseline_std,
+                "z_score": z_score,
+                "cusum_score": cusum_score,
+                "page_hinkley_score": page_hinkley_score,
+                "soft": bool(soft_hit),
+                "hard": bool(hard_hit),
+            }
+
+        soft_unique = list(dict.fromkeys(soft_channels))
+        hard_unique = list(dict.fromkeys(hard_channels))
+        severity = "none"
+        if len(hard_unique) >= max(int(hard_min_channels), 1):
+            severity = "hard"
+        elif len(soft_unique) >= max(int(soft_min_channels), 1):
+            severity = "soft"
+        drift_channels = hard_unique if severity == "hard" else soft_unique if severity == "soft" else []
+
+        return {
+            "bars_seen": int(pair_state.get("bars_seen", 0)),
+            "min_samples": int(max(int(min_samples), 1)),
+            "ready_channels": ready_channels,
+            "channels": channel_details,
+            "soft_channels": soft_unique,
+            "hard_channels": hard_unique,
+            "soft_count": int(len(soft_unique)),
+            "hard_count": int(len(hard_unique)),
+            "severity": str(severity),
+            "drift_detected": bool(severity in {"soft", "hard"}),
+            "drift_channels": drift_channels,
+        }
+
+
 @dataclass(frozen=True)
 class GridBrainRuntimeSnapshot:
     timestamp: int
@@ -287,11 +462,16 @@ class GridBrainV1Core(IStrategy):
             self, self._lookback_summary
         )
         self._empirical_cost_calibrator = EmpiricalCostCalibrator(self.empirical_cost_window)
+        self._meta_drift_guard = MetaDriftGuard(
+            self.meta_drift_guard_window,
+            self.meta_drift_guard_smoothing_alpha,
+        )
 
     INTERFACE_VERSION = 3
     STOP_REASON_TREND_ADX = "STOP_TREND_ADX"
     STOP_REASON_VOL_EXPANSION = "STOP_VOL_EXPANSION"
     STOP_REASON_BOX_BREAK = "STOP_BOX_BREAK"
+    STOP_REASON_META_DRIFT_HARD = str(StopReason.STOP_META_DRIFT_HARD)
 
     # ===== MTF PLAN ALIGNMENT =====
     # 15m: box + execution triggers
@@ -562,6 +742,23 @@ class GridBrainV1Core(IStrategy):
     planner_health_quarantine_on_misalign = True
     meta_drift_soft_block_enabled = True
     meta_drift_soft_block_steps = 0.75
+    meta_drift_guard_enabled = True
+    meta_drift_guard_window = 256
+    meta_drift_guard_min_samples = 24
+    meta_drift_guard_smoothing_alpha = 0.20
+    meta_drift_guard_eps = 1e-6
+    meta_drift_guard_z_soft = 2.5
+    meta_drift_guard_z_hard = 4.0
+    meta_drift_guard_cusum_k_sigma = 0.25
+    meta_drift_guard_cusum_soft = 4.0
+    meta_drift_guard_cusum_hard = 7.0
+    meta_drift_guard_ph_delta_sigma = 0.10
+    meta_drift_guard_ph_soft = 4.0
+    meta_drift_guard_ph_hard = 7.0
+    meta_drift_guard_soft_min_channels = 1
+    meta_drift_guard_hard_min_channels = 2
+    meta_drift_guard_cooldown_extend_minutes = 120
+    meta_drift_guard_spread_proxy_scale = 0.10
     breakout_idle_reclaim_on_fresh = True
     hvp_quiet_exit_bias_enabled = False
     hvp_quiet_exit_step_multiple = 0.5
@@ -743,6 +940,7 @@ class GridBrainV1Core(IStrategy):
     _box_quality_by_pair: Dict[str, Dict[str, object]] = {}
     _mid_history_by_pair: Dict[str, deque] = {}
     _hvp_cooloff_by_pair: Dict[str, bool] = {}
+    _meta_drift_prev_box_pos_by_pair: Dict[str, float] = {}
     _external_mode_thresholds_path_cache: Optional[str] = None
     _external_mode_thresholds_mtime_cache: float = -1.0
     _external_mode_thresholds_cache: Dict[str, Dict[str, float]] = {}
@@ -2175,9 +2373,12 @@ class GridBrainV1Core(IStrategy):
             self._plan_guard_decision_count_by_pair,
             self._breakout_bars_since_by_pair,
             self._breakout_levels_by_pair,
+            self._meta_drift_prev_box_pos_by_pair,
         ]
         for store in stores:
             store.pop(pair, None)
+        if hasattr(self, "_meta_drift_guard") and self._meta_drift_guard is not None:
+            self._meta_drift_guard.reset_pair(pair)
 
     @staticmethod
     def _ts_to_iso(ts: Optional[int]) -> Optional[str]:
@@ -3654,6 +3855,131 @@ class GridBrainV1Core(IStrategy):
             "recommended_floor_pct": recommended_floor_pct,
         }
 
+    def _meta_drift_channels(
+        self,
+        pair: str,
+        last_row: pd.Series,
+        close: float,
+        atr_pct_15m: Optional[float],
+        rvol_15m: Optional[float],
+        box_position: float,
+    ) -> Dict[str, Optional[float]]:
+        prev_box_pos = self._safe_float(self._meta_drift_prev_box_pos_by_pair.get(pair))
+        box_pos_abs_delta = (
+            float(abs(float(box_position) - float(prev_box_pos)))
+            if prev_box_pos is not None
+            else None
+        )
+        self._meta_drift_prev_box_pos_by_pair[pair] = float(box_position)
+
+        spread_pct = self._safe_float(last_row.get("spread_pct"))
+        if spread_pct is None and close > 0:
+            hi = self._safe_float(last_row.get("high"))
+            lo = self._safe_float(last_row.get("low"))
+            if hi is not None and lo is not None and hi >= lo:
+                spread_pct = float(
+                    ((hi - lo) / close) * float(max(self.meta_drift_guard_spread_proxy_scale, 0.0))
+                )
+
+        return {
+            "atr_pct_15m": self._safe_float(atr_pct_15m),
+            "rvol_15m": self._safe_float(rvol_15m),
+            "spread_pct": spread_pct,
+            "box_pos_abs_delta": box_pos_abs_delta,
+            "orderbook_imbalance": self._safe_float(last_row.get("orderbook_imbalance")),
+            "depth_thinning_score": self._safe_float(last_row.get("depth_thinning_score")),
+        }
+
+    def _meta_drift_state(
+        self,
+        pair: str,
+        *,
+        last_row: pd.Series,
+        close: float,
+        atr_pct_15m: Optional[float],
+        rvol_15m: Optional[float],
+        box_position: float,
+        running_active: bool,
+    ) -> Dict[str, object]:
+        channels = self._meta_drift_channels(
+            pair,
+            last_row,
+            close,
+            atr_pct_15m,
+            rvol_15m,
+            box_position,
+        )
+        out: Dict[str, object] = {
+            "enabled": bool(self.meta_drift_guard_enabled),
+            "drift_detected": False,
+            "drift_channels": [],
+            "severity": "none",
+            "recommended_action": "NONE",
+            "soft_block": False,
+            "hard_stop": False,
+            "channels": {},
+            "soft_channels": [],
+            "hard_channels": [],
+            "channels_input": channels,
+            "bars_seen": 0,
+            "ready_channels": [],
+            "min_samples": int(max(int(self.meta_drift_guard_min_samples), 1)),
+        }
+        if not self.meta_drift_guard_enabled:
+            return out
+
+        if (
+            (not hasattr(self, "_meta_drift_guard"))
+            or self._meta_drift_guard is None
+            or int(getattr(self._meta_drift_guard, "_window", 0)) != max(int(self.meta_drift_guard_window), 8)
+            or abs(float(getattr(self._meta_drift_guard, "_alpha", 0.0)) - float(np.clip(self.meta_drift_guard_smoothing_alpha, 0.01, 1.0))) > 1e-12
+        ):
+            self._meta_drift_guard = MetaDriftGuard(
+                self.meta_drift_guard_window,
+                self.meta_drift_guard_smoothing_alpha,
+            )
+
+        snapshot = self._meta_drift_guard.observe(
+            pair,
+            channels,
+            min_samples=int(max(int(self.meta_drift_guard_min_samples), 1)),
+            eps=float(max(float(self.meta_drift_guard_eps), 1e-12)),
+            z_soft=float(max(float(self.meta_drift_guard_z_soft), 0.0)),
+            z_hard=float(max(float(self.meta_drift_guard_z_hard), 0.0)),
+            cusum_k_sigma=float(max(float(self.meta_drift_guard_cusum_k_sigma), 0.0)),
+            cusum_soft=float(max(float(self.meta_drift_guard_cusum_soft), 0.0)),
+            cusum_hard=float(max(float(self.meta_drift_guard_cusum_hard), 0.0)),
+            ph_delta_sigma=float(max(float(self.meta_drift_guard_ph_delta_sigma), 0.0)),
+            ph_soft=float(max(float(self.meta_drift_guard_ph_soft), 0.0)),
+            ph_hard=float(max(float(self.meta_drift_guard_ph_hard), 0.0)),
+            soft_min_channels=int(max(int(self.meta_drift_guard_soft_min_channels), 1)),
+            hard_min_channels=int(max(int(self.meta_drift_guard_hard_min_channels), 1)),
+        )
+        severity = str(snapshot.get("severity", "none"))
+        recommended_action = "NONE"
+        if severity == "hard":
+            recommended_action = "HARD_STOP" if bool(running_active) else "COOLDOWN_EXTEND"
+        elif severity == "soft":
+            recommended_action = "PAUSE_STARTS"
+
+        out.update(
+            {
+                "drift_detected": bool(snapshot.get("drift_detected", False)),
+                "drift_channels": [str(x) for x in snapshot.get("drift_channels", [])],
+                "severity": severity,
+                "recommended_action": str(recommended_action),
+                "soft_block": bool(severity in {"soft", "hard"}),
+                "hard_stop": bool(severity == "hard" and running_active),
+                "channels": snapshot.get("channels", {}),
+                "soft_channels": [str(x) for x in snapshot.get("soft_channels", [])],
+                "hard_channels": [str(x) for x in snapshot.get("hard_channels", [])],
+                "bars_seen": int(snapshot.get("bars_seen", 0)),
+                "ready_channels": [str(x) for x in snapshot.get("ready_channels", [])],
+                "min_samples": int(snapshot.get("min_samples", out["min_samples"])),
+            }
+        )
+        return out
+
     def _effective_cost_floor(
         self,
         pair: str,
@@ -4780,7 +5106,7 @@ class GridBrainV1Core(IStrategy):
         mrvd_gate_ok = bool(
             (not self.mrvd_enabled) or ((mrvd_overlap_ok or mrvd_near_any_poc) and not mrvd_pause_entries)
         )
-        meta_drift_soft_block = bool(
+        meta_drift_soft_block_mrvd = bool(
             self.meta_drift_soft_block_enabled
             and mrvd_drift_delta_steps is not None
             and mrvd_drift_delta_steps >= float(self.meta_drift_soft_block_steps)
@@ -5027,6 +5353,20 @@ class GridBrainV1Core(IStrategy):
         box_position = 0.5
         if box_span > 0:
             box_position = float(np.clip((close - lo_p) / box_span, 0.0, 1.0))
+        meta_drift_state = self._meta_drift_state(
+            pair,
+            last_row=last,
+            close=close,
+            atr_pct_15m=atr_pct_15m,
+            rvol_15m=rvol_15m,
+            box_position=box_position,
+            running_active=running_active_hint,
+        )
+        meta_drift_soft_block = bool(
+            meta_drift_soft_block_mrvd or bool(meta_drift_state.get("soft_block", False))
+        )
+        meta_drift_hard_stop = bool(meta_drift_state.get("hard_stop", False))
+        meta_drift_recommended_action = str(meta_drift_state.get("recommended_action", "NONE"))
         start_box_position_ok = bool(
             (not self.start_box_position_guard_enabled)
             or (
@@ -5259,6 +5599,7 @@ class GridBrainV1Core(IStrategy):
             "mode_handoff_required_stop": bool(mode_handoff_required_stop),
             "router_pause_stop": bool(router_pause_stop),
             "fresh_breakout_idle_reclaim_stop": bool(fresh_breakout_idle_reclaim_stop),
+            "meta_drift_hard_stop": bool(meta_drift_hard_stop),
             "range_shift_stop": bool(shift_stop),
         }
         stop_reason_enum_active: List[str] = []
@@ -5268,6 +5609,8 @@ class GridBrainV1Core(IStrategy):
             stop_reason_enum_active.append(self.STOP_REASON_VOL_EXPANSION)
         if neutral_box_break_stop:
             stop_reason_enum_active.append(self.STOP_REASON_BOX_BREAK)
+        if meta_drift_hard_stop:
+            stop_reason_enum_active.append(self.STOP_REASON_META_DRIFT_HARD)
         stop_reason_primary = str(stop_reason_enum_active[0]) if stop_reason_enum_active else None
 
         hard_stop = bool(
@@ -5283,6 +5626,7 @@ class GridBrainV1Core(IStrategy):
             or mode_handoff_required_stop
             or router_pause_stop
             or fresh_breakout_idle_reclaim_stop
+            or meta_drift_hard_stop
         )
         raw_stop_rule = bool(two_up or two_dn or hard_stop or shift_stop)
 
@@ -5470,6 +5814,20 @@ class GridBrainV1Core(IStrategy):
         cooldown_until_ts = int(self._cooldown_until_ts_by_pair.get(pair, 0) or 0)
         reclaim_active = bool(reclaim_until_ts and int(clock_ts) < reclaim_until_ts)
         cooldown_active = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
+        meta_drift_cooldown_extended = False
+        meta_drift_cooldown_extend_secs = int(
+            max(float(self.meta_drift_guard_cooldown_extend_minutes), 0.0) * 60.0
+        )
+        if (
+            meta_drift_recommended_action == "COOLDOWN_EXTEND"
+            and meta_drift_cooldown_extend_secs > 0
+        ):
+            target_cooldown_ts = int(clock_ts) + int(meta_drift_cooldown_extend_secs)
+            if target_cooldown_ts > cooldown_until_ts:
+                cooldown_until_ts = int(target_cooldown_ts)
+                self._cooldown_until_ts_by_pair[pair] = int(cooldown_until_ts)
+                meta_drift_cooldown_extended = True
+            cooldown_active = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
 
         stop_rule = bool(raw_stop_rule)
         min_runtime_blocked_stop = False
@@ -6062,6 +6420,15 @@ class GridBrainV1Core(IStrategy):
                 "start_stability_ok": bool(start_stability_ok),
                 "core_gates_ok": bool(core_gates_ok),
                 "meta_drift_soft_block": bool(meta_drift_soft_block),
+                "meta_drift_soft_block_mrvd": bool(meta_drift_soft_block_mrvd),
+                "meta_drift_detected": bool(meta_drift_state.get("drift_detected", False)),
+                "meta_drift_severity": str(meta_drift_state.get("severity", "none")),
+                "meta_drift_recommended_action": str(meta_drift_recommended_action),
+                "meta_drift_channels": [str(x) for x in meta_drift_state.get("drift_channels", [])],
+                "meta_drift_soft_channels": [str(x) for x in meta_drift_state.get("soft_channels", [])],
+                "meta_drift_hard_channels": [str(x) for x in meta_drift_state.get("hard_channels", [])],
+                "meta_drift_hard_stop": bool(meta_drift_hard_stop),
+                "meta_drift_cooldown_extended": bool(meta_drift_cooldown_extended),
                 "rsi_15m": rsi,
                 "vwap_15m": vwap,
                 "rule_range_ok": bool(rule_range_ok),
@@ -6107,6 +6474,7 @@ class GridBrainV1Core(IStrategy):
                     "neutral_box_break_stop": bool(stop_reason_flags_raw["neutral_box_break_stop"]),
                     "mode_handoff_required_stop": bool(stop_reason_flags_raw["mode_handoff_required_stop"]),
                     "router_pause_stop": bool(stop_reason_flags_raw["router_pause_stop"]),
+                    "meta_drift_hard_stop": bool(stop_reason_flags_raw["meta_drift_hard_stop"]),
                     "fresh_breakout_idle_reclaim_stop": bool(
                         stop_reason_flags_raw["fresh_breakout_idle_reclaim_stop"]
                     ),
@@ -6196,6 +6564,26 @@ class GridBrainV1Core(IStrategy):
                     "planner_health_quarantine_on_misalign": bool(self.planner_health_quarantine_on_misalign),
                     "meta_drift_soft_block_enabled": bool(self.meta_drift_soft_block_enabled),
                     "meta_drift_soft_block_steps": float(self.meta_drift_soft_block_steps),
+                    "meta_drift_guard_enabled": bool(self.meta_drift_guard_enabled),
+                    "meta_drift_guard_window": int(self.meta_drift_guard_window),
+                    "meta_drift_guard_min_samples": int(self.meta_drift_guard_min_samples),
+                    "meta_drift_guard_smoothing_alpha": float(self.meta_drift_guard_smoothing_alpha),
+                    "meta_drift_guard_z_soft": float(self.meta_drift_guard_z_soft),
+                    "meta_drift_guard_z_hard": float(self.meta_drift_guard_z_hard),
+                    "meta_drift_guard_cusum_k_sigma": float(self.meta_drift_guard_cusum_k_sigma),
+                    "meta_drift_guard_cusum_soft": float(self.meta_drift_guard_cusum_soft),
+                    "meta_drift_guard_cusum_hard": float(self.meta_drift_guard_cusum_hard),
+                    "meta_drift_guard_ph_delta_sigma": float(self.meta_drift_guard_ph_delta_sigma),
+                    "meta_drift_guard_ph_soft": float(self.meta_drift_guard_ph_soft),
+                    "meta_drift_guard_ph_hard": float(self.meta_drift_guard_ph_hard),
+                    "meta_drift_guard_soft_min_channels": int(self.meta_drift_guard_soft_min_channels),
+                    "meta_drift_guard_hard_min_channels": int(self.meta_drift_guard_hard_min_channels),
+                    "meta_drift_guard_cooldown_extend_minutes": float(
+                        self.meta_drift_guard_cooldown_extend_minutes
+                    ),
+                    "meta_drift_guard_spread_proxy_scale": float(
+                        self.meta_drift_guard_spread_proxy_scale
+                    ),
                     "start_stability_min_score": float(self.start_stability_min_score),
                     "start_stability_k_fraction": float(self.start_stability_k_fraction),
                     "start_box_position_guard_enabled": bool(self.start_box_position_guard_enabled),
@@ -6348,6 +6736,12 @@ class GridBrainV1Core(IStrategy):
                 "start_stability_ok": bool(start_stability_ok),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
                 "start_filters": dict(start_filter_states),
+                "meta_drift_detected": bool(meta_drift_state.get("drift_detected", False)),
+                "meta_drift_severity": str(meta_drift_state.get("severity", "none")),
+                "meta_drift_recommended_action": str(meta_drift_recommended_action),
+                "meta_drift_channels": [str(x) for x in meta_drift_state.get("drift_channels", [])],
+                "meta_drift_hard_stop": bool(meta_drift_hard_stop),
+                "meta_drift_cooldown_extended": bool(meta_drift_cooldown_extended),
                 "warning_codes": warning_codes,
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
                 "stop_reason_flags_applied_active": [str(x) for x in stop_reason_flags_applied_active],
@@ -6376,6 +6770,12 @@ class GridBrainV1Core(IStrategy):
                 "start_blocked": bool(start_blocked),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
                 "start_filters": dict(start_filter_states),
+                "meta_drift_detected": bool(meta_drift_state.get("drift_detected", False)),
+                "meta_drift_severity": str(meta_drift_state.get("severity", "none")),
+                "meta_drift_recommended_action": str(meta_drift_recommended_action),
+                "meta_drift_channels": [str(x) for x in meta_drift_state.get("drift_channels", [])],
+                "meta_drift_hard_stop": bool(meta_drift_hard_stop),
+                "meta_drift_cooldown_extended": bool(meta_drift_cooldown_extended),
                 "warning_codes": warning_codes,
                 "stop_rule_triggered": bool(stop_rule),
                 "stop_rule_triggered_raw": bool(raw_stop_rule),
@@ -6386,6 +6786,24 @@ class GridBrainV1Core(IStrategy):
                 "router_desired_mode": router_state.get("desired_mode"),
                 "router_desired_reason": router_state.get("desired_reason"),
                 "router_switched": bool(router_state.get("switched", False)),
+            },
+            "meta_drift": {
+                "enabled": bool(meta_drift_state.get("enabled", False)),
+                "drift_detected": bool(meta_drift_state.get("drift_detected", False)),
+                "severity": str(meta_drift_state.get("severity", "none")),
+                "recommended_action": str(meta_drift_recommended_action),
+                "drift_channels": [str(x) for x in meta_drift_state.get("drift_channels", [])],
+                "soft_channels": [str(x) for x in meta_drift_state.get("soft_channels", [])],
+                "hard_channels": [str(x) for x in meta_drift_state.get("hard_channels", [])],
+                "soft_block": bool(meta_drift_state.get("soft_block", False)),
+                "hard_stop": bool(meta_drift_hard_stop),
+                "cooldown_extended": bool(meta_drift_cooldown_extended),
+                "cooldown_extend_minutes": float(self.meta_drift_guard_cooldown_extend_minutes),
+                "bars_seen": int(meta_drift_state.get("bars_seen", 0)),
+                "ready_channels": [str(x) for x in meta_drift_state.get("ready_channels", [])],
+                "min_samples": int(meta_drift_state.get("min_samples", 0)),
+                "channels_input": meta_drift_state.get("channels_input", {}),
+                "channels": meta_drift_state.get("channels", {}),
             },
             "capital_policy": {
                 "mode": "QUOTE_ONLY",
