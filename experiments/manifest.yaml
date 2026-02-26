@@ -1,7 +1,7 @@
 {
   "version": 1,
   "defaults": {
-    "baseline_run_id": "",
+    "baseline_run_id": "wf_exp_router_fast_20200101_20260213_v2_strict",
     "oos_gates": {
       "min_oos_windows_ok": 8,
       "max_failed_windows": 0,
@@ -39,27 +39,27 @@
   },
   "experiments": [
     {
-      "id": "candidate_placeholder",
-      "enabled": false,
+      "id": "router_fast_v3_promotion_candidate",
+      "enabled": true,
       "slot": "GridBrainV1|ETH/USDT|15m",
       "walkforward": {
-        "run_id": "wf_candidate_placeholder"
+        "run_id": "wf_exp_router_fast_20200101_20260213_v3_strictfix2"
       },
       "baseline": {
-        "run_id": "wf_baseline_placeholder"
+        "run_id": "wf_exp_router_fast_20200101_20260213_v2_strict"
       },
       "ablations": [
         {
-          "id": "ablation_no_meta_drift",
-          "run_id": "wf_candidate_placeholder_no_meta_drift",
+          "id": "router_fast_v2_strict_ablation",
+          "run_id": "wf_exp_router_fast_20200101_20260213_v2_strict",
           "required": true
         }
       ],
       "chaos": {
         "profiles": [
           {
-            "name": "latency_spread_shock",
-            "run_id": "wf_candidate_placeholder_chaos_ls",
+            "name": "step6_long_b_audit_proxy",
+            "run_id": "wf_step6_long_B_audit_20200101_20260213",
             "required": true
           }
         ]

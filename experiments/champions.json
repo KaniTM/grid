@@ -1,6 +1,64 @@
 {
-  "version": 1,
-  "updated_utc": "",
-  "champions": {},
-  "history": []
+  "champions": {
+    "GridBrainV1|ETH/USDT|15m": {
+      "baseline_run_id": "wf_exp_router_fast_20200101_20260213_v2_strict",
+      "experiment_id": "router_fast_v3_promotion_candidate",
+      "manifest": "/home/kani/grid-ml-system/experiments/manifest.yaml",
+      "metrics": {
+        "action_start": 174,
+        "avg_pnl_pct": 1.997990252922382,
+        "churn_events_per_window": 600.551724137931,
+        "false_start_rate": 99.816091954023,
+        "max_gain_pct": 21.35648294728172,
+        "max_loss_pct": -5.26781906554058,
+        "median_pnl_pct": 0.12031688197045032,
+        "profit_factor": 5.717794944811332,
+        "rank_stability_jaccard": 0.75,
+        "rebuild_events": 2,
+        "run_id": "wf_exp_router_fast_20200101_20260213_v3_strictfix2",
+        "seed_events": 46,
+        "start_rank_jaccard": 1.0,
+        "stop_events": 17368,
+        "stop_events_per_window": 598.8965517241379,
+        "stop_rank_jaccard": 0.5,
+        "sum_pnl_quote": 579.4171733474906,
+        "top_start_blocker": "gate_fail:mode_active_ok",
+        "top_stop_reason": "event:PLAN_STOP",
+        "win_rate": 62.06896551724138,
+        "windows_failed": 0,
+        "windows_ok": 29,
+        "windows_total": 29
+      },
+      "promotion": {
+        "candidate_objective": 1.997990252922382,
+        "champion_objective": 0.0,
+        "improvement": 1.997990252922382,
+        "improvement_pass": true,
+        "min_improvement": 0.05,
+        "note": "promoted",
+        "objective_metric": "avg_pnl_pct"
+      },
+      "run_id": "wf_exp_router_fast_20200101_20260213_v3_strictfix2",
+      "updated_utc": "2026-02-26T05:20:45.686870+00:00"
+    }
+  },
+  "history": [
+    {
+      "ablation_pass": true,
+      "candidate_run_id": "wf_exp_router_fast_20200101_20260213_v3_strictfix2",
+      "chaos_pass": true,
+      "experiment_id": "router_fast_v3_promotion_candidate",
+      "objective_improvement": 1.997990252922382,
+      "objective_metric": "avg_pnl_pct",
+      "oos_pass": true,
+      "promoted": true,
+      "promotion_note": "promoted",
+      "rank_pass": true,
+      "run_id": "tp_first_real_live",
+      "slot": "GridBrainV1|ETH/USDT|15m",
+      "ts_utc": "2026-02-26T05:20:45.686849+00:00"
+    }
+  ],
+  "updated_utc": "2026-02-26T05:20:45.686876+00:00",
+  "version": 1
 }
