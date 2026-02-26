@@ -76,10 +76,6 @@
     },
     "spread_shock_bps": {
       "type": "object",
-      "required": [
-        "base",
-        "burst"
-      ],
       "properties": {
         "base": {
           "type": "number",
@@ -103,6 +99,20 @@
           "maximum": 1
         }
       },
+      "anyOf": [
+        {
+          "required": [
+            "base",
+            "burst"
+          ]
+        },
+        {
+          "required": [
+            "base_p50",
+            "burst_p95"
+          ]
+        }
+      ],
       "additionalProperties": true
     },
     "partial_fill_probability": {
