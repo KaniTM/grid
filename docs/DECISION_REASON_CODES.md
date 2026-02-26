@@ -261,6 +261,12 @@ Use these fields (or equivalent):
 - **Applies to:** `START`, `REBUILD`
 - **Severity:** hard
 
+### `BLOCK_FUNDING_FILTER`
+- **Module:** funding filter gate
+- **Meaning:** Funding premium index (`fr_8h_pct`) exceeds ±0.05% while the filter is enabled, so new builds are blocked until the premium normalizes.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** soft (optional gate)
+
 ### `COOLOFF_BBWP_EXTREME`
 - **Module:** BBWP MTF cooloff
 - **Meaning:** BBWP extreme condition triggered cooloff; wait until cooloff recovery thresholds are met.
@@ -348,6 +354,18 @@ Use these fields (or equivalent):
 - **Meaning:** Box/channel overlap is below acceptable threshold for valid range representation.
 - **Applies to:** `START`, `REBUILD`
 - **Severity:** hard (or soft if configured)
+
+### `BLOCK_BOX_OVERLAP_HIGH`
+- **Module:** box overlap pruning
+- **Meaning:** Proposed box overlaps ≥60% with a recently used range; the planner prunes to avoid redundant rebuilds.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** hard
+
+### `BLOCK_BOX_ENVELOPE_RATIO_HIGH`
+- **Module:** envelope/BB overlap policy
+- **Meaning:** Box width is excessively wide compared to the overlay envelope when momentum (ADX/rVol) indicates market stress.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** hard
 
 ### `BLOCK_BOX_DONCHIAN_WIDTH_SANITY`
 - **Module:** Donchian width gate

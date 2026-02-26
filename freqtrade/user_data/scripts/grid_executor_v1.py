@@ -114,10 +114,28 @@ def write_json(path: str, payload: Dict) -> None:
     os.replace(tmp, path)
 
 
-def build_levels(box_low: float, box_high: float, n_levels: int) -> np.ndarray:
+def _round_to_tick(price: float, tick_size: Optional[float]) -> float:
+    if tick_size is None or tick_size <= 0:
+        return float(price)
+    return float(np.round(float(price) / float(tick_size)) * float(tick_size))
+
+
+def build_levels(
+    box_low: float,
+    box_high: float,
+    n_levels: int,
+    tick_size: Optional[float] = None,
+) -> np.ndarray:
     if n_levels <= 0:
         return np.array([])
-    return np.linspace(box_low, box_high, n_levels + 1)
+    levels = np.linspace(box_low, box_high, n_levels + 1)
+    if tick_size is not None and tick_size > 0:
+        levels = np.array([_round_to_tick(float(px), tick_size) for px in levels], dtype=float)
+        levels = np.sort(levels)
+        if len(levels) != (n_levels + 1):
+            levels = np.linspace(float(levels[0]), float(levels[-1]), n_levels + 1)
+            levels = np.array([_round_to_tick(float(px), tick_size) for px in levels], dtype=float)
+    return levels
 
 
 def plan_signature(plan: Dict) -> Tuple:
@@ -288,6 +306,37 @@ def _normalized_side_weights(indices: List[int], rung_weights: Optional[List[flo
     return [float(v / s) for v in vals]
 
 
+class FillCooldownGuard:
+    def __init__(self, cooldown_bars: int, no_repeat_lsi_guard: bool = True) -> None:
+        self.cooldown_bars = max(int(cooldown_bars), 0)
+        self.no_repeat_lsi_guard = bool(no_repeat_lsi_guard)
+        self._last_fill_by_key: Dict[Tuple[str, int], int] = {}
+
+    def configure(
+        self,
+        *,
+        cooldown_bars: Optional[int] = None,
+        no_repeat_lsi_guard: Optional[bool] = None,
+    ) -> None:
+        if cooldown_bars is not None:
+            self.cooldown_bars = max(int(cooldown_bars), 0)
+        if no_repeat_lsi_guard is not None:
+            self.no_repeat_lsi_guard = bool(no_repeat_lsi_guard)
+
+    def allow(self, side: str, level_index: int, bar_index: int) -> bool:
+        if not self.no_repeat_lsi_guard:
+            return True
+        last = self._last_fill_by_key.get((str(side), int(level_index)))
+        if last is None:
+            return True
+        return bool((int(bar_index) - int(last)) > self.cooldown_bars)
+
+    def mark(self, side: str, level_index: int, bar_index: int) -> None:
+        if not self.no_repeat_lsi_guard:
+            return
+        self._last_fill_by_key[(str(side), int(level_index))] = int(bar_index)
+
+
 # -----------------------------
 # Core executor logic
 # -----------------------------
@@ -356,6 +405,16 @@ class GridExecutorV1:
         self._last_effective_action: Optional[str] = None
         self._last_action_suppression_reason: Optional[str] = None
         self._last_effective_action_signature: Optional[Tuple] = None
+        self._fill_confirmation_mode: str = "Touch"
+        self._fill_no_repeat_lsi_guard: bool = True
+        self._fill_cooldown_bars: int = 1
+        self._fill_guard = FillCooldownGuard(
+            self._fill_cooldown_bars,
+            no_repeat_lsi_guard=self._fill_no_repeat_lsi_guard,
+        )
+        self._fill_guard_bar_seq: int = 0
+        self._fill_guard_last_clock_ts: Optional[int] = None
+        self._tick_size: Optional[float] = None
 
         if self.mode == "ccxt":
             if ccxt is None:
@@ -598,6 +657,21 @@ class GridExecutorV1:
             return None
         return float(levels[idx])
 
+    def _next_fill_bar_index(self, plan: Dict) -> int:
+        runtime_state = plan.get("runtime_state") or {}
+        clock_ts = runtime_state.get("clock_ts")
+        if clock_ts is None:
+            clock_ts = plan.get("candle_ts")
+        clock_ts_int = _safe_float(clock_ts, default=None)
+        if clock_ts_int is not None:
+            clock_ts_value = int(clock_ts_int)
+            if self._fill_guard_last_clock_ts != clock_ts_value:
+                self._fill_guard_last_clock_ts = clock_ts_value
+                self._fill_guard_bar_seq = int(self._fill_guard_bar_seq + 1)
+            return int(max(self._fill_guard_bar_seq, 1))
+        self._fill_guard_bar_seq = int(self._fill_guard_bar_seq + 1)
+        return int(self._fill_guard_bar_seq)
+
     def _extract_exit_levels(self, plan: Dict) -> Tuple[Optional[float], Optional[float]]:
         """
         Read TP/SL levels from plan, supporting both new and legacy locations.
@@ -630,7 +704,14 @@ class GridExecutorV1:
                 return o
         return None
 
-    def _ingest_trades_and_replenish(self, symbol: str, levels: np.ndarray, limits: Dict) -> None:
+    def _ingest_trades_and_replenish(
+        self,
+        symbol: str,
+        levels: np.ndarray,
+        limits: Dict,
+        *,
+        fill_bar_index: int,
+    ) -> None:
         """
         Fetch user trades since last_trade_ms and:
         - match them to our tracked orders (by trade['order'])
@@ -695,24 +776,30 @@ class GridExecutorV1:
             # Place opposite rung for the filled portion ONLY
             filled_qty = amount
             if filled_qty > 0:
-                if ro.side == "buy":
-                    next_idx = ro.level_index + 1
-                    px = self._levels_for_index(levels, next_idx)
-                    if px is not None:
-                        new_px = float(quantize_price(self.exchange, symbol, px))
-                        new_qty = float(quantize_amount(self.exchange, symbol, filled_qty))
-                        if new_qty > 0 and passes_min_notional(limits, new_px, new_qty):
-                            new_oid = self._ccxt_place_limit("sell", symbol, new_qty, new_px, limits)
-                            self._orders.append(RestingOrder("sell", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
-                else:
-                    next_idx = ro.level_index - 1
-                    px = self._levels_for_index(levels, next_idx)
-                    if px is not None:
-                        new_px = float(quantize_price(self.exchange, symbol, px))
-                        new_qty = float(quantize_amount(self.exchange, symbol, filled_qty))
-                        if new_qty > 0 and passes_min_notional(limits, new_px, new_qty):
-                            new_oid = self._ccxt_place_limit("buy", symbol, new_qty, new_px, limits)
-                            self._orders.append(RestingOrder("buy", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
+                if self._fill_guard.allow(ro.side, ro.level_index, fill_bar_index):
+                    action_attempted = False
+                    if ro.side == "buy":
+                        next_idx = ro.level_index + 1
+                        px = self._levels_for_index(levels, next_idx)
+                        if px is not None:
+                            new_px = float(quantize_price(self.exchange, symbol, px))
+                            new_qty = float(quantize_amount(self.exchange, symbol, filled_qty))
+                            if new_qty > 0 and passes_min_notional(limits, new_px, new_qty):
+                                action_attempted = True
+                                new_oid = self._ccxt_place_limit("sell", symbol, new_qty, new_px, limits)
+                                self._orders.append(RestingOrder("sell", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
+                    else:
+                        next_idx = ro.level_index - 1
+                        px = self._levels_for_index(levels, next_idx)
+                        if px is not None:
+                            new_px = float(quantize_price(self.exchange, symbol, px))
+                            new_qty = float(quantize_amount(self.exchange, symbol, filled_qty))
+                            if new_qty > 0 and passes_min_notional(limits, new_px, new_qty):
+                                action_attempted = True
+                                new_oid = self._ccxt_place_limit("buy", symbol, new_qty, new_px, limits)
+                                self._orders.append(RestingOrder("buy", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
+                    if action_attempted:
+                        self._fill_guard.mark(ro.side, ro.level_index, fill_bar_index)
 
             if fully_filled:
                 ro.status = "filled"
@@ -745,9 +832,19 @@ class GridExecutorV1:
         box_high = float(plan["range"]["high"])
         n_levels = int(plan["grid"]["n_levels"])
         step = float(plan["grid"]["step_price"])
+        fill_cfg = (plan.get("grid", {}) or {}).get("fill_detection", {}) or {}
+        self._fill_confirmation_mode = str(fill_cfg.get("fill_confirmation_mode", "Touch"))
+        self._fill_no_repeat_lsi_guard = bool(fill_cfg.get("no_repeat_lsi_guard", True))
+        self._fill_cooldown_bars = int(fill_cfg.get("cooldown_bars", 1) or 1)
+        self._fill_guard.configure(
+            cooldown_bars=self._fill_cooldown_bars,
+            no_repeat_lsi_guard=self._fill_no_repeat_lsi_guard,
+        )
+        fill_bar_index = self._next_fill_bar_index(plan)
+        self._tick_size = _safe_float((plan.get("grid", {}) or {}).get("tick_size"), default=None)
         rung_weights = _extract_rung_weights(plan, n_levels)
 
-        levels = build_levels(box_low, box_high, n_levels)
+        levels = build_levels(box_low, box_high, n_levels, tick_size=self._tick_size)
         if len(levels) < 2:
             raise ValueError("Not enough levels (n_levels must be >= 1).")
 
@@ -783,7 +880,12 @@ class GridExecutorV1:
             self._sync_balance_ccxt()
             # Ingest fills and replenish before we make plan-adjust decisions
             if raw_action != "STOP":
-                self._ingest_trades_and_replenish(symbol, levels, limits)
+                self._ingest_trades_and_replenish(
+                    symbol,
+                    levels,
+                    limits,
+                    fill_bar_index=fill_bar_index,
+                )
 
         rebuild = False
         soft_adjust = False
@@ -947,6 +1049,10 @@ class GridExecutorV1:
             "raw_action": self._last_raw_action,
             "effective_action": self._last_effective_action,
             "action_suppression_reason": self._last_action_suppression_reason,
+            "fill_confirmation_mode": self._fill_confirmation_mode,
+            "fill_no_repeat_lsi_guard": self._fill_no_repeat_lsi_guard,
+            "fill_cooldown_bars": int(self._fill_cooldown_bars),
+            "tick_size": self._tick_size,
         }
 
         payload = ExecutorState(

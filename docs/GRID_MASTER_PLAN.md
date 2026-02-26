@@ -454,100 +454,9 @@ This phase decides whether a grid can be built/launched/rebuilt.
 
 ---
 
-## 11.1 Core Baseline Gates (Must-Have)
+### DONE
 
-### 11.1.1 ADX Gate (4h)
-**Goal:** avoid strong directional regimes.  
-Baseline:
-- enter allowed if `ADX_4h <= 22`
-- optional hysteresis (e.g., enter ≤22, exit ≥25)
-
-Reason code:
-- `BLOCK_ADX_HIGH`
-
-### 11.1.2 BBW Quietness Gate (1h)
-**Goal:** avoid volatility expansion / breakout phase.  
-Baseline:
-- BBW non-expanding over recent bars (configurable lookback + tolerance)
-
-Reason code:
-- `BLOCK_BBW_EXPANDING`
-
-### 11.1.3 EMA Distance Compression Gate (1h)
-**Goal:** avoid hidden trend acceleration despite local range.  
-Baseline:
-- `abs(EMA50 - EMA100)/price <= threshold`
-
-Reason code:
-- `BLOCK_EMA_DIST`
-
-### 11.1.4 rVol Calm Gate (15m and/or 1h)
-**Goal:** avoid impulse/event spikes.  
-Baseline:
-- build prefers `rVol <= ~1.2–1.5` (mode-dependent)
-
-Reason code:
-- `BLOCK_RVOL_SPIKE`
-
-### 11.1.5 7d Context / Extreme Sanity
-**Goal:** avoid building directly into macro breakout edges.  
-Used as a box/build sanity overlay (not always a hard veto unless configured).
-
----
-
-## 11.2 Structural Breakout Fresh-Block (Non-Repainting)
-
-### Logic
-On build TF (default 15m):
-- `bull_break_N = close > highest(high[1], N)`
-- `bear_break_N = close < lowest(low[1], N)`
-- cache last breakout levels
-- track bars since breakout
-- if fresh breakout → set `Idle` + start reclaim timer
-
-### Defaults
-- `N = 14`
-- fresh breakout block window ~20 bars
-- reclaim override allowed (configurable)
-
-### Cached Levels
-- `last_break_up_lvl`
-- `last_break_dn_lvl`
-
-### Integration
-- START/REBUILD block
-- box straddle veto if box crosses cached breakout level within `< 1 step`
-
-Reason code:
-- `BLOCK_FRESH_BREAKOUT`
-
----
-
-## 11.3 Range DI / Deviation-Pivot Regime State (`os_dev`) [Misu-style integration]
-
-### State
-- `-1` bearish directional
-- `0` range/neutral
-- `+1` bullish directional
-
-### Characteristics
-- deviation pivot based
-- strike confirmation (`nStrike=2`)
-- persistence requirement for neutral state
-
-### Defaults / Behavior
-- Build eligibility prefers `os_dev=0`
-- Require `os_dev=0` persisting ≥ L/2 bars
-- If `os_dev` flips to ±1 → set `Idle` + start reclaim timer
-- Rebuild only after reclaim + `os_dev=0` persistence + quiet volume
-
-### Additions
-- band slope veto during build (e.g. >0.35% / 20 bars)
-- range strike-gated STOP/REBUILD discipline
-
----
-
-## 11.4 Band / Drift / Slope / Asymmetry Vetoes
+#### 11.4 Band / Drift / Slope / Asymmetry Vetoes
 
 ### Included ideas
 - Band midline slope veto
@@ -557,47 +466,9 @@ Reason code:
 
 These are optional/toggleable strictness layers to reduce launches into hidden acceleration.
 
----
+**Status:** Implemented inside `GridBrainV1` (band slope history, drift guard, and excursion ratio helpers feed the phase-2 gate checks, and `test_phase3_validation` now exercises the new helper methods).
 
-## 11.5 BBWP MTF Gate (Core/High Value; ON by default later)
-
-### Adopted behavior
-- Use BBWP percentile across S/M/L TFs
-- Build allow when:
-  - `S ≤ 35`
-  - `M ≤ 50`
-  - `L ≤ 60`
-  - plus 3-bar non-expansion
-- Veto when any `≥ 90`
-- Cool-off after any `≥ 98` until S<50 and M<60
-
-### Additional integrations preserved
-- EltAlt auto timeframe ladder mapping for M/L
-- BBWP v6 array-based percentile implementation (preferred standard)
-
-Reason codes:
-- `BLOCK_BBWP_HIGH`
-- `COOLOFF_BBWP_EXTREME`
-
----
-
-## 11.6 Squeeze State Gate (BB inside KC) + Squeeze Momentum
-
-### Core squeeze logic
-- detect BB-inside-KC compression
-- prefer builds during squeeze-on with quiet volume
-- allow controlled post-release window if range re-normalizes
-
-### Quick STOP override
-- if squeeze releases against box bias and close > 1 step outside box → STOP immediately
-
-### Squeeze Momentum v2 (LazyBear `val`) integration
-- block fresh START if `val` flips against edge context
-- TP nudge when `val` decelerates / color flip
-
----
-
-## 11.7 Funding Filter (Optional, Spot Contextual)
+#### 11.7 Funding Filter (Optional, Spot Contextual)
 
 ### Source/logic (preserved)
 Use FR script logic (Binance premium index derived 8h funding estimate):
@@ -608,9 +479,9 @@ Use FR script logic (Binance premium index derived 8h funding estimate):
 ### Role
 Optional Phase-2 advisory/gate, not hard dependency.
 
----
+**Status:** Implemented via the `funding_filter` toggle in `GridBrainV1`; `fr_8h_pct` must stay within ±0.05% to allow START/REBUILD, otherwise `BLOCK_FUNDING_FILTER` is emitted.
 
-## 11.8 HVP Gate (High Volatility Percentile style; ON by default later)
+#### 11.8 HVP Gate (High Volatility Percentile style; ON by default later)
 
 ### Purpose
 Block builds during volatility expansion clusters missed by static gates.
@@ -621,21 +492,143 @@ Block builds during volatility expansion clusters missed by static gates.
 - Require cool-off (`HVP < HVPSMA`) before (re)build
 - Optional quiet-exit bias when HVP drops below SMA
 
----
+**Status:** Implemented through `GridBrainV1`’s HVP gate (cool-off state tracked per pair, metrics reported in the plan signals, and gating tested via `test_phase3_validation` helpers).
 
-## 11.9 Start Gate Aggregation Order (Recommended)
+### TODO
+
+#### 11.1 Core Baseline Gates (Must-Have)
+
+##### 11.1.1 ADX Gate (4h)
+**Goal:** avoid strong directional regimes.  
+Baseline:
+- enter allowed if `ADX_4h <= 22`
+- optional hysteresis (e.g., enter ≤22, exit ≥25)
+
+Reason code:
+- `BLOCK_ADX_HIGH`
+
+##### 11.1.2 BBW Quietness Gate (1h)
+**Goal:** avoid volatility expansion / breakout phase.  
+Baseline:
+- BBW non-expanding over recent bars (configurable lookback + tolerance)
+
+Reason code:
+- `BLOCK_BBW_EXPANDING`
+
+##### 11.1.3 EMA Distance Compression Gate (1h)
+**Goal:** avoid hidden trend acceleration despite local range.  
+Baseline:
+- `abs(EMA50 - EMA100)/price <= threshold`
+
+Reason code:
+- `BLOCK_EMA_DIST`
+
+##### 11.1.4 rVol Calm Gate (15m and/or 1h)
+**Goal:** avoid impulse/event spikes.  
+Baseline:
+- build prefers `rVol <= ~1.2–1.5` (mode-dependent)
+
+Reason code:
+- `BLOCK_RVOL_SPIKE`
+
+##### 11.1.5 7d Context / Extreme Sanity
+**Goal:** avoid building directly into macro breakout edges.  
+Used as a box/build sanity overlay (not always a hard veto unless configured).
+
+#### 11.2 Structural Breakout Fresh-Block (Non-Repainting)
+
+##### Logic
+On build TF (default 15m):
+- `bull_break_N = close > highest(high[1], N)`
+- `bear_break_N = close < lowest(low[1], N)`
+- cache last breakout levels
+- track bars since breakout
+- if fresh breakout → set `Idle` + start reclaim timer
+
+##### Defaults
+- `N = 14`
+- fresh breakout block window ~20 bars
+- reclaim override allowed (configurable)
+
+##### Cached Levels
+- `last_break_up_lvl`
+- `last_break_dn_lvl`
+
+##### Integration
+- START/REBUILD block
+- box straddle veto if box crosses cached breakout level within `< 1 step`
+
+Reason code:
+- `BLOCK_FRESH_BREAKOUT`
+
+#### 11.3 Range DI / Deviation-Pivot Regime State (`os_dev`) [Misu-style integration]
+
+##### State
+- `-1` bearish directional
+- `0` range/neutral
+- `+1` bullish directional
+
+##### Characteristics
+- deviation pivot based
+- strike confirmation (`nStrike=2`)
+- persistence requirement for neutral state
+
+##### Defaults / Behavior
+- Build eligibility prefers `os_dev=0`
+- Require `os_dev=0` persisting ≥ L/2 bars
+- If `os_dev` flips to ±1 → set `Idle` + start reclaim timer
+- Rebuild only after reclaim + `os_dev=0` persistence + quiet volume
+
+##### Additions
+- band slope veto during build (e.g. >0.35% / 20 bars)
+- range strike-gated STOP/REBUILD discipline
+
+#### 11.5 BBWP MTF Gate (Core/High Value; ON by default later)
+
+##### Adopted behavior
+- Use BBWP percentile across S/M/L TFs
+- Build allow when:
+  - `S ≤ 35`
+  - `M ≤ 50`
+  - `L ≤ 60`
+  - plus 3-bar non-expansion
+- Veto when any `≥ 90`
+- Cool-off after any `≥ 98` until S<50 and M<60
+
+##### Additional integrations preserved
+- EltAlt auto timeframe ladder mapping for M/L
+- BBWP v6 array-based percentile implementation (preferred standard)
+
+Reason codes:
+- `BLOCK_BBWP_HIGH`
+- `COOLOFF_BBWP_EXTREME`
+
+#### 11.6 Squeeze State Gate (BB inside KC) + Squeeze Momentum
+
+##### Core squeeze logic
+- detect BB-inside-KC compression
+- prefer builds during squeeze-on with quiet volume
+- allow controlled post-release window if range re-normalizes
+
+##### Quick STOP override
+- if squeeze releases against box bias and close > 1 step outside box → STOP immediately
+
+##### Squeeze Momentum v2 (LazyBear `val`) integration
+- block fresh START if `val` flips against edge context
+- TP nudge when `val` decelerates / color flip
+
+#### 11.9 Start Gate Aggregation Order (Recommended)
 
 Apply in this order:
-1. planner health state (`ok/degraded/quarantine`)
-2. hard STOP conditions
-3. phase-2 baseline gates
-4. structural freshness / `os_dev` / BBWP / squeeze / HVP
-5. meta drift soft block
-6. start stability score + k-of-n
-7. replan/materiality policy (if active plan exists)
+- planner health state (`ok/degraded/quarantine`)
+- hard STOP conditions
+- phase-2 baseline gates
+- structural freshness / `os_dev` / BBWP / squeeze / HVP
+- meta drift soft block
+- start stability score + k-of-n
+- replan/materiality policy (if active plan exists)
 
 ---
-
 # 12) Phase-3: Box Builder (Range Definition & Validation)
 
 This is the core of the grid planner and must remain deterministic and explainable.
@@ -663,6 +656,29 @@ This is the core of the grid planner and must remain deterministic and explainab
 - price position in box
 - pad size
 - source window metadata
+
+### DONE
+
+#### 12.1 Core Box Builder (Baseline)
+- Implementation observes a 24h rolling high/low on 15m candles, pads the range via `atr_15m` (see `GridBrainV1._build_box_15m`), and auto-adjusts lookback windows when the width falls outside the 3.5–6% band. The diagnostics recorded in `_box_candidate_diag` capture the width, midpoint, pad, and lookback metadata every cycle.
+
+#### 12.2 Box Width Adjustment & Veto Policy
+- Width and channel thresholds are enforced through the sequential lookback fallbacks in `_build_box_15m`, the overlap pruning (`_box_overlap_prune`), and the envelope/band overlap gates near `GridBrainV1._update_box_quality`. Hard/soft bounds are surfaced via `BlockReason` entries such as `BLOCK_BOX_CHANNEL_OVERLAP_LOW` and `BLOCK_BOX_ENVELOPE_RATIO_HIGH` when the box violates the configured ratios.
+
+#### 12.3 VRVP / Volume Profile (Deterministic, 24h baseline)
+- `_vrvp_profile` produces poc/vah/val with fixed bins and window, and `_determine_box_candidate` shifts the candidate range toward the VRVP POC (bounded by `vrvp_max_box_shift_frac`). The subsequent `_vrvp_box_ok` flags cancel builds when the POC remains outside with insufficient tolerance, and the VRVP metadata travels through the plan payload.
+
+#### 12.4 POC Acceptance Gate
+- `_poc_acceptance_status` tracks whether a POC cross has occurred for a live signature; the gate is enforced when `poc_acceptance_enabled` is true, emitting `BLOCK_NO_POC_ACCEPTANCE` if unmet and delaying `START` until `open/close` actions cross the stored POC.
+
+#### 12.5 Straddle Veto Framework
+- Centralized helpers (`_box_straddles_level`, `_box_straddles_cached_breakout`, `_box_level_straddle_reasons`) evaluate cached breakout, FVG, session, and other structural levels against the candidate box with configurable step buffers (`fvg_straddle_veto_steps`), applying veto flags captured as `fvg_straddle_veto` and providing precise reasons in `extra_level_reasons`.
+
+#### 12.6 Box Quality Enhancements
+- Quartiles, log-space extensions, and band/VP overlap heuristics live inside `_update_box_quality`. Overlap pruning, midline bias fallbacks, envelope-width checks, and channel ratio validations all feed into the box diagnostics so future planners can introspect any mutation.
+
+#### 12.7 Session/Range Context Integrations
+- Session VWAP/FVG cues, pad shrink when session prints occur, and optional session-based gating (`fvg_state` flags) integrate with the box builder by shrinking pads, shifting boxes, and attaching session metadata to the emitted plan.
 
 ---
 
@@ -919,6 +935,18 @@ Planner should log **all blockers**, not just first blocker.
 - tick-aware rounding using `syminfo.mintick` equivalent precision helpers
 
 ### Executor and simulator should share logic or exact semantics.
+
+### Status update (2026-02-26)
+- `fill_detection.no_repeat_lsi_guard` is now enforced (not metadata-only) in both simulator and executor.
+- Guard semantics are aligned as side+level scoped cooldown control:
+  - key = `(side, level_index)`
+  - if enabled, repeated action on the same key is blocked until cooldown bars elapse
+  - if disabled, repeated action is allowed
+- Simulator and replay paths now both read/apply:
+  - `fill_detection.fill_confirmation_mode`
+  - `fill_detection.no_repeat_lsi_guard`
+  - `fill_detection.cooldown_bars`
+- Executor now uses plan clock (`runtime_state.clock_ts`, fallback `candle_ts`) to derive deterministic bar-index progression for the same cooldown semantics.
 
 ---
 
@@ -2128,6 +2156,9 @@ This is the intended path to a system that is not only feature-rich, but **stabl
 
 ## 26.1 DONE
 - # 2) System Architecture (Brain / Simulator / Executor / Overlay)
+- # 11) Phase-2: Regime Filters and Build Gates (Detailed)
+- # 13) Phase-4: Grid Sizing, START Filters, Targets, Risk
+- 2026-02-26 sync: `13.7` no-repeat/LSI guard moved from metadata-only to enforced behavior across simulator + executor, with regression tests.
 
 ## 2.1 Brain / Planner (`GridBrainV1`)
 
@@ -2312,194 +2343,7 @@ At each 15m decision tick:
 ---
 
 ## 26.2 TODO (ordered by priority)
-1. # 11) Phase-2: Regime Filters and Build Gates (Detailed)
-
-This phase decides whether a grid can be built/launched/rebuilt.
-
----
-
-## 11.1 Core Baseline Gates (Must-Have)
-
-### 11.1.1 ADX Gate (4h)
-**Goal:** avoid strong directional regimes.  
-Baseline:
-- enter allowed if `ADX_4h <= 22`
-- optional hysteresis (e.g., enter ≤22, exit ≥25)
-
-Reason code:
-- `BLOCK_ADX_HIGH`
-
-### 11.1.2 BBW Quietness Gate (1h)
-**Goal:** avoid volatility expansion / breakout phase.  
-Baseline:
-- BBW non-expanding over recent bars (configurable lookback + tolerance)
-
-Reason code:
-- `BLOCK_BBW_EXPANDING`
-
-### 11.1.3 EMA Distance Compression Gate (1h)
-**Goal:** avoid hidden trend acceleration despite local range.  
-Baseline:
-- `abs(EMA50 - EMA100)/price <= threshold`
-
-Reason code:
-- `BLOCK_EMA_DIST`
-
-### 11.1.4 rVol Calm Gate (15m and/or 1h)
-**Goal:** avoid impulse/event spikes.  
-Baseline:
-- build prefers `rVol <= ~1.2–1.5` (mode-dependent)
-
-Reason code:
-- `BLOCK_RVOL_SPIKE`
-
-### 11.1.5 7d Context / Extreme Sanity
-**Goal:** avoid building directly into macro breakout edges.  
-Used as a box/build sanity overlay (not always a hard veto unless configured).
-
----
-
-## 11.2 Structural Breakout Fresh-Block (Non-Repainting)
-
-### Logic
-On build TF (default 15m):
-- `bull_break_N = close > highest(high[1], N)`
-- `bear_break_N = close < lowest(low[1], N)`
-- cache last breakout levels
-- track bars since breakout
-- if fresh breakout → set `Idle` + start reclaim timer
-
-### Defaults
-- `N = 14`
-- fresh breakout block window ~20 bars
-- reclaim override allowed (configurable)
-
-### Cached Levels
-- `last_break_up_lvl`
-- `last_break_dn_lvl`
-
-### Integration
-- START/REBUILD block
-- box straddle veto if box crosses cached breakout level within `< 1 step`
-
-Reason code:
-- `BLOCK_FRESH_BREAKOUT`
-
----
-
-## 11.3 Range DI / Deviation-Pivot Regime State (`os_dev`) [Misu-style integration]
-
-### State
-- `-1` bearish directional
-- `0` range/neutral
-- `+1` bullish directional
-
-### Characteristics
-- deviation pivot based
-- strike confirmation (`nStrike=2`)
-- persistence requirement for neutral state
-
-### Defaults / Behavior
-- Build eligibility prefers `os_dev=0`
-- Require `os_dev=0` persisting ≥ L/2 bars
-- If `os_dev` flips to ±1 → set `Idle` + start reclaim timer
-- Rebuild only after reclaim + `os_dev=0` persistence + quiet volume
-
-### Additions
-- band slope veto during build (e.g. >0.35% / 20 bars)
-- range strike-gated STOP/REBUILD discipline
-
----
-
-## 11.4 Band / Drift / Slope / Asymmetry Vetoes
-
-### Included ideas
-- Band midline slope veto
-- Drift slope veto (pivot/channel based)
-- Excursion asymmetry veto (up/down deviation ratio bounds)
-- Envelope vs box overlap soft/hard checks (later channel modules)
-
-These are optional/toggleable strictness layers to reduce launches into hidden acceleration.
-
----
-
-## 11.5 BBWP MTF Gate (Core/High Value; ON by default later)
-
-### Adopted behavior
-- Use BBWP percentile across S/M/L TFs
-- Build allow when:
-  - `S ≤ 35`
-  - `M ≤ 50`
-  - `L ≤ 60`
-  - plus 3-bar non-expansion
-- Veto when any `≥ 90`
-- Cool-off after any `≥ 98` until S<50 and M<60
-
-### Additional integrations preserved
-- EltAlt auto timeframe ladder mapping for M/L
-- BBWP v6 array-based percentile implementation (preferred standard)
-
-Reason codes:
-- `BLOCK_BBWP_HIGH`
-- `COOLOFF_BBWP_EXTREME`
-
----
-
-## 11.6 Squeeze State Gate (BB inside KC) + Squeeze Momentum
-
-### Core squeeze logic
-- detect BB-inside-KC compression
-- prefer builds during squeeze-on with quiet volume
-- allow controlled post-release window if range re-normalizes
-
-### Quick STOP override
-- if squeeze releases against box bias and close > 1 step outside box → STOP immediately
-
-### Squeeze Momentum v2 (LazyBear `val`) integration
-- block fresh START if `val` flips against edge context
-- TP nudge when `val` decelerates / color flip
-
----
-
-## 11.7 Funding Filter (Optional, Spot Contextual)
-
-### Source/logic (preserved)
-Use FR script logic (Binance premium index derived 8h funding estimate):
-- `fr_8h_pct`
-- `funding_ok = abs(fr_8h_pct) <= 0.05%`
-- optional bias = sign(funding)
-
-### Role
-Optional Phase-2 advisory/gate, not hard dependency.
-
----
-
-## 11.8 HVP Gate (High Volatility Percentile style; ON by default later)
-
-### Purpose
-Block builds during volatility expansion clusters missed by static gates.
-
-### Behavior
-- Compute HVP + HVP SMA
-- Block new builds when `HVP >= HVPSMA` and 1h BBW expanding
-- Require cool-off (`HVP < HVPSMA`) before (re)build
-- Optional quiet-exit bias when HVP drops below SMA
-
----
-
-## 11.9 Start Gate Aggregation Order (Recommended)
-
-Apply in this order:
-1. planner health state (`ok/degraded/quarantine`)
-2. hard STOP conditions
-3. phase-2 baseline gates
-4. structural freshness / `os_dev` / BBWP / squeeze / HVP
-5. meta drift soft block
-6. start stability score + k-of-n
-7. replan/materiality policy (if active plan exists)
-
----
-2. # 12) Phase-3: Box Builder (Range Definition & Validation)
+1. # 12) Phase-3: Box Builder (Range Definition & Validation)
 
 This is the core of the grid planner and must remain deterministic and explainable.
 
@@ -2781,6 +2625,18 @@ Planner should log **all blockers**, not just first blocker.
 - tick-aware rounding using `syminfo.mintick` equivalent precision helpers
 
 ### Executor and simulator should share logic or exact semantics.
+
+### Status update (2026-02-26)
+- `fill_detection.no_repeat_lsi_guard` is now enforced (not metadata-only) in both simulator and executor.
+- Guard semantics are aligned as side+level scoped cooldown control:
+  - key = `(side, level_index)`
+  - if enabled, repeated action on the same key is blocked until cooldown bars elapse
+  - if disabled, repeated action is allowed
+- Simulator and replay paths now both read/apply:
+  - `fill_detection.fill_confirmation_mode`
+  - `fill_detection.no_repeat_lsi_guard`
+  - `fill_detection.cooldown_bars`
+- Executor now uses plan clock (`runtime_state.clock_ts`, fallback `candle_ts`) to derive deterministic bar-index progression for the same cooldown semantics.
 
 ---
 4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch)

@@ -1,5 +1,10 @@
 """Freqtrade bot"""
 
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+
 __version__ = "2026.2-dev"
 
 if "dev" in __version__:
@@ -32,3 +37,8 @@ if "dev" in __version__:
                 __version__ = f"docker-{__version__}-{versionfile.read_text()[:8]}"
         except Exception:  # noqa: S110
             pass
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))

@@ -249,10 +249,120 @@ class FillSim:
     reason: str
 
 
-def build_levels(box_low: float, box_high: float, n_levels: int) -> np.ndarray:
+def _round_to_tick(price: float, tick_size: Optional[float]) -> float:
+    if tick_size is None or tick_size <= 0:
+        return float(price)
+    return float(np.round(float(price) / float(tick_size)) * float(tick_size))
+
+
+def build_levels(
+    box_low: float,
+    box_high: float,
+    n_levels: int,
+    tick_size: Optional[float] = None,
+) -> np.ndarray:
     if n_levels <= 0:
         return np.array([])
-    return np.linspace(box_low, box_high, n_levels + 1)
+    levels = np.linspace(box_low, box_high, n_levels + 1)
+    if tick_size is not None and tick_size > 0:
+        levels = np.array([_round_to_tick(float(px), tick_size) for px in levels], dtype=float)
+        levels = np.sort(levels)
+        # Keep deterministic level count after rounding.
+        if len(levels) != (n_levels + 1):
+            levels = np.linspace(float(levels[0]), float(levels[-1]), n_levels + 1)
+            levels = np.array([_round_to_tick(float(px), tick_size) for px in levels], dtype=float)
+    return levels
+
+
+def _normalize_fill_mode(touch_fill: bool, mode_hint: Optional[str]) -> str:
+    mode = str(mode_hint or "").strip().lower()
+    if mode == "touch":
+        return "Touch"
+    if mode == "reverse":
+        return "Reverse"
+    return "Touch" if bool(touch_fill) else "Reverse"
+
+
+def _fill_trigger(side: str, o: float, h: float, l: float, c: float, price: float, mode: str) -> bool:
+    m = str(mode or "Touch")
+    if m == "Reverse":
+        if side == "buy":
+            return bool(o > price and c < price)
+        return bool(o < price and c > price)
+    if side == "buy":
+        return bool(l <= price)
+    return bool(h >= price)
+
+
+def _touched_index_bounds(
+    levels: np.ndarray,
+    *,
+    side: str,
+    o: float,
+    h: float,
+    l: float,
+    c: float,
+    mode: str,
+) -> Optional[Tuple[int, int]]:
+    if len(levels) == 0:
+        return None
+    m = str(mode or "Touch")
+    if m == "Reverse":
+        if side == "buy":
+            if not (o > c):
+                return None
+            lo, hi = c, o
+        else:
+            if not (o < c):
+                return None
+            lo, hi = o, c
+        left = int(np.searchsorted(levels, lo, side="right"))
+        right = int(np.searchsorted(levels, hi, side="left")) - 1
+    else:
+        if side == "buy":
+            left = int(np.searchsorted(levels, l, side="left"))
+            right = len(levels) - 1
+        else:
+            left = 0
+            right = int(np.searchsorted(levels, h, side="right")) - 1
+    if right < left:
+        return None
+    left = max(left, 0)
+    right = min(right, len(levels) - 1)
+    if right < left:
+        return None
+    return left, right
+
+
+class FillCooldownGuard:
+    def __init__(self, cooldown_bars: int, no_repeat_lsi_guard: bool = True) -> None:
+        self.cooldown_bars = max(int(cooldown_bars), 0)
+        self.no_repeat_lsi_guard = bool(no_repeat_lsi_guard)
+        self._last_fill_by_key: Dict[Tuple[str, int], int] = {}
+
+    def configure(
+        self,
+        *,
+        cooldown_bars: Optional[int] = None,
+        no_repeat_lsi_guard: Optional[bool] = None,
+    ) -> None:
+        if cooldown_bars is not None:
+            self.cooldown_bars = max(int(cooldown_bars), 0)
+        if no_repeat_lsi_guard is not None:
+            self.no_repeat_lsi_guard = bool(no_repeat_lsi_guard)
+
+    def allow(self, side: str, level_index: int, bar_index: int) -> bool:
+        if not self.no_repeat_lsi_guard:
+            return True
+        last = self._last_fill_by_key.get((str(side), int(level_index)))
+        if last is None:
+            return True
+        return bool((int(bar_index) - int(last)) > self.cooldown_bars)
+
+    def mark(self, side: str, level_index: int, bar_index: int) -> None:
+        if not self.no_repeat_lsi_guard:
+            return
+        self._last_fill_by_key[(str(side), int(level_index))] = int(bar_index)
 
 
 def _safe_float(x, default=None):
@@ -722,6 +832,10 @@ def simulate_grid(
     maker_fee_pct: float,
     stop_out_steps: int = 1,
     touch_fill: bool = True,
+    fill_confirmation_mode: Optional[str] = None,
+    fill_cooldown_bars: int = 1,
+    fill_no_repeat_lsi_guard: bool = True,
+    tick_size: Optional[float] = None,
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     rung_weights: Optional[List[float]] = None,
@@ -743,7 +857,8 @@ def simulate_grid(
     if df.empty:
         raise ValueError("OHLCV dataframe is empty (timerange/filter may have removed all rows).")
 
-    levels = build_levels(box_low, box_high, n_levels)
+    fill_mode = _normalize_fill_mode(touch_fill, fill_confirmation_mode)
+    levels = build_levels(box_low, box_high, n_levels, tick_size=tick_size)
     if len(levels) < 2:
         raise ValueError("Not enough levels. n_levels must be >= 1.")
 
@@ -755,6 +870,7 @@ def simulate_grid(
 
     open_orders: List[OrderSim] = []
     fills: List[FillSim] = []
+    fill_guard = FillCooldownGuard(fill_cooldown_bars, fill_no_repeat_lsi_guard)
 
     curve = []
 
@@ -800,7 +916,7 @@ def simulate_grid(
     # -----------------------------
     # Simulation loop
     # -----------------------------
-    for _, row in df.iterrows():
+    for bar_index, (_, row) in enumerate(df.iterrows()):
         ts = row["date"].isoformat()
         o = float(row["open"])
         h = float(row["high"])
@@ -841,6 +957,24 @@ def simulate_grid(
 
         newly_filled: List[OrderSim] = []
         remaining: List[OrderSim] = []
+        buy_bounds = _touched_index_bounds(
+            levels,
+            side="buy",
+            o=o,
+            h=h,
+            l=l,
+            c=c,
+            mode=fill_mode,
+        )
+        sell_bounds = _touched_index_bounds(
+            levels,
+            side="sell",
+            o=o,
+            h=h,
+            l=l,
+            c=c,
+            mode=fill_mode,
+        )
 
         for od in open_orders:
             if od.status != "open":
@@ -850,8 +984,14 @@ def simulate_grid(
                 continue
 
             if od.side == "buy":
-                fill = (l <= od.price) if touch_fill else (o > od.price and c < od.price)
+                if buy_bounds is None or not (buy_bounds[0] <= od.level_index <= buy_bounds[1]):
+                    remaining.append(od)
+                    continue
+                fill = _fill_trigger("buy", o, h, l, c, od.price, fill_mode)
                 if fill:
+                    if not fill_guard.allow("buy", od.level_index, bar_index):
+                        remaining.append(od)
+                        continue
                     cost = od.qty_base * od.price
                     fee_quote = cost * fee
                     if quote >= cost + fee_quote:
@@ -859,6 +999,7 @@ def simulate_grid(
                         base += od.qty_base
                         od.status = "filled"
                         fills.append(FillSim(ts, "buy", od.price, od.qty_base, fee_quote, "FILL"))
+                        fill_guard.mark("buy", od.level_index, bar_index)
                         newly_filled.append(od)
                     else:
                         remaining.append(od)
@@ -866,8 +1007,14 @@ def simulate_grid(
                     remaining.append(od)
 
             else:  # sell
-                fill = (h >= od.price) if touch_fill else (o < od.price and c > od.price)
+                if sell_bounds is None or not (sell_bounds[0] <= od.level_index <= sell_bounds[1]):
+                    remaining.append(od)
+                    continue
+                fill = _fill_trigger("sell", o, h, l, c, od.price, fill_mode)
                 if fill:
+                    if not fill_guard.allow("sell", od.level_index, bar_index):
+                        remaining.append(od)
+                        continue
                     proceeds = od.qty_base * od.price
                     fee_quote = proceeds * fee
                     if base >= od.qty_base:
@@ -875,6 +1022,7 @@ def simulate_grid(
                         quote += (proceeds - fee_quote)
                         od.status = "filled"
                         fills.append(FillSim(ts, "sell", od.price, od.qty_base, fee_quote, "FILL"))
+                        fill_guard.mark("sell", od.level_index, bar_index)
                         newly_filled.append(od)
                     else:
                         remaining.append(od)
@@ -926,6 +1074,10 @@ def simulate_grid(
             "maker_fee_pct": maker_fee_pct,
             "stop_out_steps": stop_out_steps,
             "touch_fill": touch_fill,
+            "fill_confirmation_mode": fill_mode,
+            "fill_cooldown_bars": int(fill_cooldown_bars),
+            "fill_no_repeat_lsi_guard": bool(fill_no_repeat_lsi_guard),
+            "tick_size": tick_size,
             "tp_price": tp_price,
             "sl_price": sl_price,
         },
@@ -943,6 +1095,10 @@ def simulate_grid_replay(
     maker_fee_pct: float,
     stop_out_steps: int = 1,
     touch_fill: bool = True,
+    fill_confirmation_mode: Optional[str] = None,
+    fill_cooldown_bars: int = 1,
+    fill_no_repeat_lsi_guard: bool = True,
+    tick_size: Optional[float] = None,
     max_orders_per_side: int = 40,
     close_on_stop: bool = False,
 ) -> Dict:
@@ -996,8 +1152,10 @@ def simulate_grid_replay(
     fill_mode_counts: Dict[str, int] = {}
     fill_mode_side_counts: Dict[str, int] = {}
     last_effective_action_signature: Optional[Tuple] = None
+    fill_guard = FillCooldownGuard(fill_cooldown_bars, fill_no_repeat_lsi_guard)
+    active_fill_mode = _normalize_fill_mode(touch_fill, fill_confirmation_mode)
 
-    for _, row in df.iterrows():
+    for bar_index, (_, row) in enumerate(df.iterrows()):
         dt = pd.Timestamp(row["date"])
         ts = dt.isoformat()
         o = float(row["open"])
@@ -1073,7 +1231,18 @@ def simulate_grid_replay(
         box_low = float(active_plan["range"]["low"])
         box_high = float(active_plan["range"]["high"])
         n_levels = int(active_plan["grid"]["n_levels"])
-        levels = build_levels(box_low, box_high, n_levels)
+        grid_cfg = active_plan.get("grid", {}) or {}
+        fd_cfg = grid_cfg.get("fill_detection", {}) or {}
+        active_fill_mode = _normalize_fill_mode(
+            touch_fill,
+            fd_cfg.get("fill_confirmation_mode", fill_confirmation_mode),
+        )
+        fill_guard.configure(
+            cooldown_bars=int(fd_cfg.get("cooldown_bars", fill_cooldown_bars) or fill_cooldown_bars),
+            no_repeat_lsi_guard=bool(fd_cfg.get("no_repeat_lsi_guard", fill_no_repeat_lsi_guard)),
+        )
+        tick_size_eff = _safe_float(grid_cfg.get("tick_size"), default=tick_size)
+        levels = build_levels(box_low, box_high, n_levels, tick_size=tick_size_eff)
         if len(levels) < 2:
             raise ValueError("Not enough levels in replay plan (n_levels must be >= 1).")
         step = float(levels[1] - levels[0])
@@ -1317,6 +1486,24 @@ def simulate_grid_replay(
 
         newly_filled: List[OrderSim] = []
         remaining: List[OrderSim] = []
+        buy_bounds = _touched_index_bounds(
+            levels,
+            side="buy",
+            o=o,
+            h=h,
+            l=l,
+            c=c,
+            mode=active_fill_mode,
+        )
+        sell_bounds = _touched_index_bounds(
+            levels,
+            side="sell",
+            o=o,
+            h=h,
+            l=l,
+            c=c,
+            mode=active_fill_mode,
+        )
 
         for od in open_orders:
             if od.status != "open":
@@ -1326,8 +1513,14 @@ def simulate_grid_replay(
                 continue
 
             if od.side == "buy":
-                fill = (l <= od.price) if touch_fill else (o > od.price and c < od.price)
+                if buy_bounds is None or not (buy_bounds[0] <= od.level_index <= buy_bounds[1]):
+                    remaining.append(od)
+                    continue
+                fill = _fill_trigger("buy", o, h, l, c, od.price, active_fill_mode)
                 if fill:
+                    if not fill_guard.allow("buy", od.level_index, bar_index):
+                        remaining.append(od)
+                        continue
                     cost = od.qty_base * od.price
                     fee_quote = cost * fee
                     if quote >= cost + fee_quote:
@@ -1335,6 +1528,7 @@ def simulate_grid_replay(
                         base += od.qty_base
                         od.status = "filled"
                         fills.append(FillSim(ts, "buy", od.price, od.qty_base, fee_quote, "FILL"))
+                        fill_guard.mark("buy", od.level_index, bar_index)
                         _increment_reason(fill_mode_counts, active_mode, 1)
                         _increment_reason(fill_mode_side_counts, f"buy|{active_mode}", 1)
                         newly_filled.append(od)
@@ -1344,8 +1538,14 @@ def simulate_grid_replay(
                     remaining.append(od)
 
             else:
-                fill = (h >= od.price) if touch_fill else (o < od.price and c > od.price)
+                if sell_bounds is None or not (sell_bounds[0] <= od.level_index <= sell_bounds[1]):
+                    remaining.append(od)
+                    continue
+                fill = _fill_trigger("sell", o, h, l, c, od.price, active_fill_mode)
                 if fill:
+                    if not fill_guard.allow("sell", od.level_index, bar_index):
+                        remaining.append(od)
+                        continue
                     proceeds = od.qty_base * od.price
                     fee_quote = proceeds * fee
                     if base >= od.qty_base:
@@ -1353,6 +1553,7 @@ def simulate_grid_replay(
                         quote += (proceeds - fee_quote)
                         od.status = "filled"
                         fills.append(FillSim(ts, "sell", od.price, od.qty_base, fee_quote, "FILL"))
+                        fill_guard.mark("sell", od.level_index, bar_index)
                         _increment_reason(fill_mode_counts, active_mode, 1)
                         _increment_reason(fill_mode_side_counts, f"sell|{active_mode}", 1)
                         newly_filled.append(od)
@@ -1428,6 +1629,9 @@ def simulate_grid_replay(
             "maker_fee_pct": maker_fee_pct,
             "stop_out_steps": stop_out_steps,
             "touch_fill": touch_fill,
+            "fill_confirmation_mode": active_fill_mode,
+            "fill_cooldown_bars": int(fill_guard.cooldown_bars),
+            "fill_no_repeat_lsi_guard": bool(fill_guard.no_repeat_lsi_guard),
             "close_on_stop": bool(close_on_stop),
             "plans_total": int(len(plans)),
             "plans_switched": int(plan_switch_count),
@@ -1523,6 +1727,11 @@ def main():
     box_high = float(plan["range"]["high"])
     n_levels = int(plan["grid"]["n_levels"])
     rung_weights = extract_rung_weights(plan, n_levels)
+    fill_cfg = (plan.get("grid", {}) or {}).get("fill_detection", {}) or {}
+    fill_mode_hint = fill_cfg.get("fill_confirmation_mode")
+    fill_cooldown_bars = int(fill_cfg.get("cooldown_bars", 1) or 1)
+    fill_no_repeat_lsi_guard = bool(fill_cfg.get("no_repeat_lsi_guard", True))
+    tick_size = _safe_float((plan.get("grid", {}) or {}).get("tick_size"), default=None)
     tp_price = None
     sl_price = None
     try:
@@ -1574,6 +1783,10 @@ def main():
             maker_fee_pct=args.fee_pct,
             stop_out_steps=args.stop_out_steps,
             touch_fill=touch_fill,
+            fill_confirmation_mode=fill_mode_hint,
+            fill_cooldown_bars=fill_cooldown_bars,
+            fill_no_repeat_lsi_guard=fill_no_repeat_lsi_guard,
+            tick_size=tick_size,
             max_orders_per_side=args.max_orders_per_side,
             close_on_stop=args.close_on_stop,
         )
@@ -1588,6 +1801,10 @@ def main():
             maker_fee_pct=args.fee_pct,
             stop_out_steps=args.stop_out_steps,
             touch_fill=touch_fill,
+            fill_confirmation_mode=fill_mode_hint,
+            fill_cooldown_bars=fill_cooldown_bars,
+            fill_no_repeat_lsi_guard=fill_no_repeat_lsi_guard,
+            tick_size=tick_size,
             tp_price=tp_price,
             sl_price=sl_price,
             rung_weights=rung_weights,

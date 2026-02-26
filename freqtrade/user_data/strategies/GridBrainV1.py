@@ -11,7 +11,7 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Iterable
 import numpy as np
 import pandas as pd
 from pandas import DataFrame
@@ -20,7 +20,7 @@ from freqtrade.configuration import Configuration as Config
 from freqtrade.strategy import IStrategy, informative
 import talib.abstract as ta
 from technical import qtpylib
-from core.enums import BlockReason, MaterialityClass
+from core.enums import BlockReason, MaterialityClass, WarningCode
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
 REQUIRED_OHLC_COLUMNS = ("date", "open", "high", "low", "close", "volume")
@@ -52,6 +52,151 @@ def _normalize_runtime_value(value: object) -> object:
     if isinstance(value, (int, float, str, bool)):
         return value
     return str(value)
+
+
+class EmpiricalCostCalibrator:
+    """
+    Lightweight rolling empirical cost estimator.
+
+    The estimator can run off coarse proxy inputs when fill/order logs are unavailable,
+    while still allowing conservative cost-floor escalation when reliable samples exist.
+    """
+
+    def __init__(self, window: int) -> None:
+        self._window = max(int(window), 1)
+        self._samples_by_pair: Dict[str, deque] = {}
+        self._bars_seen_by_pair: Dict[str, int] = {}
+        self._last_update_bar_by_pair: Dict[str, int] = {}
+
+    def _samples(self, pair: str) -> deque:
+        samples = self._samples_by_pair.get(pair)
+        if samples is None or samples.maxlen != self._window:
+            samples = deque(maxlen=self._window)
+            self._samples_by_pair[pair] = samples
+        return samples
+
+    def observe(
+        self,
+        pair: str,
+        *,
+        spread_pct: Optional[float],
+        adverse_selection_pct: Optional[float],
+        retry_reject_rate: Optional[float],
+        missed_fill_rate: Optional[float],
+        retry_penalty_pct: float,
+        missed_fill_penalty_pct: float,
+        recommended_floor_pct: Optional[float] = None,
+    ) -> Dict[str, Optional[float]]:
+        bar_idx = int(self._bars_seen_by_pair.get(pair, 0) + 1)
+        self._bars_seen_by_pair[pair] = bar_idx
+
+        spread = float(max(spread_pct or 0.0, 0.0))
+        adverse = float(max(adverse_selection_pct or 0.0, 0.0))
+        retry_rate = float(np.clip(retry_reject_rate or 0.0, 0.0, 1.0))
+        missed_rate = float(np.clip(missed_fill_rate or 0.0, 0.0, 1.0))
+        retry_penalty = float(max(retry_penalty_pct, 0.0) * retry_rate)
+        missed_penalty = float(max(missed_fill_penalty_pct, 0.0) * missed_rate)
+        recommended = (
+            float(max(recommended_floor_pct, 0.0))
+            if recommended_floor_pct is not None
+            else None
+        )
+
+        sample = {
+            "spread_pct": float(spread),
+            "adverse_selection_pct": float(adverse),
+            "retry_reject_rate": float(retry_rate),
+            "missed_fill_rate": float(missed_rate),
+            "retry_penalty_pct": float(retry_penalty),
+            "missed_fill_penalty_pct": float(missed_penalty),
+            "total_pct": float(spread + adverse + retry_penalty + missed_penalty),
+            "recommended_floor_pct": recommended,
+            "bar_idx": int(bar_idx),
+        }
+        self._samples(pair).append(sample)
+        self._last_update_bar_by_pair[pair] = bar_idx
+        return sample
+
+    def snapshot(
+        self,
+        pair: str,
+        *,
+        percentile: float,
+        min_samples: int,
+        stale_bars: int,
+    ) -> Dict[str, object]:
+        samples = list(self._samples(pair))
+        sample_count = int(len(samples))
+        p = float(np.clip(percentile, 0.0, 100.0))
+        bars_seen = int(self._bars_seen_by_pair.get(pair, 0))
+        last_update = self._last_update_bar_by_pair.get(pair)
+        bars_since_update = (
+            int(max(bars_seen - int(last_update), 0))
+            if last_update is not None
+            else None
+        )
+
+        out: Dict[str, object] = {
+            "sample_count": int(sample_count),
+            "bars_seen": int(bars_seen),
+            "bars_since_update": int(bars_since_update) if bars_since_update is not None else None,
+            "stale": True,
+            "spread_pct_percentile": None,
+            "adverse_selection_pct_percentile": None,
+            "retry_reject_rate_percentile": None,
+            "missed_fill_rate_percentile": None,
+            "retry_penalty_pct_percentile": None,
+            "missed_fill_penalty_pct_percentile": None,
+            "total_cost_pct_percentile": None,
+            "recommended_floor_pct_percentile": None,
+            "empirical_floor_pct": None,
+        }
+
+        if sample_count == 0:
+            return out
+
+        def pct(name: str) -> Optional[float]:
+            vals = [
+                float(item[name])
+                for item in samples
+                if item.get(name) is not None and np.isfinite(float(item[name]))
+            ]
+            if not vals:
+                return None
+            return float(np.percentile(np.asarray(vals, dtype=float), p))
+
+        spread_pct_p = pct("spread_pct")
+        adverse_pct_p = pct("adverse_selection_pct")
+        retry_rate_p = pct("retry_reject_rate")
+        missed_rate_p = pct("missed_fill_rate")
+        retry_penalty_p = pct("retry_penalty_pct")
+        missed_penalty_p = pct("missed_fill_penalty_pct")
+        total_cost_p = pct("total_pct")
+        recommended_p = pct("recommended_floor_pct")
+
+        empirical_floor_candidates = [x for x in [total_cost_p, recommended_p] if x is not None]
+        empirical_floor = float(max(empirical_floor_candidates)) if empirical_floor_candidates else None
+
+        stale = bool(
+            sample_count < max(int(min_samples), 1)
+            or (bars_since_update is not None and bars_since_update > max(int(stale_bars), 0))
+        )
+
+        out.update(
+            {
+                "stale": bool(stale),
+                "spread_pct_percentile": spread_pct_p,
+                "adverse_selection_pct_percentile": adverse_pct_p,
+                "retry_reject_rate_percentile": retry_rate_p,
+                "missed_fill_rate_percentile": missed_rate_p,
+                "retry_penalty_pct_percentile": retry_penalty_p,
+                "missed_fill_penalty_pct_percentile": missed_penalty_p,
+                "total_cost_pct_percentile": total_cost_p,
+                "recommended_floor_pct_percentile": recommended_p,
+                "empirical_floor_pct": empirical_floor,
+            }
+        )
+        return out
 
 
 @dataclass(frozen=True)
@@ -141,6 +286,7 @@ class GridBrainV1Core(IStrategy):
         self._runtime_snapshot = GridBrainRuntimeSnapshot.from_strategy(
             self, self._lookback_summary
         )
+        self._empirical_cost_calibrator = EmpiricalCostCalibrator(self.empirical_cost_window)
 
     INTERFACE_VERSION = 3
     STOP_REASON_TREND_ADX = "STOP_TREND_ADX"
@@ -187,6 +333,22 @@ class GridBrainV1Core(IStrategy):
     box_lookback_18h_bars = 72
     box_lookback_12h_bars = 48
     extremes_7d_bars = 7 * 24 * 4  # 672
+    box_overlap_prune_threshold = 0.6
+    box_overlap_history = 4
+    box_band_overlap_required = 0.6
+    box_band_adx_allow = 25.0
+    box_band_rvol_allow = 1.2
+    box_envelope_ratio_max = 2.0
+    box_envelope_adx_threshold = 25.0
+    box_envelope_rvol_threshold = 1.2
+    session_box_pad_shrink_pct = 0.2
+
+    # Structural breakout guard
+    breakout_lookback_bars = 14
+    breakout_block_bars = 20
+    breakout_override_allowed = True
+    breakout_straddle_step_buffer_frac = 0.25
+    breakout_reason_code = BlockReason.BLOCK_FRESH_BREAKOUT
 
     atr_period_15m = 20
     atr_pad_mult = 0.35
@@ -208,10 +370,14 @@ class GridBrainV1Core(IStrategy):
     bb_stds = 2.0
     bbw_pct_lookback_1h = 252
     bbw_1h_pct_max = 50.0
+    bbw_nonexp_lookback_bars = 3
+    bbw_nonexp_tolerance_frac = 0.01
+    context_7d_hard_veto = True
 
     vol_sma_window = 20
     vol_spike_mult = 1.5  # 1h volume <= 1.5 * SMA20
     rvol_window_15m = 20
+    rvol_15m_max = 1.5
 
     # VRVP (fixed-window volume profile)
     vrvp_lookback_bars = 96
@@ -233,9 +399,27 @@ class GridBrainV1Core(IStrategy):
     bbwp_cooloff_trigger_pct = 98.0
     bbwp_cooloff_release_s = 50.0
     bbwp_cooloff_release_m = 60.0
+    bbwp_nonexp_bars = 3
     squeeze_enabled = True
     squeeze_require_on_1h = False
+    squeeze_momentum_block_enabled = True
+    squeeze_tp_nudge_enabled = True
+    squeeze_tp_nudge_step_multiple = 0.5
     kc_atr_mult = 1.5
+
+    # Optional strictness gates
+    band_slope_veto_enabled = False
+    band_slope_veto_bars = 20
+    band_slope_veto_pct = 0.0035
+    drift_slope_veto_enabled = False
+    excursion_asymmetry_veto_enabled = False
+    excursion_asymmetry_min_ratio = 0.7
+    excursion_asymmetry_max_ratio = 1.5
+    hvp_enabled = False
+    hvp_lookback_bars = 32
+    hvp_sma_bars = 8
+    funding_filter_enabled = False
+    funding_filter_pct = 0.0005
 
     # instrumentation lookbacks
     instrumentation_er_lookback = 20
@@ -326,8 +510,23 @@ class GridBrainV1Core(IStrategy):
     target_net_step_pct = 0.0040
     est_fee_pct = 0.0020     # default 0.20% (tweak per exchange/VIP)
     est_spread_pct = 0.0005  # default 0.05% majors
+    majors_gross_step_floor_pct = 0.0065
     n_min = 6
     n_max = 12
+    n_volatility_adapter_enabled = True
+    n_volatility_adapter_strength = 1.0
+
+    # Empirical cost calibration (Section 13.2).
+    empirical_cost_enabled = True
+    empirical_cost_window = 256
+    empirical_cost_min_samples = 24
+    empirical_cost_stale_bars = 96
+    empirical_cost_percentile = 90.0
+    empirical_spread_proxy_scale = 0.10
+    empirical_adverse_selection_scale = 0.25
+    empirical_retry_penalty_pct = 0.0010
+    empirical_missed_fill_penalty_pct = 0.0010
+    empirical_cost_floor_min_pct = 0.0
 
     # Width constraints for the box
     min_width_pct = 0.035  # 3.5%
@@ -349,6 +548,23 @@ class GridBrainV1Core(IStrategy):
     # Gate tuning profile (START gating debug/tune helper)
     gate_profile = "strict"  # strict | balanced | aggressive
     start_min_gate_pass_ratio = 1.0  # keep 1.0 for strict all-gates behavior
+    start_stability_min_score = 1.0
+    start_stability_k_fraction = 1.0
+    start_box_position_guard_enabled = True
+    start_box_position_min_frac = 0.35
+    start_box_position_max_frac = 0.65
+    basis_cross_confirm_enabled = False
+    capacity_hint_path = ""
+    capacity_hint_hard_block = False
+
+    # Planner health / meta drift / runtime rails.
+    planner_health_quarantine_on_gap = True
+    planner_health_quarantine_on_misalign = True
+    meta_drift_soft_block_enabled = True
+    meta_drift_soft_block_steps = 0.75
+    breakout_idle_reclaim_on_fresh = True
+    hvp_quiet_exit_bias_enabled = False
+    hvp_quiet_exit_step_multiple = 0.5
 
     # Regime router (intraday / neutral_choppy / swing / pause).
     regime_router_enabled = True
@@ -410,8 +626,11 @@ class GridBrainV1Core(IStrategy):
     intraday_adx_exit_min = 30.0
     intraday_adx_rising_bars = 3
     intraday_bbw_1h_pct_max = 30.0
+    intraday_bbw_nonexp_lookback_bars = 3
+    intraday_bbw_nonexp_tolerance_frac = 0.01
     intraday_ema_dist_max_frac = 0.005
     intraday_vol_spike_mult = 1.2
+    intraday_rvol_15m_max = 1.2
     intraday_bbwp_s_enter_low = 15.0
     intraday_bbwp_s_enter_high = 45.0
     intraday_bbwp_m_enter_low = 10.0
@@ -428,8 +647,11 @@ class GridBrainV1Core(IStrategy):
     swing_adx_exit_min = 35.0
     swing_adx_rising_bars = 2
     swing_bbw_1h_pct_max = 40.0
+    swing_bbw_nonexp_lookback_bars = 3
+    swing_bbw_nonexp_tolerance_frac = 0.015
     swing_ema_dist_max_frac = 0.010
     swing_vol_spike_mult = 1.8
+    swing_rvol_15m_max = 1.8
     swing_bbwp_s_enter_low = 10.0
     swing_bbwp_s_enter_high = 65.0
     swing_bbwp_m_enter_low = 10.0
@@ -448,8 +670,29 @@ class GridBrainV1Core(IStrategy):
     soft_adjust_max_step_frac = 0.5  # if edges move < 0.5*step => soft adjust allowed
 
     # Capital policy (quote-only for now)
+    inventory_mode = "quote_only"
+    inventory_target_base_min_pct = 0.0
+    inventory_target_base_max_pct = 0.0
+    topup_policy = "manual"
+    max_concurrent_rebuilds = 1
+    preferred_rung_cap = 0
     grid_budget_pct = 0.70
     reserve_pct = 0.30
+
+    # TP/SL target expansion (Section 13.6).
+    donchian_lookback_bars = 96
+    basis_band_window = 96
+    basis_band_stds = 2.0
+    fvg_vp_enabled = False
+    sl_lvn_avoid_steps = 0.25
+    sl_fvg_buffer_steps = 0.10
+
+    # Shared fill semantics metadata (Section 13.7).
+    fill_confirmation_mode = "Touch"  # Touch | Reverse
+    fill_no_repeat_lsi_guard = True
+    fill_no_repeat_cooldown_bars = 1
+    tick_size_step_frac = 0.01
+    tick_size_floor = 1e-8
 
     plans_root_rel = "grid_plans"
 
@@ -484,14 +727,22 @@ class GridBrainV1Core(IStrategy):
     _box_state_by_pair: Dict[str, Dict[str, object]] = {}
     _box_rebuild_bars_since_by_pair: Dict[str, int] = {}
     _neutral_box_break_bars_by_pair: Dict[str, int] = {}
+    _breakout_levels_by_pair: Dict[str, Dict[str, float]] = {}
+    _breakout_bars_since_by_pair: Dict[str, int] = {}
     _box_signature_by_pair: Dict[str, str] = {}
     _data_quality_issues_by_pair: Dict[str, Dict[str, object]] = {}
     _materiality_epoch_bar_count_by_pair: Dict[str, int] = {}
+    _box_history_by_pair: Dict[str, deque] = {}
     _last_width_pct_by_pair: Dict[str, float] = {}
     _last_tp_price_by_pair: Dict[str, float] = {}
     _last_sl_price_by_pair: Dict[str, float] = {}
     _poc_acceptance_crossed_by_pair: Dict[str, bool] = {}
     _plan_guard_decision_count_by_pair: Dict[str, int] = {}
+    _mid_history_by_pair: Dict[str, deque] = {}
+    _hvp_cooloff_by_pair: Dict[str, bool] = {}
+    _box_quality_by_pair: Dict[str, Dict[str, object]] = {}
+    _mid_history_by_pair: Dict[str, deque] = {}
+    _hvp_cooloff_by_pair: Dict[str, bool] = {}
     _external_mode_thresholds_path_cache: Optional[str] = None
     _external_mode_thresholds_mtime_cache: float = -1.0
     _external_mode_thresholds_cache: Dict[str, Dict[str, float]] = {}
@@ -545,6 +796,13 @@ class GridBrainV1Core(IStrategy):
             (dataframe["bb_upper_1h"] < dataframe["kc_upper_1h"])
             & (dataframe["bb_lower_1h"] > dataframe["kc_lower_1h"])
         ).astype(int)
+        # LazyBear-style squeeze momentum proxy used for Phase-2 start/TP nudges.
+        highest_1h = dataframe["high"].rolling(window=self.bb_window, min_periods=self.bb_window).max()
+        lowest_1h = dataframe["low"].rolling(window=self.bb_window, min_periods=self.bb_window).min()
+        mean_hl = (highest_1h + lowest_1h) / 2.0
+        mean_close = dataframe["close"].rolling(window=self.bb_window, min_periods=self.bb_window).mean()
+        squeeze_source = dataframe["close"] - ((mean_hl + mean_close) / 2.0)
+        dataframe["squeeze_val_1h"] = ta.LINEARREG(squeeze_source, timeperiod=self.bb_window)
         return dataframe
 
     # ========== Helpers ==========
@@ -563,6 +821,59 @@ class GridBrainV1Core(IStrategy):
             return xf
         except Exception:
             return None
+
+    def _record_mid_history(self, pair: str, mid: float) -> Optional[float]:
+        window = max(int(self.band_slope_veto_bars), 2)
+        history = self._mid_history_by_pair.get(pair)
+        if history is None or history.maxlen != window:
+            history = deque(maxlen=window)
+            self._mid_history_by_pair[pair] = history
+        prev_mid = history[0] if len(history) == window else None
+        history.append(mid)
+        return prev_mid
+
+    def _compute_band_slope_pct(self, pair: str, mid: float) -> Optional[float]:
+        prev_mid = self._record_mid_history(pair, mid)
+        if prev_mid is None or prev_mid <= 0.0:
+            return None
+        try:
+            return abs(mid - float(prev_mid)) / float(prev_mid)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _excursion_asymmetry_ratio(lo: float, hi: float, mid: float) -> Optional[float]:
+        up_dev = hi - mid
+        down_dev = mid - lo
+        if up_dev <= 0.0 or down_dev <= 0.0:
+            return None
+        try:
+            return up_dev / down_dev
+        except (TypeError, ValueError):
+            return None
+
+    def _funding_gate_ok(self, fr_8h_pct: Optional[float]) -> bool:
+        if not self.funding_filter_enabled:
+            return True
+        if fr_8h_pct is None:
+            return True
+        return bool(abs(fr_8h_pct) <= float(self.funding_filter_pct))
+
+    def _hvp_stats(self, close_series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
+        if close_series is None or close_series.empty:
+            return None, None
+        returns = close_series.pct_change().abs()
+        hvp_window = max(int(self.hvp_lookback_bars), 1)
+        hvp_indicator = returns.rolling(window=hvp_window, min_periods=1).std()
+        if hvp_indicator.empty:
+            return None, None
+        current = self._safe_float(hvp_indicator.iloc[-1])
+        sma_window = max(int(self.hvp_sma_bars), 1)
+        if len(hvp_indicator) >= sma_window:
+            sma = self._safe_float(hvp_indicator.iloc[-sma_window :].mean())
+        else:
+            sma = self._safe_float(hvp_indicator.mean())
+        return current, sma
 
     @staticmethod
     def _box_signature(lo: float, hi: float, lookback: int, pad: float) -> str:
@@ -602,6 +913,64 @@ class GridBrainV1Core(IStrategy):
         if session_conflict:
             reasons.append(BlockReason.BLOCK_BOX_STRADDLE_SESSION_FVG_AVG)
         return reasons
+
+    def _box_straddles_cached_breakout(
+        self, pair: str, box_low: float, box_high: float, step_price: float
+    ) -> bool:
+        if step_price <= 0 or box_low is None or box_high is None:
+            return False
+        bars_since = self._breakout_bars_since_by_pair.get(pair)
+        if bars_since is None or int(bars_since) > int(self.breakout_block_bars):
+            return False
+        breakout = self._breakout_levels_by_pair.get(pair)
+        if not breakout:
+            return False
+        return self._is_level_near_box(
+            breakout.get("up"),
+            box_low,
+            box_high,
+            step_price,
+            self.breakout_straddle_step_buffer_frac,
+        ) or self._is_level_near_box(
+            breakout.get("dn"),
+            box_low,
+            box_high,
+            step_price,
+            self.breakout_straddle_step_buffer_frac,
+        )
+
+    def _box_straddles_level(
+        self,
+        pair: str,
+        level: Optional[float],
+        box_low: float,
+        box_high: float,
+        step_price: float,
+        buffer_frac: float,
+    ) -> bool:
+        if level is None:
+            return False
+        return self._is_level_near_box(level, box_low, box_high, step_price, buffer_frac)
+
+    def _box_level_straddle_reasons(
+        self,
+        pair: str,
+        box_low: float,
+        box_high: float,
+        step_price: float,
+        levels: List[Tuple[Optional[float], BlockReason]],
+    ) -> List[BlockReason]:
+        if box_low is None or box_high is None or step_price <= 0 or not levels:
+            return []
+        reasons: List[BlockReason] = []
+        for level, reason in levels:
+            if self._box_straddles_level(pair, level, box_low, box_high, step_price, self.breakout_straddle_step_buffer_frac):
+                reasons.append(reason)
+        return reasons
+
+    @staticmethod
+    def _squeeze_release_block_reason(release: bool) -> Optional[BlockReason]:
+        return BlockReason.BLOCK_SQUEEZE_RELEASE_AGAINST_BIAS if release else None
 
     def _append_reason(self, reasons: List[BlockReason], reason: BlockReason) -> None:
         if reason not in reasons:
@@ -669,17 +1038,26 @@ class GridBrainV1Core(IStrategy):
         return float(np.percentile(window, percentile))
 
     def _poc_acceptance_status(
-        self, pair: str, df: DataFrame, poc: Optional[float]
+        self, pair: str, df: DataFrame, pocs: Optional[Iterable[float]]
     ) -> bool:
         if not self.poc_acceptance_enabled:
             return True
         if bool(self._poc_acceptance_crossed_by_pair.get(pair, False)):
             return True
-        if poc is None or df is None or df.empty:
+        if df is None or df.empty:
             return False
-        if self._poc_cross_detected(df, poc, self.poc_acceptance_lookback_bars):
-            self._poc_acceptance_crossed_by_pair[pair] = True
-            return True
+        candidates: List[float] = []
+        if isinstance(pocs, (int, float)):
+            candidates.append(float(pocs))
+        elif pocs:
+            for candidate in pocs:
+                if candidate is None:
+                    continue
+                candidates.append(float(candidate))
+        for candidate in candidates:
+            if self._poc_cross_detected(df, candidate, self.poc_acceptance_lookback_bars):
+                self._poc_acceptance_crossed_by_pair[pair] = True
+                return True
         return False
 
     @staticmethod
@@ -695,6 +1073,137 @@ class GridBrainV1Core(IStrategy):
         if volatility is None or volatility <= 0:
             return None
         return float(change) / float(volatility)
+
+    def _detect_structural_breakout(
+        self,
+        dataframe: DataFrame,
+        lookback: int,
+    ) -> Tuple[bool, Optional[str], Optional[float], Optional[float]]:
+        if len(dataframe) <= lookback + 1:
+            return False, None, None, None
+        region = dataframe.iloc[-(lookback + 1):-1]
+        hi_max = self._safe_float(region["high"].max())
+        lo_min = self._safe_float(region["low"].min())
+        close_now = self._safe_float(dataframe["close"].iloc[-1])
+        if hi_max is None or lo_min is None or close_now is None:
+            return False, None, hi_max, lo_min
+        bull_break = bool(close_now > hi_max)
+        bear_break = bool(close_now < lo_min)
+        if bull_break:
+            return True, "bull", hi_max, lo_min
+        if bear_break:
+            return True, "bear", hi_max, lo_min
+        return False, None, hi_max, lo_min
+
+    @staticmethod
+    def _bbw_nonexpanding(series: Optional[pd.Series], lookback: int, tolerance_frac: float) -> bool:
+        if series is None:
+            return False
+        bars = max(int(lookback), 1)
+        vals = pd.to_numeric(series, errors="coerce").dropna().astype(float)
+        if len(vals) < (bars + 1):
+            return False
+        window = vals.iloc[-(bars + 1) :].to_numpy(dtype=float)
+        tol = max(float(tolerance_frac), 0.0)
+        for i in range(1, len(window)):
+            prev = float(window[i - 1])
+            cur = float(window[i])
+            # Require no meaningful bar-over-bar expansion.
+            if cur > (prev * (1.0 + tol)):
+                return False
+        return True
+
+    def _update_breakout_fresh_state(
+        self,
+        pair: str,
+        breakout_now: bool,
+        breakout_hi: Optional[float],
+        breakout_lo: Optional[float],
+        close: float,
+    ) -> Tuple[bool, float, float]:
+        if breakout_now:
+            up = breakout_hi if breakout_hi is not None else close
+            dn = breakout_lo if breakout_lo is not None else close
+            self._breakout_levels_by_pair[pair] = {"up": float(up), "dn": float(dn)}
+            self._breakout_bars_since_by_pair[pair] = 0
+        elif pair in self._breakout_bars_since_by_pair:
+            self._breakout_bars_since_by_pair[pair] = int(self._breakout_bars_since_by_pair[pair]) + 1
+
+        breakout_levels = self._breakout_levels_by_pair.get(pair, {})
+        up_level = self._safe_float(breakout_levels.get("up"))
+        dn_level = self._safe_float(breakout_levels.get("dn"))
+        bars_since = self._breakout_bars_since_by_pair.get(pair)
+        fresh_active = bars_since is not None and int(bars_since) <= int(self.breakout_block_bars)
+        reclaim_override = False
+        if (
+            fresh_active
+            and self.breakout_override_allowed
+            and up_level is not None
+            and dn_level is not None
+            and dn_level <= close <= up_level
+        ):
+            reclaim_override = True
+        fresh_block_active = bool(fresh_active and not reclaim_override)
+        return fresh_block_active, up_level if up_level is not None else close, dn_level if dn_level is not None else close
+
+    def _phase2_gate_failures_from_flags(
+        self,
+        adx_ok: bool,
+        bbw_nonexp: bool,
+        ema_dist_ok: bool,
+        vol_ok: bool,
+        inside_7d: bool,
+    ) -> List[BlockReason]:
+        reasons: List[BlockReason] = []
+        if not adx_ok:
+            reasons.append(BlockReason.BLOCK_ADX_HIGH)
+        if not bbw_nonexp:
+            reasons.append(BlockReason.BLOCK_BBW_EXPANDING)
+        if not ema_dist_ok:
+            reasons.append(BlockReason.BLOCK_EMA_DIST)
+        if not vol_ok:
+            reasons.append(BlockReason.BLOCK_RVOL_SPIKE)
+        if not inside_7d:
+            reasons.append(BlockReason.BLOCK_7D_EXTREME_CONTEXT)
+        return reasons
+
+    def _planner_health_state(self, data_quality_ok: bool, reasons: List[BlockReason]) -> str:
+        if data_quality_ok:
+            return "ok"
+        reason_set = {str(r) for r in reasons}
+        if (
+            self.planner_health_quarantine_on_gap
+            and str(BlockReason.BLOCK_DATA_GAP) in reason_set
+        ):
+            return "quarantine"
+        if (
+            self.planner_health_quarantine_on_misalign
+            and str(BlockReason.BLOCK_DATA_MISALIGN) in reason_set
+        ):
+            return "quarantine"
+        return "degraded"
+
+    @staticmethod
+    def _start_stability_state(
+        gate_checks: List[Tuple[str, bool]],
+        min_score: float,
+        k_fraction: float,
+    ) -> Dict[str, float]:
+        total = max(int(len(gate_checks)), 1)
+        passed = int(sum(1 for _, ok in gate_checks if ok))
+        score = float(passed / total)
+        frac = float(np.clip(k_fraction, 0.0, 1.0))
+        k_required = int(math.ceil(total * frac))
+        min_required = float(np.clip(min_score, 0.0, 1.0))
+        ok = bool(score >= min_required and passed >= k_required)
+        return {
+            "score": score,
+            "passed": passed,
+            "total": total,
+            "k_required": k_required,
+            "min_score": min_required,
+            "ok": ok,
+        }
 
     def _atomic_write_file(self, path: str, payload: str) -> None:
         tmp_path = f"{path}.tmp"
@@ -926,7 +1435,7 @@ class GridBrainV1Core(IStrategy):
         exit_min: float,
         rising_bars_required: int,
     ) -> bool:
-        adx = self._safe_float(adx_value)
+        adx = GridBrainV1Core._safe_float(adx_value)
         if adx is None:
             return False
         rb = int(max(int(rising_bars_required), 1))
@@ -942,9 +1451,9 @@ class GridBrainV1Core(IStrategy):
         rising_bars_required: int,
         early_margin: float = 2.0,
     ) -> bool:
-        adx = self._safe_float(adx_value)
-        plus_di = self._safe_float(plus_di_value)
-        minus_di = self._safe_float(minus_di_value)
+        adx = GridBrainV1Core._safe_float(adx_value)
+        plus_di = GridBrainV1Core._safe_float(plus_di_value)
+        minus_di = GridBrainV1Core._safe_float(minus_di_value)
         if adx is None or plus_di is None or minus_di is None:
             return False
         if not bool(minus_di > plus_di):
@@ -962,8 +1471,12 @@ class GridBrainV1Core(IStrategy):
             "profile": profile,
             "adx_4h_max": float(self.adx_4h_max),
             "bbw_1h_pct_max": float(self.bbw_1h_pct_max),
+            "bbw_nonexp_lookback_bars": int(self.bbw_nonexp_lookback_bars),
+            "bbw_nonexp_tolerance_frac": float(self.bbw_nonexp_tolerance_frac),
             "ema_dist_max_frac": float(self.ema_dist_max_frac),
             "vol_spike_mult": float(self.vol_spike_mult),
+            "rvol_15m_max": float(self.rvol_15m_max),
+            "context_7d_hard_veto": bool(self.context_7d_hard_veto),
             "bbwp_s_max": float(self.bbwp_s_max),
             "bbwp_m_max": float(self.bbwp_m_max),
             "bbwp_l_max": float(self.bbwp_l_max),
@@ -979,8 +1492,10 @@ class GridBrainV1Core(IStrategy):
         if profile == "balanced":
             cfg["adx_4h_max"] = max(cfg["adx_4h_max"], 25.0)
             cfg["bbw_1h_pct_max"] = max(cfg["bbw_1h_pct_max"], 60.0)
+            cfg["bbw_nonexp_tolerance_frac"] = max(cfg["bbw_nonexp_tolerance_frac"], 0.015)
             cfg["ema_dist_max_frac"] = max(cfg["ema_dist_max_frac"], 0.009)
             cfg["vol_spike_mult"] = max(cfg["vol_spike_mult"], 3.0)
+            cfg["rvol_15m_max"] = max(cfg["rvol_15m_max"], 1.5)
             cfg["bbwp_s_max"] = max(cfg["bbwp_s_max"], 45.0)
             cfg["bbwp_m_max"] = max(cfg["bbwp_m_max"], 60.0)
             cfg["bbwp_l_max"] = max(cfg["bbwp_l_max"], 70.0)
@@ -989,8 +1504,10 @@ class GridBrainV1Core(IStrategy):
         elif profile == "aggressive":
             cfg["adx_4h_max"] = max(cfg["adx_4h_max"], 30.0)
             cfg["bbw_1h_pct_max"] = max(cfg["bbw_1h_pct_max"], 70.0)
+            cfg["bbw_nonexp_tolerance_frac"] = max(cfg["bbw_nonexp_tolerance_frac"], 0.02)
             cfg["ema_dist_max_frac"] = max(cfg["ema_dist_max_frac"], 0.015)
             cfg["vol_spike_mult"] = max(cfg["vol_spike_mult"], 4.0)
+            cfg["rvol_15m_max"] = max(cfg["rvol_15m_max"], 1.8)
             cfg["bbwp_s_max"] = max(cfg["bbwp_s_max"], 60.0)
             cfg["bbwp_m_max"] = max(cfg["bbwp_m_max"], 75.0)
             cfg["bbwp_l_max"] = max(cfg["bbwp_l_max"], 85.0)
@@ -1114,6 +1631,10 @@ class GridBrainV1Core(IStrategy):
                 normalized["os_dev_persist_bars"] = int(round(float(normalized["os_dev_persist_bars"])))
             if "adx_rising_bars" in normalized:
                 normalized["adx_rising_bars"] = int(round(float(normalized["adx_rising_bars"])))
+            if "bbw_nonexp_lookback_bars" in normalized:
+                normalized["bbw_nonexp_lookback_bars"] = int(
+                    round(float(normalized["bbw_nonexp_lookback_bars"]))
+                )
             if "router_eligible" not in normalized:
                 normalized["router_eligible"] = True
 
@@ -1136,8 +1657,11 @@ class GridBrainV1Core(IStrategy):
                     "adx_exit_max": 30.0,
                     "adx_rising_bars": 3,
                     "bbw_1h_pct_max": 30.0,
+                    "bbw_nonexp_lookback_bars": 3,
+                    "bbw_nonexp_tolerance_frac": 0.01,
                     "ema_dist_max_frac": 0.005,
                     "vol_spike_mult": 1.2,
+                    "rvol_15m_max": 1.2,
                     "bbwp_s_enter_low": 15.0,
                     "bbwp_s_enter_high": 45.0,
                     "bbwp_m_enter_low": 10.0,
@@ -1161,8 +1685,11 @@ class GridBrainV1Core(IStrategy):
                     "adx_exit_max": 35.0,
                     "adx_rising_bars": 2,
                     "bbw_1h_pct_max": 40.0,
+                    "bbw_nonexp_lookback_bars": 3,
+                    "bbw_nonexp_tolerance_frac": 0.015,
                     "ema_dist_max_frac": 0.010,
                     "vol_spike_mult": 1.5,
+                    "rvol_15m_max": 1.8,
                     "bbwp_s_enter_low": 10.0,
                     "bbwp_s_enter_high": 65.0,
                     "bbwp_m_enter_low": 10.0,
@@ -1194,8 +1721,11 @@ class GridBrainV1Core(IStrategy):
             "adx_exit_max": float(self.intraday_adx_exit_min),
             "adx_rising_bars": int(self.intraday_adx_rising_bars),
             "bbw_1h_pct_max": float(self.intraday_bbw_1h_pct_max),
+            "bbw_nonexp_lookback_bars": int(self.intraday_bbw_nonexp_lookback_bars),
+            "bbw_nonexp_tolerance_frac": float(self.intraday_bbw_nonexp_tolerance_frac),
             "ema_dist_max_frac": float(self.intraday_ema_dist_max_frac),
             "vol_spike_mult": float(self.intraday_vol_spike_mult),
+            "rvol_15m_max": float(self.intraday_rvol_15m_max),
             "bbwp_s_enter_low": float(self.intraday_bbwp_s_enter_low),
             "bbwp_s_enter_high": float(self.intraday_bbwp_s_enter_high),
             "bbwp_m_enter_low": float(self.intraday_bbwp_m_enter_low),
@@ -1223,8 +1753,11 @@ class GridBrainV1Core(IStrategy):
                 "adx_exit_max": float(self.swing_adx_exit_min),
                 "adx_rising_bars": int(self.swing_adx_rising_bars),
                 "bbw_1h_pct_max": float(self.swing_bbw_1h_pct_max),
+                "bbw_nonexp_lookback_bars": int(self.swing_bbw_nonexp_lookback_bars),
+                "bbw_nonexp_tolerance_frac": float(self.swing_bbw_nonexp_tolerance_frac),
                 "ema_dist_max_frac": float(self.swing_ema_dist_max_frac),
                 "vol_spike_mult": float(self.swing_vol_spike_mult),
+                "rvol_15m_max": float(self.swing_rvol_15m_max),
                 "bbwp_s_enter_low": float(self.swing_bbwp_s_enter_low),
                 "bbwp_s_enter_high": float(self.swing_bbwp_s_enter_high),
                 "bbwp_m_enter_low": float(self.swing_bbwp_m_enter_low),
@@ -1273,7 +1806,7 @@ class GridBrainV1Core(IStrategy):
             "bbwp_m_ok": None if bbwp_m is None else bool(float(cfg["bbwp_m_enter_low"]) <= bbwp_m <= float(cfg["bbwp_m_enter_high"])),
             "bbwp_l_ok": None if bbwp_l is None else bool(float(cfg["bbwp_l_enter_low"]) <= bbwp_l <= float(cfg["bbwp_l_enter_high"])),
             "atr_pct_ok": None if atr_pct is None else bool(atr_pct <= float(cfg["atr_pct_max"])),
-            "rvol_15m_ok": None if rvol_15m is None else bool(rvol_15m <= float(cfg["os_dev_rvol_max"])),
+            "rvol_15m_ok": None if rvol_15m is None else bool(rvol_15m <= float(cfg.get("rvol_15m_max", cfg["os_dev_rvol_max"]))),
         }
         known = [v for v in checks.values() if v is not None]
         passed = int(sum(1 for v in known if bool(v)))
@@ -1640,6 +2173,8 @@ class GridBrainV1Core(IStrategy):
             self._history_emit_end_ts_by_pair,
             self._neutral_box_break_bars_by_pair,
             self._plan_guard_decision_count_by_pair,
+            self._breakout_bars_since_by_pair,
+            self._breakout_levels_by_pair,
         ]
         for store in stores:
             store.pop(pair, None)
@@ -1765,6 +2300,116 @@ class GridBrainV1Core(IStrategy):
             used = self.box_lookback_12h_bars
 
         return lo_p, hi_p, w, used, pad
+
+    @staticmethod
+    def _latest_daily_vwap(df: DataFrame) -> Optional[float]:
+        if "date" not in df.columns or "volume" not in df.columns:
+            return None
+        dates = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        if dates.isnull().all():
+            return None
+        latest_day = dates.dropna().iloc[-1].floor("D")
+        if pd.isna(latest_day):
+            return None
+        mask = dates.dt.floor("D") == latest_day
+        subset = df.loc[mask]
+        if subset.empty:
+            return None
+        vols = pd.to_numeric(subset["volume"], errors="coerce").fillna(0.0)
+        tp = (subset.get("high") + subset.get("low") + subset.get("close")) / 3.0
+        tp = pd.to_numeric(tp, errors="coerce").fillna(0.0)
+        denom = float(vols.sum())
+        if denom <= 0:
+            return None
+        return float((tp * vols).sum() / denom)
+
+    @staticmethod
+    def _is_level_near_box(
+        level: Optional[float],
+        box_low: float,
+        box_high: float,
+        step_price: float,
+        buffer_frac: float,
+    ) -> bool:
+        if level is None or step_price <= 0.0:
+            return False
+        buffer = max(float(buffer_frac) * float(step_price), 0.0)
+        if not (box_low - buffer <= float(level) <= box_high + buffer):
+            return False
+        level_val = float(level)
+        dist_lo = level_val - box_low
+        dist_hi = box_high - level_val
+        min_dist = min(
+            dist_lo if dist_lo >= 0 else float("inf"),
+            dist_hi if dist_hi >= 0 else float("inf"),
+        )
+        return bool(min_dist < float(step_price))
+
+    def _update_box_quality(
+        self,
+        pair: str,
+        lo_p: float,
+        hi_p: float,
+        pad: float,
+        lookback: int,
+        dataframe: DataFrame,
+    ) -> Dict[str, object]:
+        mid = (hi_p + lo_p) / 2.0 if (hi_p + lo_p) else 0.0
+        width_pct = (hi_p - lo_p) / mid if mid > 0 else 0.0
+        pad_pct = (pad / mid) if (mid > 0) else 0.0
+        quartile_span = hi_p - lo_p
+        q1 = lo_p + 0.25 * quartile_span
+        q2 = lo_p + 0.50 * quartile_span
+        q3 = lo_p + 0.75 * quartile_span
+        ext_factor = 1.386
+        ext_lo = lo_p - 0.5 * (ext_factor - 1.0) * quartile_span
+        ext_hi = hi_p + 0.5 * (ext_factor - 1.0) * quartile_span
+        diagnostics = {
+            "lookback_bars": int(lookback),
+            "width_pct": float(width_pct),
+            "pad": float(pad),
+            "pad_pct": float(pad_pct),
+            "q1": float(q1),
+            "q2": float(q2),
+            "q3": float(q3),
+            "extension_lo": float(ext_lo),
+            "extension_hi": float(ext_hi),
+        }
+        self._box_quality_by_pair[pair] = diagnostics
+        return diagnostics
+
+    @staticmethod
+    def _box_overlap_fraction(
+        lo_a: float, hi_a: float, lo_b: float, hi_b: float
+    ) -> float:
+        if hi_a <= lo_a or hi_b <= lo_b:
+            return 0.0
+        overlap_lo = max(lo_a, lo_b)
+        overlap_hi = min(hi_a, hi_b)
+        if overlap_hi <= overlap_lo:
+            return 0.0
+        overlap = overlap_hi - overlap_lo
+        width = min(hi_a - lo_a, hi_b - lo_b)
+        if width <= 0:
+            return 0.0
+        return float(overlap / width)
+
+    def _box_overlap_prune(self, pair: str, lo_p: float, hi_p: float) -> bool:
+        history = self._box_history_by_pair.get(pair)
+        if not history:
+            return False
+        threshold = float(self.box_overlap_prune_threshold)
+        for stored_lo, stored_hi in history:
+            if self._box_overlap_fraction(lo_p, hi_p, stored_lo, stored_hi) >= threshold:
+                return True
+        return False
+
+    def _record_box_history(self, pair: str, lo_p: float, hi_p: float) -> None:
+        hist = self._box_history_by_pair.get(pair)
+        if hist is None:
+            hist = deque(maxlen=max(1, int(self.box_overlap_history)))
+            self._box_history_by_pair[pair] = hist
+        hist.append((float(lo_p), float(hi_p)))
 
     @staticmethod
     def _bbw_percentile_ok(pct: Optional[float], max_pct: float) -> bool:
@@ -2922,6 +3567,8 @@ class GridBrainV1Core(IStrategy):
         out["session_pause_active"] = bool(session_pause_active)
         out["session_inside_block"] = bool(session_inside_block)
         out["session_gate_ok"] = bool(session_gate_ok)
+        out["session_high"] = float(max(z["high"] for z in session_zones)) if session_zones else None
+        out["session_low"] = float(min(z["low"] for z in session_zones)) if session_zones else None
 
         imfvg_bull = [float(z["mid"]) for z in bull if z["mitigated"]]
         imfvg_bear = [float(z["mid"]) for z in bear if z["mitigated"]]
@@ -2930,6 +3577,7 @@ class GridBrainV1Core(IStrategy):
         out["imfvg_avg_bull"] = float(np.mean(imfvg_bull)) if len(imfvg_bull) else None
         out["imfvg_avg_bear"] = float(np.mean(imfvg_bear)) if len(imfvg_bear) else None
         out["session_fvg_avg"] = float(np.mean(sess_mid)) if len(sess_mid) else None
+        out["session_vwap"] = float(np.mean(sess_mid)) if len(sess_mid) else None
 
         up_edges = [float(z["high"]) for z in bull]
         dn_edges = [float(z["low"]) for z in bear]
@@ -2946,26 +3594,296 @@ class GridBrainV1Core(IStrategy):
         )
         return out
 
-    def _grid_sizing(self, lo_p: float, hi_p: float) -> Tuple[int, float, float, float]:
+    def _capacity_hint_state(self, pair: str) -> Dict[str, object]:
+        out = {
+            "available": False,
+            "allow_start": True,
+            "reason": None,
+            "preferred_rung_cap": None,
+            "max_concurrent_rebuilds": None,
+            "advisory_only": bool(not self.capacity_hint_hard_block),
+        }
+        path = str(self.capacity_hint_path or "").strip()
+        if not path:
+            return out
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return out
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            raw = payload.get(pair) if isinstance(payload, dict) and pair in payload else payload
+            if not isinstance(raw, dict):
+                return out
+            out["available"] = True
+            out["allow_start"] = bool(raw.get("allow_start", True))
+            out["reason"] = raw.get("reason")
+            out["preferred_rung_cap"] = raw.get("preferred_rung_cap")
+            out["max_concurrent_rebuilds"] = raw.get("max_concurrent_rebuilds")
+            out["advisory_only"] = bool(raw.get("advisory_only", not self.capacity_hint_hard_block))
+            return out
+        except Exception:
+            return out
+
+    def _empirical_cost_sample(
+        self,
+        pair: str,
+        last_row: pd.Series,
+        close: float,
+    ) -> Dict[str, Optional[float]]:
+        spread_direct = self._safe_float(last_row.get("spread_pct"))
+        if spread_direct is None and close > 0:
+            hi = self._safe_float(last_row.get("high"))
+            lo = self._safe_float(last_row.get("low"))
+            if hi is not None and lo is not None and hi >= lo:
+                spread_direct = float(((hi - lo) / close) * float(self.empirical_spread_proxy_scale))
+
+        open_px = self._safe_float(last_row.get("open"))
+        adverse_pct = None
+        if open_px is not None and close > 0:
+            adverse_pct = float((abs(close - open_px) / close) * float(self.empirical_adverse_selection_scale))
+
+        retry_reject_rate = self._safe_float(last_row.get("post_only_retry_reject_rate"))
+        missed_fill_rate = self._safe_float(last_row.get("missed_fill_rate"))
+        recommended_floor_pct = self._safe_float(last_row.get("recommended_cost_floor_pct"))
+        return {
+            "spread_pct": spread_direct,
+            "adverse_selection_pct": adverse_pct,
+            "retry_reject_rate": retry_reject_rate,
+            "missed_fill_rate": missed_fill_rate,
+            "recommended_floor_pct": recommended_floor_pct,
+        }
+
+    def _effective_cost_floor(
+        self,
+        pair: str,
+        last_row: pd.Series,
+        close: float,
+    ) -> Dict[str, object]:
+        target_net = float(max(float(self.target_net_step_pct), 0.0040))
+        static_floor = float(target_net + max(float(self.est_fee_pct), 0.0) + max(float(self.est_spread_pct), 0.0))
+        static_floor = float(max(static_floor, float(self.majors_gross_step_floor_pct), float(self.empirical_cost_floor_min_pct)))
+
+        warning_codes: List[str] = []
+        empirical_snapshot: Dict[str, object] = {
+            "enabled": bool(self.empirical_cost_enabled),
+            "sample_count": 0,
+            "stale": True,
+            "spread_pct_percentile": None,
+            "adverse_selection_pct_percentile": None,
+            "retry_reject_rate_percentile": None,
+            "missed_fill_rate_percentile": None,
+            "retry_penalty_pct_percentile": None,
+            "missed_fill_penalty_pct_percentile": None,
+            "total_cost_pct_percentile": None,
+            "recommended_floor_pct_percentile": None,
+            "empirical_floor_pct": None,
+        }
+        empirical_sample: Dict[str, Optional[float]] = {}
+
+        if self.empirical_cost_enabled:
+            if not hasattr(self, "_empirical_cost_calibrator") or self._empirical_cost_calibrator is None:
+                self._empirical_cost_calibrator = EmpiricalCostCalibrator(self.empirical_cost_window)
+            empirical_sample = self._empirical_cost_sample(pair, last_row, close)
+            observed = self._empirical_cost_calibrator.observe(
+                pair,
+                spread_pct=empirical_sample.get("spread_pct"),
+                adverse_selection_pct=empirical_sample.get("adverse_selection_pct"),
+                retry_reject_rate=empirical_sample.get("retry_reject_rate"),
+                missed_fill_rate=empirical_sample.get("missed_fill_rate"),
+                retry_penalty_pct=float(self.empirical_retry_penalty_pct),
+                missed_fill_penalty_pct=float(self.empirical_missed_fill_penalty_pct),
+                recommended_floor_pct=empirical_sample.get("recommended_floor_pct"),
+            )
+            empirical_snapshot.update(
+                {
+                    "last_sample_spread_pct": observed.get("spread_pct"),
+                    "last_sample_adverse_selection_pct": observed.get("adverse_selection_pct"),
+                    "last_sample_retry_reject_rate": observed.get("retry_reject_rate"),
+                    "last_sample_missed_fill_rate": observed.get("missed_fill_rate"),
+                    "last_sample_total_cost_pct": observed.get("total_pct"),
+                }
+            )
+
+            snapshot = self._empirical_cost_calibrator.snapshot(
+                pair,
+                percentile=float(self.empirical_cost_percentile),
+                min_samples=int(self.empirical_cost_min_samples),
+                stale_bars=int(self.empirical_cost_stale_bars),
+            )
+            empirical_snapshot.update(snapshot)
+            if bool(empirical_snapshot.get("stale", True)):
+                warning_codes.append(str(WarningCode.WARN_COST_MODEL_STALE))
+
+        empirical_floor = self._safe_float(empirical_snapshot.get("empirical_floor_pct"))
+        chosen_floor = float(static_floor)
+        source = "static"
+        if empirical_floor is not None:
+            chosen_floor = float(max(static_floor, empirical_floor))
+            if empirical_floor > static_floor:
+                source = "empirical"
+
+        return {
+            "target_net_step_pct": float(target_net),
+            "static_floor_pct": float(static_floor),
+            "chosen_floor_pct": float(chosen_floor),
+            "source": str(source),
+            "empirical_snapshot": empirical_snapshot,
+            "empirical_sample": empirical_sample,
+            "warning_codes": warning_codes,
+        }
+
+    def _n_level_bounds(
+        self,
+        active_mode: str,
+        atr_mode_pct: Optional[float],
+        atr_mode_max: float,
+    ) -> Tuple[int, int, Dict[str, object]]:
+        n_low = max(int(self.n_min), 1)
+        n_high = max(int(self.n_max), n_low)
+        diag = {
+            "mode": str(active_mode),
+            "adapter_enabled": bool(self.n_volatility_adapter_enabled),
+            "volatility_ratio": None,
+            "adjustment": 0,
+        }
+        if not self.n_volatility_adapter_enabled:
+            return n_low, n_high, diag
+        if atr_mode_pct is None or atr_mode_max <= 0:
+            return n_low, n_high, diag
+
+        ratio = float(max(atr_mode_pct, 0.0) / atr_mode_max)
+        adjustment = int(np.floor(max(ratio - 1.0, 0.0) * float(self.n_volatility_adapter_strength) * 2.0))
+        if adjustment > 0:
+            n_high = max(n_low, n_high - adjustment)
+        diag["volatility_ratio"] = float(ratio)
+        diag["adjustment"] = int(adjustment)
+        return n_low, n_high, diag
+
+    def _grid_sizing(
+        self,
+        lo_p: float,
+        hi_p: float,
+        *,
+        min_step_pct_required: float,
+        n_low: int,
+        n_high: int,
+    ) -> Dict[str, object]:
         """
-        Choose N in [6..12] so step >= gross_step_min
-        gross_step_min = net + fee + spread
-        Returns: (n_levels, step_price, step_pct_actual, gross_step_min_pct)
+        Section 13.1 + 13.3 sizing:
+        - derive candidate N from width and target step
+        - clamp by mode bounds
+        - reduce N until cost floor passes or bounds are exhausted
         """
         mid = (hi_p + lo_p) / 2.0
-        width_pct = (hi_p - lo_p) / mid if mid > 0 else 0.0
+        width = max(float(hi_p - lo_p), 0.0)
+        width_pct = (width / mid) if mid > 0 else 0.0
 
-        gross_min = self.target_net_step_pct + self.est_fee_pct + self.est_spread_pct
+        required = float(max(min_step_pct_required, 0.0))
+        candidate_n = int(np.floor(width_pct / required)) if required > 0 else int(n_high)
+        candidate_n = max(candidate_n, 1)
+        clamped_n = int(np.clip(candidate_n, int(max(n_low, 1)), int(max(n_high, n_low))))
 
-        if gross_min <= 0:
-            n = self.n_min
-        else:
-            n_cap = int(np.floor(width_pct / gross_min))
-            n = int(np.clip(n_cap, self.n_min, self.n_max))
+        attempts: List[Dict[str, object]] = []
+        selected_n = clamped_n
+        step_pct_actual = 0.0
+        step_price = 0.0
+        cost_ok = False
+        for n_try in range(clamped_n, int(max(n_low, 1)) - 1, -1):
+            step_price_try = (width / float(n_try)) if n_try > 0 else 0.0
+            step_pct_try = (step_price_try / mid) if mid > 0 else 0.0
+            ok = bool(step_pct_try >= required)
+            attempts.append(
+                {
+                    "n": int(n_try),
+                    "step_price": float(step_price_try),
+                    "step_pct_actual": float(step_pct_try),
+                    "cost_ok": bool(ok),
+                }
+            )
+            selected_n = int(n_try)
+            step_pct_actual = float(step_pct_try)
+            step_price = float(step_price_try)
+            cost_ok = bool(ok)
+            if ok:
+                break
 
-        step_price = (hi_p - lo_p) / float(n) if n > 0 else 0.0
-        step_pct_actual = (step_price / mid) if mid > 0 else 0.0
-        return n, step_price, step_pct_actual, gross_min
+        return {
+            "n_levels": int(selected_n),
+            "step_price": float(step_price),
+            "step_pct_actual": float(step_pct_actual),
+            "width_pct": float(width_pct),
+            "min_step_pct_required": float(required),
+            "candidate_n": int(candidate_n),
+            "clamped_n": int(clamped_n),
+            "cost_ok": bool(cost_ok),
+            "attempts": attempts,
+        }
+
+    @staticmethod
+    def _nearest_above(close: float, values: Iterable[Optional[float]]) -> Optional[float]:
+        candidates: List[float] = []
+        for raw in values:
+            if raw is None:
+                continue
+            value = float(raw)
+            if not np.isfinite(value):
+                continue
+            if value > close:
+                candidates.append(value)
+        if not candidates:
+            return None
+        return float(min(candidates))
+
+    def _select_tp_price(
+        self,
+        close: float,
+        base_tp: float,
+        candidates: Dict[str, Optional[float]],
+    ) -> Tuple[float, Dict[str, object]]:
+        nearest_value = self._nearest_above(close, candidates.values())
+        selected = float(base_tp)
+        selected_source = "base_tp"
+        if nearest_value is not None and nearest_value < selected:
+            selected = float(nearest_value)
+            for key, value in candidates.items():
+                if value is not None and float(value) == selected:
+                    selected_source = str(key)
+                    break
+        return selected, {"source": selected_source, "nearest_conservative": selected}
+
+    def _select_sl_price(
+        self,
+        *,
+        sl_base: float,
+        step_price: float,
+        lvn_levels: List[float],
+        fvg_state: Dict[str, object],
+    ) -> Tuple[float, Dict[str, object]]:
+        reasons: List[str] = ["base_sl"]
+        candidates = [float(sl_base)]
+        if step_price > 0 and lvn_levels:
+            lvn_buf = float(max(self.sl_lvn_avoid_steps, 0.0) * step_price)
+            near_lvn = any(abs(float(lvl) - float(sl_base)) <= lvn_buf for lvl in lvn_levels)
+            if near_lvn:
+                candidates.append(float(sl_base - lvn_buf))
+                reasons.append("avoid_lvn_void")
+        near_bull = fvg_state.get("nearest_bullish") if isinstance(fvg_state, dict) else None
+        if isinstance(near_bull, dict):
+            zl = self._safe_float(near_bull.get("low"))
+            zh = self._safe_float(near_bull.get("high"))
+            if zl is not None and zh is not None and zl < zh and zl < sl_base < zh:
+                fvg_buf = float(max(self.sl_fvg_buffer_steps, 0.0) * step_price)
+                candidates.append(float(zl - fvg_buf))
+                reasons.append("avoid_fvg_gap")
+        selected = float(min(candidates))
+        return selected, {"source": ",".join(reasons), "constraints": reasons}
+
+    def _infer_tick_size(self, step_price: float) -> float:
+        inferred = float(max(step_price * float(self.tick_size_step_frac), float(self.tick_size_floor)))
+        if inferred <= 0:
+            return float(self.tick_size_floor)
+        return inferred
 
     def _breakout_flags(self, close: float, lo_p: float, hi_p: float, step: float) -> Dict[str, bool]:
         close_outside_up = close > hi_p
@@ -3005,6 +3923,31 @@ class GridBrainV1Core(IStrategy):
             dataframe,
             window=self.box_lookback_24h_bars,
             min_periods=1,
+        )
+        dataframe["donchian_high_15m"] = dataframe["high"].rolling(
+            window=max(int(self.donchian_lookback_bars), 1),
+            min_periods=1,
+        ).max()
+        dataframe["donchian_low_15m"] = dataframe["low"].rolling(
+            window=max(int(self.donchian_lookback_bars), 1),
+            min_periods=1,
+        ).min()
+        dataframe["donchian_mid_15m"] = (
+            dataframe["donchian_high_15m"] + dataframe["donchian_low_15m"]
+        ) / 2.0
+        basis_raw = (
+            (pd.to_numeric(dataframe["close"], errors="coerce") - pd.to_numeric(dataframe["vwap_15m"], errors="coerce"))
+            / pd.to_numeric(dataframe["vwap_15m"], errors="coerce").replace(0.0, np.nan)
+        )
+        basis_window = max(int(self.basis_band_window), 2)
+        dataframe["basis_15m"] = basis_raw
+        dataframe["basis_mid_15m"] = basis_raw.rolling(window=basis_window, min_periods=1).mean()
+        dataframe["basis_std_15m"] = basis_raw.rolling(window=basis_window, min_periods=1).std().fillna(0.0)
+        dataframe["basis_upper_15m"] = dataframe["basis_mid_15m"] + (
+            float(self.basis_band_stds) * dataframe["basis_std_15m"]
+        )
+        dataframe["basis_lower_15m"] = dataframe["basis_mid_15m"] - (
+            float(self.basis_band_stds) * dataframe["basis_std_15m"]
         )
 
         # 7d extremes on 15m
@@ -3054,6 +3997,8 @@ class GridBrainV1Core(IStrategy):
         data_quality = self._run_data_quality_checks(dataframe, pair)
         data_quality_ok = bool(data_quality.get("ok", True))
         data_quality_reasons = data_quality.get("reasons", [])
+        planner_health_state = self._planner_health_state(data_quality_ok, data_quality_reasons)
+        planner_health_ok = bool(planner_health_state == "ok")
         rsi = self._safe_float(last.get("rsi_15m"))
         vwap = self._safe_float(last.get("vwap_15m"))
         gate_cfg = self._gate_profile_values()
@@ -3063,8 +4008,14 @@ class GridBrainV1Core(IStrategy):
         gate_adx_4h_exit_max = float(gate_adx_4h_exit_min)
         gate_adx_rising_bars = 1
         gate_bbw_1h_pct_max = float(gate_cfg.get("bbw_1h_pct_max", self.bbw_1h_pct_max))
+        gate_bbw_nonexp_lookback_bars = int(gate_cfg.get("bbw_nonexp_lookback_bars", self.bbw_nonexp_lookback_bars))
+        gate_bbw_nonexp_tolerance_frac = float(
+            gate_cfg.get("bbw_nonexp_tolerance_frac", self.bbw_nonexp_tolerance_frac)
+        )
         gate_ema_dist_max_frac = float(gate_cfg.get("ema_dist_max_frac", self.ema_dist_max_frac))
         gate_vol_spike_mult = float(gate_cfg.get("vol_spike_mult", self.vol_spike_mult))
+        gate_rvol_15m_max = float(gate_cfg.get("rvol_15m_max", self.rvol_15m_max))
+        gate_context_7d_hard_veto = bool(gate_cfg.get("context_7d_hard_veto", self.context_7d_hard_veto))
         gate_bbwp_s_enter_low = 0.0
         gate_bbwp_s_enter_high = float(gate_cfg.get("bbwp_s_max", self.bbwp_s_max))
         gate_bbwp_m_enter_low = 0.0
@@ -3127,10 +4078,13 @@ class GridBrainV1Core(IStrategy):
         vol_sma20 = None
         squeeze_on_1h = None
         squeeze_released_1h = False
+        squeeze_val_1h = None
+        squeeze_val_prev_1h = None
 
         bbw1h_col = None
         bbw4h_col = None
         squeeze_col = None
+        squeeze_val_col = None
         for c in dataframe.columns:
             if bbw1h_col is None and (c.endswith("bb_width_1h_1h") or c == "bb_width_1h"):
                 bbw1h_col = c
@@ -3152,6 +4106,8 @@ class GridBrainV1Core(IStrategy):
                 vol_sma20 = self._safe_float(last.get(c))
             if squeeze_col is None and (c.endswith("squeeze_on_1h_1h") or c == "squeeze_on_1h"):
                 squeeze_col = c
+            if squeeze_val_col is None and (c.endswith("squeeze_val_1h_1h") or c == "squeeze_val_1h"):
+                squeeze_val_col = c
 
         if bbw1h_col:
             bbw1h = self._safe_float(last.get(bbw1h_col))
@@ -3165,6 +4121,10 @@ class GridBrainV1Core(IStrategy):
                     sq_prev = self._safe_float(dataframe[squeeze_col].iloc[-2])
                     if sq_prev is not None:
                         squeeze_released_1h = bool(sq_prev >= 0.5 and sq < 0.5)
+        if squeeze_val_col:
+            squeeze_val_1h = self._safe_float(last.get(squeeze_val_col))
+            if len(dataframe) > 1:
+                squeeze_val_prev_1h = self._safe_float(dataframe[squeeze_val_col].iloc[-2])
 
         if "volume_1h_1h" in dataframe.columns:
             vol_1h = self._safe_float(last.get("volume_1h_1h"))
@@ -3247,7 +4207,9 @@ class GridBrainV1Core(IStrategy):
         atr_4h_pct = (atr_4h / close) if (atr_4h is not None and close > 0.0) else None
 
         # BBW gate on 1h (rolling percentile on pair's own history).
-        bbw1h_pct = self._bbwp_percentile_last(dataframe[bbw1h_col], self.bbw_pct_lookback_1h) if bbw1h_col else None
+        bbw1h_series = dataframe[bbw1h_col] if bbw1h_col else None
+        bbw4h_series = dataframe[bbw4h_col] if bbw4h_col else None
+        bbw1h_pct = self._bbwp_percentile_last(bbw1h_series, self.bbw_pct_lookback_1h) if bbw1h_series is not None else None
 
         # EMA distance gate (1h)
         ema_dist_ok = False
@@ -3277,8 +4239,8 @@ class GridBrainV1Core(IStrategy):
 
         # BBWP raw percentiles (S=15m, M=1h, L=4h).
         bbwp_s = self._bbwp_percentile_last(dataframe["bb_width_15m"], self.bbwp_lookback_s)
-        bbwp_m = self._bbwp_percentile_last(dataframe[bbw1h_col], self.bbwp_lookback_m) if bbw1h_col else None
-        bbwp_l = self._bbwp_percentile_last(dataframe[bbw4h_col], self.bbwp_lookback_l) if bbw4h_col else None
+        bbwp_m = self._bbwp_percentile_last(bbw1h_series, self.bbwp_lookback_m) if bbw1h_series is not None else None
+        bbwp_l = self._bbwp_percentile_last(bbw4h_series, self.bbwp_lookback_l) if bbw4h_series is not None else None
         bbwp_cooloff = bool(self._bbwp_cooloff_by_pair.get(pair, False))
 
         # Regime router picks intraday/swing mode from raw features, then activates mode thresholds.
@@ -3320,8 +4282,15 @@ class GridBrainV1Core(IStrategy):
         gate_adx_4h_exit_max = float(mode_cfg.get("adx_exit_max", gate_adx_4h_exit_min))
         gate_adx_rising_bars = int(mode_cfg.get("adx_rising_bars", gate_adx_rising_bars))
         gate_bbw_1h_pct_max = float(mode_cfg.get("bbw_1h_pct_max", gate_bbw_1h_pct_max))
+        gate_bbw_nonexp_lookback_bars = int(
+            mode_cfg.get("bbw_nonexp_lookback_bars", gate_bbw_nonexp_lookback_bars)
+        )
+        gate_bbw_nonexp_tolerance_frac = float(
+            mode_cfg.get("bbw_nonexp_tolerance_frac", gate_bbw_nonexp_tolerance_frac)
+        )
         gate_ema_dist_max_frac = float(mode_cfg.get("ema_dist_max_frac", gate_ema_dist_max_frac))
         gate_vol_spike_mult = float(mode_cfg.get("vol_spike_mult", gate_vol_spike_mult))
+        gate_rvol_15m_max = float(mode_cfg.get("rvol_15m_max", gate_rvol_15m_max))
         gate_bbwp_s_enter_low = float(mode_cfg.get("bbwp_s_enter_low", gate_bbwp_s_enter_low))
         gate_bbwp_s_enter_high = float(mode_cfg.get("bbwp_s_enter_high", gate_bbwp_s_enter_high))
         gate_bbwp_m_enter_low = float(mode_cfg.get("bbwp_m_enter_low", gate_bbwp_m_enter_low))
@@ -3348,13 +4317,22 @@ class GridBrainV1Core(IStrategy):
 
         # Apply active mode thresholds.
         mode_pause = bool(active_mode == "pause")
-        bbw_nonexp = self._bbw_percentile_ok(bbw1h_pct, gate_bbw_1h_pct_max)
+        bbw_percentile_ok = self._bbw_percentile_ok(bbw1h_pct, gate_bbw_1h_pct_max)
+        bbw_trend_nonexp_ok = self._bbw_nonexpanding(
+            bbw1h_series, gate_bbw_nonexp_lookback_bars, gate_bbw_nonexp_tolerance_frac
+        )
+        bbw_nonexp = bool(bbw_percentile_ok and bbw_trend_nonexp_ok)
         ema_dist_ok = False
         if ema_dist_frac is not None:
             ema_dist_ok = bool(ema_dist_frac <= gate_ema_dist_max_frac)
-        vol_ok = False
-        if vol_ratio is not None:
-            vol_ok = bool(vol_ratio <= gate_vol_spike_mult)
+        vol_1h_ok = bool(vol_ratio is not None and vol_ratio <= gate_vol_spike_mult)
+        rvol_15m_ok = bool(rvol_15m is not None and rvol_15m <= gate_rvol_15m_max)
+        if vol_ratio is None:
+            vol_ok = bool(rvol_15m_ok)
+        elif rvol_15m is None:
+            vol_ok = bool(vol_1h_ok)
+        else:
+            vol_ok = bool(vol_1h_ok and rvol_15m_ok)
         atr_mode_pct = atr_4h_pct if gate_atr_source == "4h" else atr_1h_pct
         atr_ok = bool(atr_mode_pct is not None and atr_mode_pct <= gate_atr_pct_max)
 
@@ -3386,6 +4364,10 @@ class GridBrainV1Core(IStrategy):
         # BBWP gate (active mode thresholds + global veto/cooloff).
         if self.bbwp_enabled:
             bbwp_vals = [x for x in [bbwp_s, bbwp_m, bbwp_l] if x is not None]
+            bbwp_nonexp_15m = self._bbw_nonexpanding(dataframe["bb_width_15m"], self.bbwp_nonexp_bars, 0.0)
+            bbwp_nonexp_1h = self._bbw_nonexpanding(bbw1h_series, self.bbwp_nonexp_bars, 0.0)
+            bbwp_nonexp_4h = self._bbw_nonexpanding(bbw4h_series, self.bbwp_nonexp_bars, 0.0)
+            bbwp_nonexp_ok = bool(bbwp_nonexp_15m and bbwp_nonexp_1h and bbwp_nonexp_4h)
             bbwp_expansion_stop = any(x >= gate_bbwp_stop_high for x in bbwp_vals)
             bbwp_veto = any(x >= min(gate_bbwp_veto_pct, gate_bbwp_stop_high) for x in bbwp_vals)
             if any(x >= gate_bbwp_cooloff_trigger_pct for x in bbwp_vals):
@@ -3407,10 +4389,12 @@ class GridBrainV1Core(IStrategy):
                 and gate_bbwp_s_enter_low <= bbwp_s <= gate_bbwp_s_enter_high
                 and gate_bbwp_m_enter_low <= bbwp_m <= gate_bbwp_m_enter_high
                 and gate_bbwp_l_enter_low <= bbwp_l <= gate_bbwp_l_enter_high
+                and bbwp_nonexp_ok
             )
             bbwp_gate_ok = bool(bbwp_allow and not bbwp_veto and not bbwp_cooloff)
         else:
             bbwp_allow = True
+            bbwp_nonexp_ok = True
             bbwp_veto = False
             bbwp_cooloff = False
             bbwp_expansion_stop = False
@@ -3422,9 +4406,21 @@ class GridBrainV1Core(IStrategy):
         inside_7d = True
         if hi7d is not None and lo7d is not None:
             inside_7d = (close <= hi7d) and (close >= lo7d)
+        inside_7d_gate_ok = bool(inside_7d or (not gate_context_7d_hard_veto))
+        fr_8h_pct = None
+        if "fr_8h_pct" in dataframe.columns:
+            fr_8h_pct = self._safe_float(last.get("fr_8h_pct"))
+        funding_gate_ok = self._funding_gate_ok(fr_8h_pct)
+        funding_bias = 0
+        if fr_8h_pct is not None:
+            if fr_8h_pct > 0:
+                funding_bias = 1
+            elif fr_8h_pct < 0:
+                funding_bias = -1
 
         # ---- Build box on 15m ----
         lo_p, hi_p, width_pct, used_lb, pad = self._build_box_15m(dataframe)
+        overlap_pruned = self._box_overlap_prune(pair, lo_p, hi_p)
 
         # VRVP POC/VAH/VAL + deterministic box shift toward POC.
         vrvp = self._vrvp_profile(dataframe, self.vrvp_lookback_bars, self.vrvp_bins, self.vrvp_value_area_pct)
@@ -3503,6 +4499,9 @@ class GridBrainV1Core(IStrategy):
         use_candidate = True
         if neutral_mode_active and stored_box is not None:
             use_candidate = bool(rebuild_for_shift or rebuild_for_time)
+        if overlap_pruned:
+            use_candidate = False
+            box_block_reasons.append(BlockReason.BLOCK_BOX_OVERLAP_HIGH)
         box_rebuild_skipped = bool(neutral_mode_active and stored_box is not None and not use_candidate)
         box_rebuild_wait_bars = 0
         if use_candidate:
@@ -3513,10 +4512,13 @@ class GridBrainV1Core(IStrategy):
             }
             active_vrvp = candidate_vrvp
             self._box_state_by_pair[pair] = dict(active_box)
+            used_lb_int = int(active_box.get("used_lookback", used_lb))
+            candidate_signature = self._box_signature(lo_p, hi_p, used_lb_int, pad_effective)
             self._box_signature_by_pair[pair] = candidate_signature
             if signature_changed:
                 self._poc_acceptance_crossed_by_pair.pop(pair, None)
             self._box_rebuild_bars_since_by_pair[pair] = 0
+            self._record_box_history(pair, lo_p, hi_p)
             box_rebuild_wait_bars = 0
         else:
             active_box = stored_box or candidate_box
@@ -3525,6 +4527,70 @@ class GridBrainV1Core(IStrategy):
             box_rebuild_wait_bars = bars_since + 1
         lo_p = float(active_box["lo"])
         hi_p = float(active_box["hi"])
+        pad_effective = float(active_box.get("pad", pad))
+        session_new_print = bool(fvg_state.get("session_new_print", False))
+        session_gate_ok = bool(fvg_state.get("session_gate_ok", True))
+        if session_new_print and session_gate_ok and pad_effective > 0.0:
+            shrink_pct = float(np.clip(self.session_box_pad_shrink_pct, 0.0, 1.0))
+            target_pad = float(pad_effective * (1.0 - shrink_pct))
+            shrink = float(max(pad_effective - target_pad, 0.0))
+            if shrink * 2 < (hi_p - lo_p):
+                lo_p += shrink
+                hi_p -= shrink
+                pad_effective = float(target_pad)
+                active_box["lo"] = lo_p
+                active_box["hi"] = hi_p
+                active_box["pad"] = pad_effective
+        bb_lower_15m = self._safe_float(last.get("bb_lower_15m"))
+        bb_upper_15m = self._safe_float(last.get("bb_upper_15m"))
+        band_overlap_ratio = 0.0
+        band_overlap_ok = True
+        if bb_lower_15m is not None and bb_upper_15m is not None:
+            band_overlap_ratio = self._box_overlap_fraction(
+                lo_p, hi_p, float(bb_lower_15m), float(bb_upper_15m)
+            )
+            band_overlap_ok = bool(
+                band_overlap_ratio >= float(self.box_band_overlap_required)
+                or (
+                    adx4h is not None
+                    and adx4h <= float(self.box_band_adx_allow)
+                    and rvol_15m is not None
+                    and rvol_15m <= float(self.box_band_rvol_allow)
+                )
+            )
+            if not band_overlap_ok:
+                box_block_reasons.append(BlockReason.BLOCK_BOX_CHANNEL_OVERLAP_LOW)
+        envelope_block = False
+        if bb_lower_15m is not None and bb_upper_15m is not None:
+            envelope_width = float(bb_upper_15m) - float(bb_lower_15m)
+            if envelope_width > 0:
+                envelope_ratio = float((hi_p - lo_p) / envelope_width)
+                if envelope_ratio > float(self.box_envelope_ratio_max):
+                    if (
+                        adx4h is None
+                        or adx4h >= float(self.box_envelope_adx_threshold)
+                        or rvol_15m is None
+                        or rvol_15m >= float(self.box_envelope_rvol_threshold)
+                    ):
+                        envelope_block = True
+                        box_block_reasons.append(BlockReason.BLOCK_BOX_ENVELOPE_RATIO_HIGH)
+        breakout, breakout_direction, breakout_hi, breakout_lo = self._detect_structural_breakout(
+            dataframe, int(self.breakout_lookback_bars)
+        )
+        breakout_fresh_block_active, breakout_up_level, breakout_dn_level = self._update_breakout_fresh_state(
+            pair,
+            breakout,
+            breakout_hi,
+            breakout_lo,
+            close,
+        )
+        box_diag = self._update_box_quality(pair, lo_p, hi_p, pad_effective, used_lb, dataframe)
+        breakout_bars_since = self._breakout_bars_since_by_pair.get(pair)
+        if breakout:
+            self._neutral_box_break_bars_by_pair[pair] = int(self.breakout_block_bars)
+        else:
+            prev_break = int(self._neutral_box_break_bars_by_pair.get(pair, 0) or 0)
+            self._neutral_box_break_bars_by_pair[pair] = max(prev_break - 1, 0)
         used_lb = int(active_box["used_lookback"])
         pad = float(active_box["pad"])
         mid = float(active_box.get("mid") or ((hi_p + lo_p) / 2.0 if (hi_p + lo_p) else 0.0))
@@ -3538,30 +4604,88 @@ class GridBrainV1Core(IStrategy):
         box_rebuild_shift_frac = shift_frac
 
         final_vrvp_poc = self._safe_float(active_vrvp.get("poc"))
-        poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, final_vrvp_poc)
+        band_slope_pct = self._compute_band_slope_pct(pair, mid)
+        band_slope_gate_ok = bool(
+            (not self.band_slope_veto_enabled)
+            or (band_slope_pct is None)
+            or (band_slope_pct < float(self.band_slope_veto_pct))
+        )
+        excursion_asymmetry_ratio = self._excursion_asymmetry_ratio(lo_p, hi_p, mid)
+        excursion_asymmetry_gate_ok = bool(
+            (not self.excursion_asymmetry_veto_enabled)
+            or (excursion_asymmetry_ratio is None)
+            or (
+                float(self.excursion_asymmetry_min_ratio)
+                <= excursion_asymmetry_ratio
+                <= float(self.excursion_asymmetry_max_ratio)
+            )
+        )
+        poc_candidates = [x for x in (final_vrvp_poc,) if x is not None]
+        poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, poc_candidates)
 
         # Quartiles
-        mid = (hi_p + lo_p) / 2.0
         width_pct = (hi_p - lo_p) / mid if mid > 0 else 0.0
         q1 = lo_p + 0.25 * (hi_p - lo_p)
         q2 = mid
         q3 = lo_p + 0.75 * (hi_p - lo_p)
 
-        # ---- Grid sizing ----
-        n_levels, step_price, step_pct_actual, gross_min = self._grid_sizing(lo_p, hi_p)
+        # ---- Grid sizing (cost-aware + empirical floor) ----
+        cost_floor = self._effective_cost_floor(pair, last, close)
+        min_step_pct_required = float(cost_floor.get("chosen_floor_pct", 0.0) or 0.0)
+        static_gross_min = float(cost_floor.get("static_floor_pct", 0.0) or 0.0)
+        n_low, n_high, n_bounds_diag = self._n_level_bounds(active_mode, atr_mode_pct, gate_atr_pct_max)
+        sizing = self._grid_sizing(
+            lo_p,
+            hi_p,
+            min_step_pct_required=min_step_pct_required,
+            n_low=n_low,
+            n_high=n_high,
+        )
+        n_levels = int(sizing.get("n_levels", n_low))
+        step_price = float(sizing.get("step_price", 0.0) or 0.0)
+        step_pct_actual = float(sizing.get("step_pct_actual", 0.0) or 0.0)
         tp_price = hi_p + (self.tp_step_multiple * step_price)
         sl_price = lo_p - (self.sl_step_multiple * step_price)
+        empirical_floor_pct = self._safe_float((cost_floor.get("empirical_snapshot") or {}).get("empirical_floor_pct"))
+        step_below_cost = bool(step_pct_actual < min_step_pct_required)
+        step_below_empirical = bool(
+            step_below_cost
+            and empirical_floor_pct is not None
+            and empirical_floor_pct > static_gross_min
+            and min_step_pct_required >= empirical_floor_pct
+        )
+        step_cost_block_reason: Optional[BlockReason] = None
+        if step_below_cost:
+            step_cost_block_reason = (
+                BlockReason.BLOCK_STEP_BELOW_EMPIRICAL_COST
+                if step_below_empirical
+                else BlockReason.BLOCK_STEP_BELOW_COST
+            )
+
         grid_budget_pct_effective = float(self.grid_budget_pct)
         if neutral_mode_active:
-            adjusted_levels = max(
-                1,
-                int(round(float(n_levels) * float(self.neutral_grid_levels_ratio))),
-            )
+            adjusted_levels = int(round(float(n_levels) * float(self.neutral_grid_levels_ratio)))
+            adjusted_levels = int(np.clip(adjusted_levels, n_low, n_high))
             if adjusted_levels < n_levels:
                 n_levels = adjusted_levels
                 step_price = (hi_p - lo_p) / float(n_levels) if n_levels > 0 else 0.0
                 step_pct_actual = (step_price / mid) if mid > 0 else 0.0
             grid_budget_pct_effective *= float(self.neutral_grid_budget_ratio)
+            # Re-check cost floor after mode-specific level adjustment.
+            step_below_cost = bool(step_pct_actual < min_step_pct_required)
+            step_below_empirical = bool(
+                step_below_cost
+                and empirical_floor_pct is not None
+                and empirical_floor_pct > static_gross_min
+                and min_step_pct_required >= empirical_floor_pct
+            )
+            step_cost_block_reason = None
+            if step_below_cost:
+                step_cost_block_reason = (
+                    BlockReason.BLOCK_STEP_BELOW_EMPIRICAL_COST
+                    if step_below_empirical
+                    else BlockReason.BLOCK_STEP_BELOW_COST
+                )
 
         # MRVD (day/week/month) profile gates + drift pause.
         mrvd_day = self._mrvd_profile(
@@ -3656,6 +4780,31 @@ class GridBrainV1Core(IStrategy):
         mrvd_gate_ok = bool(
             (not self.mrvd_enabled) or ((mrvd_overlap_ok or mrvd_near_any_poc) and not mrvd_pause_entries)
         )
+        meta_drift_soft_block = bool(
+            self.meta_drift_soft_block_enabled
+            and mrvd_drift_delta_steps is not None
+            and mrvd_drift_delta_steps >= float(self.meta_drift_soft_block_steps)
+        )
+        drift_slope_gate_ok = True
+        if self.drift_slope_veto_enabled:
+            drift_slope_gate_ok = not bool(mrvd_drift_guard_triggered)
+
+        hvp_current = None
+        hvp_sma = None
+        hvp_gate_ok = True
+        hvp_quiet_exit_bias = False
+        if self.hvp_enabled and "close" in dataframe.columns:
+            hvp_current, hvp_sma = self._hvp_stats(pd.to_numeric(dataframe["close"], errors="coerce"))
+            hvp_cooloff = bool(self._hvp_cooloff_by_pair.get(pair, False))
+            if hvp_current is not None and hvp_sma is not None:
+                hvp_expanding = (not bool(bbw_nonexp)) and (hvp_current >= hvp_sma)
+                if hvp_expanding:
+                    hvp_cooloff = True
+                elif hvp_cooloff and (hvp_current < hvp_sma):
+                    hvp_cooloff = False
+                hvp_quiet_exit_bias = bool(hvp_current < hvp_sma)
+            hvp_gate_ok = not hvp_cooloff
+            self._hvp_cooloff_by_pair[pair] = hvp_cooloff
 
         # FreqAI confidence overlay (soft nudges only).
         ml_overlay = self._freqai_overlay_state(
@@ -3714,46 +4863,6 @@ class GridBrainV1Core(IStrategy):
             if len(quick_tp_pool):
                 cvd_quick_tp_candidate = float(min(quick_tp_pool))
 
-        # FVG stack (Defensive + IMFVG + Session FVG).
-        fvg_state = self._fvg_stack_state(
-            dataframe,
-            self.fvg_lookback_bars,
-            step_price,
-            lo_p,
-            hi_p,
-            close,
-        )
-        fvg_gate_ok = bool((not self.fvg_enabled) or bool(fvg_state.get("gate_ok", False)))
-        fvg_straddle_veto = bool(fvg_state.get("straddle_veto", False))
-        fvg_defensive_conflict = bool(fvg_state.get("defensive_conflict", False))
-        fvg_fresh_pause = bool(fvg_state.get("fresh_defensive_pause", False))
-        session_fvg_pause_active = bool(fvg_state.get("session_pause_active", False))
-        session_fvg_inside_block = bool(fvg_state.get("session_inside_block", False))
-        box_block_reasons = self._derive_box_block_reasons(fvg_state)
-
-        tp_candidates = {
-            "base_tp": float(tp_price),
-            "imfvg_avg_bull": self._safe_float(fvg_state.get("imfvg_avg_bull")),
-            "imfvg_avg_bear": self._safe_float(fvg_state.get("imfvg_avg_bear")),
-            "session_fvg_avg": self._safe_float(fvg_state.get("session_fvg_avg")),
-            "fvg_position_up_avg": self._safe_float(fvg_state.get("positioning_up_avg")),
-            "fvg_position_down_avg": self._safe_float(fvg_state.get("positioning_down_avg")),
-            "mrvd_day_poc": mrvd_day_poc,
-            "mrvd_week_poc": mrvd_week_poc,
-            "mrvd_month_poc": mrvd_month_poc,
-            "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
-            "cvd_quick_tp_trigger": bool(cvd_quick_tp_trigger),
-            "ml_quick_tp_candidate": ml_quick_tp_candidate,
-            "ml_breakout_risk_high": bool(ml_breakout_risk_high),
-            "ml_p_range": p_range,
-            "ml_p_breakout": p_breakout,
-        }
-        tp_price_plan = float(tp_price)
-        if cvd_quick_tp_candidate is not None:
-            tp_price_plan = float(min(tp_price_plan, cvd_quick_tp_candidate))
-        if ml_quick_tp_candidate is not None:
-            tp_price_plan = float(min(tp_price_plan, ml_quick_tp_candidate))
-
         # Micro-VAP inside current box.
         micro_vap = self._micro_vap_inside_box(
             dataframe,
@@ -3775,13 +4884,199 @@ class GridBrainV1Core(IStrategy):
             "bottom_void": 0.0,
             "void_slope": 0.0,
         }
-
         micro_poc = self._safe_float(micro_vap.get("poc"))
         micro_hvn_levels = [float(x) for x in (micro_vap.get("hvn_levels") or [])]
         micro_lvn_levels = [float(x) for x in (micro_vap.get("lvn_levels") or [])]
         micro_top_void = float(self._safe_float(micro_vap.get("top_void")) or 0.0)
         micro_bottom_void = float(self._safe_float(micro_vap.get("bottom_void")) or 0.0)
         micro_void_slope = float(self._safe_float(micro_vap.get("void_slope")) or 0.0)
+        poc_candidates = [x for x in (final_vrvp_poc, micro_poc) if x is not None]
+        poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, poc_candidates)
+
+        # FVG stack (Defensive + IMFVG + Session FVG).
+        fvg_state = self._fvg_stack_state(
+            dataframe,
+            self.fvg_lookback_bars,
+            step_price,
+            lo_p,
+            hi_p,
+            close,
+        )
+        session_vwap = self._safe_float(fvg_state.get("session_vwap"))
+        session_high = self._safe_float(fvg_state.get("session_high"))
+        session_low = self._safe_float(fvg_state.get("session_low"))
+        daily_vwap = self._latest_daily_vwap(dataframe)
+        fvg_gate_ok = bool((not self.fvg_enabled) or bool(fvg_state.get("gate_ok", False)))
+        fvg_straddle_veto = bool(fvg_state.get("straddle_veto", False))
+        fvg_defensive_conflict = bool(fvg_state.get("defensive_conflict", False))
+        fvg_fresh_pause = bool(fvg_state.get("fresh_defensive_pause", False))
+        session_fvg_pause_active = bool(fvg_state.get("session_pause_active", False))
+        session_fvg_inside_block = bool(fvg_state.get("session_inside_block", False))
+        box_block_reasons = self._derive_box_block_reasons(fvg_state)
+        if self._box_straddles_cached_breakout(pair, lo_p, hi_p, step_price):
+            box_block_reasons.append(BlockReason.BLOCK_BOX_STRADDLE_BREAKOUT_LEVEL)
+        session_zone_high = session_high
+        session_zone_low = session_low
+        extra_level_reasons = [
+            (vrvp_poc, BlockReason.BLOCK_BOX_VP_POC_MISPLACED),
+            (micro_poc, BlockReason.BLOCK_BOX_STRADDLE_FVG_AVG),
+            (self._safe_float(fvg_state.get("positioning_up_avg")), BlockReason.BLOCK_BOX_STRADDLE_FVG_EDGE),
+            (self._safe_float(fvg_state.get("positioning_down_avg")), BlockReason.BLOCK_BOX_STRADDLE_FVG_EDGE),
+            (self._safe_float(fvg_state.get("session_fvg_avg")), BlockReason.BLOCK_BOX_STRADDLE_SESSION_FVG_AVG),
+            (session_zone_high, BlockReason.BLOCK_BOX_STRADDLE_SESSION_FVG_AVG),
+            (session_zone_low, BlockReason.BLOCK_BOX_STRADDLE_SESSION_FVG_AVG),
+            (session_vwap, BlockReason.BLOCK_BOX_STRADDLE_VWAP_DONCHIAN_MID),
+            (daily_vwap, BlockReason.BLOCK_BOX_STRADDLE_VWAP_DONCHIAN_MID),
+        ]
+        box_block_reasons.extend(
+            self._box_level_straddle_reasons(pair, lo_p, hi_p, step_price, extra_level_reasons)
+        )
+
+        donchian_mid = self._safe_float(last.get("donchian_mid_15m"))
+        basis_mid = self._safe_float(last.get("basis_mid_15m"))
+        basis_upper = self._safe_float(last.get("basis_upper_15m"))
+        basis_lower = self._safe_float(last.get("basis_lower_15m"))
+        basis_raw_now = self._safe_float(last.get("basis_15m"))
+        basis_raw_prev = None
+        if len(dataframe) >= 2 and "basis_15m" in dataframe.columns:
+            basis_raw_prev = self._safe_float(dataframe["basis_15m"].iloc[-2])
+        basis_cross_confirm = bool(
+            basis_raw_prev is not None
+            and basis_raw_now is not None
+            and ((basis_raw_prev <= 0.0 <= basis_raw_now) or (basis_raw_prev >= 0.0 >= basis_raw_now))
+        )
+        hvn_nearest_above = self._nearest_above(close, micro_hvn_levels)
+        fvg_poc = micro_poc if self.fvg_vp_enabled else None
+        channel_midline = self._safe_float(last.get("bb_mid_15m"))
+        channel_upper = bb_upper_15m
+        channel_lower = bb_lower_15m
+
+        tp_candidate_prices = {
+            "box_default_tp": float(tp_price),
+            "quartile_q1": float(q1),
+            "quartile_q3": float(q3),
+            "vrvp_poc": self._safe_float(vrvp_poc),
+            "mrvd_day_poc": mrvd_day_poc,
+            "mrvd_week_poc": mrvd_week_poc,
+            "mrvd_month_poc": mrvd_month_poc,
+            "donchian_mid": donchian_mid,
+            "session_vwap": session_vwap,
+            "daily_vwap": daily_vwap,
+            "basis_upper": basis_upper,
+            "basis_mid": basis_mid,
+            "imfvg_avg_bull": self._safe_float(fvg_state.get("imfvg_avg_bull")),
+            "session_fvg_avg": self._safe_float(fvg_state.get("session_fvg_avg")),
+            "fvg_position_up_avg": self._safe_float(fvg_state.get("positioning_up_avg")),
+            "fvg_position_down_avg": self._safe_float(fvg_state.get("positioning_down_avg")),
+            "hvn_nearest": hvn_nearest_above,
+            "fvg_poc": fvg_poc,
+            "channel_midline": channel_midline,
+            "channel_upper": channel_upper,
+            "channel_lower": channel_lower,
+            "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
+            "ml_quick_tp_candidate": ml_quick_tp_candidate,
+        }
+        tp_price_plan, tp_selection = self._select_tp_price(close, float(tp_price), tp_candidate_prices)
+
+        # Preserve existing fast-exit nudges while keeping "nearest conservative wins".
+        if cvd_quick_tp_candidate is not None and cvd_quick_tp_candidate > close:
+            tp_price_plan = float(min(tp_price_plan, cvd_quick_tp_candidate))
+            tp_selection["source"] = "cvd_quick_tp_candidate"
+            tp_selection["nearest_conservative"] = float(tp_price_plan)
+        if ml_quick_tp_candidate is not None and ml_quick_tp_candidate > close:
+            tp_price_plan = float(min(tp_price_plan, ml_quick_tp_candidate))
+            tp_selection["source"] = "ml_quick_tp_candidate"
+            tp_selection["nearest_conservative"] = float(tp_price_plan)
+
+        tp_candidates = {
+            "base_tp": float(tp_price),
+            "box_default_tp": float(tp_price),
+            "quartile_q1": float(q1),
+            "quartile_q3": float(q3),
+            "vrvp_poc": self._safe_float(vrvp_poc),
+            "imfvg_avg_bull": self._safe_float(fvg_state.get("imfvg_avg_bull")),
+            "imfvg_avg_bear": self._safe_float(fvg_state.get("imfvg_avg_bear")),
+            "session_fvg_avg": self._safe_float(fvg_state.get("session_fvg_avg")),
+            "fvg_position_up_avg": self._safe_float(fvg_state.get("positioning_up_avg")),
+            "fvg_position_down_avg": self._safe_float(fvg_state.get("positioning_down_avg")),
+            "mrvd_day_poc": mrvd_day_poc,
+            "mrvd_week_poc": mrvd_week_poc,
+            "mrvd_month_poc": mrvd_month_poc,
+            "donchian_mid": donchian_mid,
+            "session_vwap": session_vwap,
+            "daily_vwap": daily_vwap,
+            "basis_upper": basis_upper,
+            "basis_lower": basis_lower,
+            "basis_mid": basis_mid,
+            "hvn_nearest": hvn_nearest_above,
+            "fvg_poc": fvg_poc,
+            "channel_midline": channel_midline,
+            "channel_upper": channel_upper,
+            "channel_lower": channel_lower,
+            "session_high": session_high,
+            "session_low": session_low,
+            "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
+            "cvd_quick_tp_trigger": bool(cvd_quick_tp_trigger),
+            "ml_quick_tp_candidate": ml_quick_tp_candidate,
+            "ml_breakout_risk_high": bool(ml_breakout_risk_high),
+            "ml_p_range": p_range,
+            "ml_p_breakout": p_breakout,
+            "selection": dict(tp_selection),
+        }
+        box_span = max(float(hi_p - lo_p), 0.0)
+        box_position = 0.5
+        if box_span > 0:
+            box_position = float(np.clip((close - lo_p) / box_span, 0.0, 1.0))
+        start_box_position_ok = bool(
+            (not self.start_box_position_guard_enabled)
+            or (
+                float(self.start_box_position_min_frac)
+                <= box_position
+                <= float(self.start_box_position_max_frac)
+            )
+        )
+        basis_cross_ok = bool((not self.basis_cross_confirm_enabled) or basis_cross_confirm)
+        capacity_hint = self._capacity_hint_state(pair)
+        capacity_hint_allow = bool(capacity_hint.get("allow_start", True))
+        capacity_hint_advisory_only = bool(capacity_hint.get("advisory_only", not self.capacity_hint_hard_block))
+        capacity_hint_ok = bool(capacity_hint_allow or capacity_hint_advisory_only)
+        squeeze_momentum_flip_against_edge = False
+        squeeze_momentum_decelerating = False
+        if squeeze_val_1h is not None and squeeze_val_prev_1h is not None:
+            near_lower = bool(box_position <= 0.5)
+            near_upper = bool(box_position > 0.5)
+            flip_to_negative = bool(squeeze_val_prev_1h >= 0 and squeeze_val_1h < 0)
+            flip_to_positive = bool(squeeze_val_prev_1h <= 0 and squeeze_val_1h > 0)
+            squeeze_momentum_flip_against_edge = bool(
+                (near_lower and flip_to_negative) or (near_upper and flip_to_positive)
+            )
+            squeeze_momentum_decelerating = bool(abs(float(squeeze_val_1h)) < abs(float(squeeze_val_prev_1h)))
+        squeeze_tp_nudged = False
+        if (
+            self.squeeze_tp_nudge_enabled
+            and squeeze_momentum_decelerating
+            and step_price > 0
+            and tp_price_plan > close
+        ):
+            nudge_tp = close + (float(self.squeeze_tp_nudge_step_multiple) * step_price)
+            tp_price_plan = float(min(tp_price_plan, nudge_tp))
+            squeeze_tp_nudged = True
+        hvp_quiet_exit_tp_nudged = False
+        if (
+            self.hvp_quiet_exit_bias_enabled
+            and hvp_quiet_exit_bias
+            and step_price > 0
+            and tp_price_plan > close
+        ):
+            nudge_tp = close + (float(self.hvp_quiet_exit_step_multiple) * step_price)
+            tp_price_plan = float(min(tp_price_plan, nudge_tp))
+            hvp_quiet_exit_tp_nudged = True
+        sl_price, sl_selection = self._select_sl_price(
+            sl_base=sl_price,
+            step_price=step_price,
+            lvn_levels=micro_lvn_levels,
+            fvg_state=fvg_state,
+        )
 
         levels_arr = np.linspace(lo_p, hi_p, n_levels + 1, dtype=float)
         rung_weights = self._rung_weights_from_micro_vap(
@@ -3886,10 +5181,16 @@ class GridBrainV1Core(IStrategy):
         squeeze_gate_ok = True
         if self.squeeze_enabled and self.squeeze_require_on_1h:
             squeeze_gate_ok = bool(squeeze_on_1h)
+        squeeze_release_against_bias = bool(
+            squeeze_released_1h
+            and (
+                (box_position <= 0.5 and close < (lo_p - step_price))
+                or (box_position > 0.5 and close > (hi_p + step_price))
+            )
+        )
         squeeze_release_break_stop = bool(
             self.squeeze_enabled
-            and squeeze_released_1h
-            and ((close > (hi_p + step_price)) or (close < (lo_p - step_price)))
+            and squeeze_release_against_bias
         )
 
         c1 = float(dataframe["close"].iloc[-1])
@@ -3931,6 +5232,11 @@ class GridBrainV1Core(IStrategy):
         fvg_conflict_stop_up = bool(flags["close_outside_up"] and bool(fvg_state.get("defensive_bear_conflict", False)))
         fvg_conflict_stop_dn = bool(flags["close_outside_dn"] and bool(fvg_state.get("defensive_bull_conflict", False)))
         fvg_conflict_stop_override = bool(fvg_conflict_stop_up or fvg_conflict_stop_dn)
+        fresh_breakout_idle_reclaim_stop = bool(
+            self.breakout_idle_reclaim_on_fresh
+            and breakout_fresh_block_active
+            and running_active_hint
+        )
         stop_reason_flags_raw = {
             "two_consecutive_outside_up": bool(two_up),
             "two_consecutive_outside_dn": bool(two_dn),
@@ -3952,6 +5258,7 @@ class GridBrainV1Core(IStrategy):
             "neutral_box_break_stop": bool(neutral_box_break_stop),
             "mode_handoff_required_stop": bool(mode_handoff_required_stop),
             "router_pause_stop": bool(router_pause_stop),
+            "fresh_breakout_idle_reclaim_stop": bool(fresh_breakout_idle_reclaim_stop),
             "range_shift_stop": bool(shift_stop),
         }
         stop_reason_enum_active: List[str] = []
@@ -3975,23 +5282,87 @@ class GridBrainV1Core(IStrategy):
             or fvg_conflict_stop_override
             or mode_handoff_required_stop
             or router_pause_stop
+            or fresh_breakout_idle_reclaim_stop
         )
         raw_stop_rule = bool(two_up or two_dn or hard_stop or shift_stop)
 
         # ---- Entry sanity (15m) ----
         price_in_box = (close >= lo_p) and (close <= hi_p)
         rsi_ok = (rsi is not None) and (self.rsi_min <= rsi <= self.rsi_max)
+        mrvd_proximity_ok = bool((not self.mrvd_enabled) or mrvd_near_any_poc or mrvd_overlap_ok)
         micro_vap_ok = bool((not self.micro_vap_enabled) or (len(rung_weights) == (n_levels + 1)))
 
         # ---- Regime allow ----
+        phase2_gate_failures = self._phase2_gate_failures_from_flags(
+            bool(adx_ok),
+            bool(bbw_nonexp),
+            bool(ema_dist_ok),
+            bool(vol_ok),
+            bool(inside_7d_gate_ok),
+        )
+        if not inside_7d and (not gate_context_7d_hard_veto):
+            phase2_gate_failures = [x for x in phase2_gate_failures if x != BlockReason.BLOCK_7D_EXTREME_CONTEXT]
+        if not band_slope_gate_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_BAND_SLOPE_HIGH)
+        if not excursion_asymmetry_gate_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_EXCURSION_ASYMMETRY)
+        if not drift_slope_gate_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_DRIFT_SLOPE_HIGH)
+        if self.bbwp_enabled:
+            if not bbwp_allow:
+                phase2_gate_failures.append(BlockReason.BLOCK_BBWP_HIGH)
+            if bbwp_veto:
+                phase2_gate_failures.append(BlockReason.BLOCK_BBWP_HIGH)
+            if bbwp_cooloff:
+                phase2_gate_failures.append(BlockReason.COOLOFF_BBWP_EXTREME)
+        if breakout_fresh_block_active:
+            phase2_gate_failures.append(BlockReason.BLOCK_FRESH_BREAKOUT)
+        if not funding_gate_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_FUNDING_FILTER)
+        if not hvp_gate_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_HVP_EXPANDING)
+        if meta_drift_soft_block:
+            phase2_gate_failures.append(BlockReason.BLOCK_META_DRIFT_SOFT)
+        if not planner_health_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_STALE_FEATURES)
+        if self.os_dev_enabled and (not os_dev_build_ok):
+            if os_dev_state != 0:
+                phase2_gate_failures.append(BlockReason.BLOCK_OS_DEV_DIRECTIONAL)
+            else:
+                phase2_gate_failures.append(BlockReason.BLOCK_OS_DEV_NEUTRAL_PERSISTENCE)
+        if self.squeeze_enabled and (not squeeze_gate_ok):
+            phase2_gate_failures.append(BlockReason.BLOCK_SQUEEZE_RELEASE_AGAINST_BIAS)
+        if self.squeeze_momentum_block_enabled and squeeze_momentum_flip_against_edge:
+            phase2_gate_failures.append(BlockReason.BLOCK_SQUEEZE_RELEASE_AGAINST_BIAS)
+        squeeze_release_reason = self._squeeze_release_block_reason(squeeze_release_break_stop)
+        if squeeze_release_reason:
+            phase2_gate_failures.append(squeeze_release_reason)
+        if step_cost_block_reason is not None:
+            phase2_gate_failures.append(step_cost_block_reason)
+        if not start_box_position_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_START_BOX_POSITION)
+        if not rsi_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_START_RSI_BAND)
+        if self.poc_acceptance_enabled and (not poc_acceptance_satisfied):
+            phase2_gate_failures.append(BlockReason.BLOCK_NO_POC_ACCEPTANCE)
+        if not mrvd_proximity_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_VAH_VAL_POC_PROXIMITY)
+        if not basis_cross_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_BASIS_CROSS_PENDING)
+        if (not capacity_hint_ok) and (not capacity_hint_advisory_only):
+            phase2_gate_failures.append(BlockReason.BLOCK_CAPACITY_THIN)
+        phase2_gate_failures = list(dict.fromkeys(phase2_gate_failures))
+
         gate_checks = [
+            ("planner_health_ok", bool(planner_health_ok)),
             ("mode_active_ok", bool(not mode_pause)),
             ("adx_ok", bool(adx_ok)),
             ("bbw_nonexp", bool(bbw_nonexp)),
             ("ema_dist_ok", bool(ema_dist_ok)),
             ("vol_ok", bool(vol_ok)),
             ("atr_ok", bool(atr_ok)),
-            ("inside_7d", bool(inside_7d)),
+            ("inside_7d", bool(inside_7d_gate_ok)),
+            ("breakout_fresh_gate_ok", bool(not breakout_fresh_block_active)),
             ("vrvp_box_ok", bool(vrvp_box_ok)),
             ("bbwp_gate_ok", bool(bbwp_gate_ok)),
             ("squeeze_gate_ok", bool(squeeze_gate_ok)),
@@ -4001,14 +5372,48 @@ class GridBrainV1Core(IStrategy):
             ("mrvd_gate_ok", bool(mrvd_gate_ok)),
             ("cvd_gate_ok", bool(cvd_gate_ok)),
             ("ml_gate_ok", bool(ml_gate_ok)),
+            ("band_slope_gate_ok", bool(band_slope_gate_ok)),
+            ("excursion_asymmetry_gate_ok", bool(excursion_asymmetry_gate_ok)),
+            ("drift_slope_gate_ok", bool(drift_slope_gate_ok)),
+            ("step_cost_ok", bool(step_cost_block_reason is None)),
+            ("start_box_position_ok", bool(start_box_position_ok)),
+            ("rsi_guard_ok", bool(rsi_ok)),
+            ("poc_acceptance_ok", bool(poc_acceptance_satisfied)),
+            ("mrvd_proximity_ok", bool(mrvd_proximity_ok)),
+            ("basis_cross_ok", bool(basis_cross_ok)),
+            ("capacity_hint_ok", bool(capacity_hint_ok)),
+            ("meta_drift_soft_block_ok", bool(not meta_drift_soft_block)),
+            ("funding_gate_ok", bool(funding_gate_ok)),
+            ("hvp_gate_ok", bool(hvp_gate_ok)),
         ]
         rule_range_ok = bool(all(ok for _, ok in gate_checks))
         gate_pass_count = int(sum(1 for _, ok in gate_checks if ok))
         gate_total_count = int(len(gate_checks))
         gate_pass_ratio = float(gate_pass_count / gate_total_count) if gate_total_count > 0 else 0.0
-        core_gate_names = {"mode_active_ok", "adx_ok", "bbw_nonexp", "ema_dist_ok", "vol_ok", "atr_ok", "inside_7d", "vrvp_box_ok"}
+        core_gate_names = {
+            "planner_health_ok",
+            "mode_active_ok",
+            "adx_ok",
+            "bbw_nonexp",
+            "ema_dist_ok",
+            "vol_ok",
+            "atr_ok",
+            "inside_7d",
+            "vrvp_box_ok",
+            "step_cost_ok",
+            "start_box_position_ok",
+            "rsi_guard_ok",
+            "poc_acceptance_ok",
+        }
         core_gates_ok = bool(all(ok for name, ok in gate_checks if name in core_gate_names))
         gate_ratio_ok = bool(gate_pass_ratio >= gate_start_min_pass_ratio)
+        start_stability = self._start_stability_state(
+            gate_checks,
+            self.start_stability_min_score,
+            self.start_stability_k_fraction,
+        )
+        start_stability_ok = bool(start_stability.get("ok", False))
+        phase2_gate_ok = not phase2_gate_failures
 
         rule_range_fail_reasons = []
         for gate_name, gate_ok in gate_checks:
@@ -4081,14 +5486,31 @@ class GridBrainV1Core(IStrategy):
         if gate_start_min_pass_ratio >= 0.999:
             start_gate_ok = bool(rule_range_ok)
         else:
-            start_gate_ok = bool(core_gates_ok and gate_ratio_ok)
-        if not data_quality_ok:
+            start_gate_ok = bool(core_gates_ok and gate_ratio_ok and phase2_gate_ok)
+        if not planner_health_ok:
             start_gate_ok = False
-        start_signal = bool(start_gate_ok and price_in_box and rsi_ok)
+        if not start_stability_ok:
+            start_gate_ok = False
+        box_block_active = bool(len(box_block_reasons) > 0)
+        start_signal = bool(
+            start_gate_ok
+            and price_in_box
+            and rsi_ok
+            and start_box_position_ok
+            and basis_cross_ok
+            and mrvd_proximity_ok
+            and bool(step_cost_block_reason is None)
+            and bool(capacity_hint_ok)
+            and (not box_block_active)
+            and bool(poc_acceptance_satisfied)
+        )
         start_blocked = bool(start_signal and (reclaim_active or cooldown_active))
         failed_core_gates = [name for name, ok in gate_checks if (name in core_gate_names) and (not ok)]
         failed_all_gates = [name for name, ok in gate_checks if not ok]
         start_block_reasons: List[str] = []
+        breakout_block_active = bool(breakout_fresh_block_active)
+        if breakout_block_active:
+            start_block_reasons.append(str(BlockReason.BLOCK_FRESH_BREAKOUT))
         if not start_gate_ok:
             if gate_start_min_pass_ratio >= 0.999:
                 start_block_reasons.extend([f"gate_fail:{name}" for name in failed_all_gates])
@@ -4097,16 +5519,31 @@ class GridBrainV1Core(IStrategy):
                     start_block_reasons.extend([f"core_gate_fail:{name}" for name in failed_core_gates])
                 if not gate_ratio_ok:
                     start_block_reasons.append("gate_ratio_below_required")
+        if not start_stability_ok:
+            start_block_reasons.append(str(BlockReason.BLOCK_START_STABILITY_LOW))
+        if step_cost_block_reason is not None:
+            start_block_reasons.append(str(step_cost_block_reason))
+        if not start_box_position_ok:
+            start_block_reasons.append(str(BlockReason.BLOCK_START_BOX_POSITION))
+        if not basis_cross_ok:
+            start_block_reasons.append(str(BlockReason.BLOCK_BASIS_CROSS_PENDING))
+        if not mrvd_proximity_ok:
+            start_block_reasons.append(str(BlockReason.BLOCK_VAH_VAL_POC_PROXIMITY))
+        if (not capacity_hint_ok) and (not capacity_hint_advisory_only):
+            start_block_reasons.append(str(BlockReason.BLOCK_CAPACITY_THIN))
+        if (not capacity_hint_allow) and capacity_hint_advisory_only:
+            hint_reason = str(capacity_hint.get("reason") or "capacity_hint")
+            start_block_reasons.append(f"capacity_hint_advisory:{hint_reason}")
         if not price_in_box:
             start_block_reasons.append("price_outside_box")
         if not rsi_ok:
-            start_block_reasons.append("rsi_out_of_range")
+            start_block_reasons.append(str(BlockReason.BLOCK_START_RSI_BAND))
         if mode_pause:
             start_block_reasons.append("router_pause_mode")
         if reclaim_active:
-            start_block_reasons.append("reclaim_active")
+            start_block_reasons.append(str(BlockReason.BLOCK_RECLAIM_PENDING))
         if cooldown_active:
-            start_block_reasons.append("cooldown_active")
+            start_block_reasons.append(str(BlockReason.BLOCK_COOLDOWN_ACTIVE))
         if mode_handoff_required_stop:
             start_block_reasons.append("mode_handoff_required_stop")
         if stop_rule:
@@ -4117,9 +5554,15 @@ class GridBrainV1Core(IStrategy):
             start_block_reasons.extend([str(x) for x in box_block_reasons])
         if self.poc_acceptance_enabled and not poc_acceptance_satisfied:
             start_block_reasons.append(str(BlockReason.BLOCK_NO_POC_ACCEPTANCE))
+        if phase2_gate_failures:
+            start_block_reasons.extend([str(x) for x in phase2_gate_failures])
+        if not planner_health_ok:
+            start_block_reasons.append(f"planner_health:{planner_health_state}")
         if not data_quality_ok:
             start_block_reasons.extend([str(x) for x in data_quality_reasons])
         start_block_reasons = list(dict.fromkeys(start_block_reasons))
+        warning_codes = [str(x) for x in (cost_floor.get("warning_codes") or [])]
+        warning_codes = list(dict.fromkeys(warning_codes))
 
         # ---- Action (final) ----
         if stop_rule:
@@ -4173,6 +5616,20 @@ class GridBrainV1Core(IStrategy):
             hard_stop,
             action,
         )
+        start_filter_states = {
+            "box_position_ok": bool(start_box_position_ok),
+            "rsi_guard_ok": bool(rsi_ok),
+            "poc_acceptance_ok": bool(poc_acceptance_satisfied),
+            "mrvd_proximity_ok": bool(mrvd_proximity_ok),
+            "basis_cross_ok": bool(basis_cross_ok),
+            "start_stability_ok": bool(start_stability_ok),
+            "meta_drift_ok": bool(not meta_drift_soft_block),
+            "planner_health_ok": bool(planner_health_ok),
+            "cooldown_ok": bool(not cooldown_active),
+            "reclaim_ok": bool(not reclaim_active),
+            "capacity_hint_ok": bool(capacity_hint_ok),
+            "cost_step_ok": bool(step_cost_block_reason is None),
+        }
 
         plan = {
             "ts": ts,
@@ -4180,6 +5637,7 @@ class GridBrainV1Core(IStrategy):
             "symbol": pair,
             "action": action,
             "mode": str(active_mode),
+            "warnings": warning_codes,
             "regime_router": {
                 "enabled": bool(router_state.get("enabled", False)),
                 "forced_mode": router_state.get("forced_mode"),
@@ -4289,11 +5747,15 @@ class GridBrainV1Core(IStrategy):
                     "straddle_veto": bool(fvg_state.get("straddle_veto", False)),
                     "defensive_conflict": bool(fvg_state.get("defensive_conflict", False)),
                     "fresh_defensive_pause": bool(fvg_state.get("fresh_defensive_pause", False)),
-                    "session_new_print": bool(fvg_state.get("session_new_print", False)),
-                    "session_pause_active": bool(fvg_state.get("session_pause_active", False)),
-                    "session_inside_block": bool(fvg_state.get("session_inside_block", False)),
-                    "session_gate_ok": bool(fvg_state.get("session_gate_ok", True)),
-                    "gate_ok": bool(fvg_state.get("gate_ok", True)),
+                "session_new_print": bool(fvg_state.get("session_new_print", False)),
+                "session_pause_active": bool(fvg_state.get("session_pause_active", False)),
+                "session_inside_block": bool(fvg_state.get("session_inside_block", False)),
+                "session_gate_ok": bool(fvg_state.get("session_gate_ok", True)),
+                "session_high": session_high,
+                "session_low": session_low,
+                "session_vwap": session_vwap,
+                "daily_vwap": daily_vwap,
+                "gate_ok": bool(fvg_state.get("gate_ok", True)),
                     "imfvg_avg_bull": self._safe_float(fvg_state.get("imfvg_avg_bull")),
                     "imfvg_avg_bear": self._safe_float(fvg_state.get("imfvg_avg_bear")),
                     "session_fvg_avg": self._safe_float(fvg_state.get("session_fvg_avg")),
@@ -4350,13 +5812,43 @@ class GridBrainV1Core(IStrategy):
             },
             "grid": {
                 "n_levels": int(n_levels),
-                "target_net_step_pct": float(self.target_net_step_pct),
+                "target_net_step_pct": float(cost_floor.get("target_net_step_pct", self.target_net_step_pct)),
                 "est_fee_pct": float(self.est_fee_pct),
                 "est_spread_pct": float(self.est_spread_pct),
-                "gross_step_min_pct": float(gross_min),
+                "gross_step_min_pct": float(static_gross_min),
+                "majors_gross_step_floor_pct": float(self.majors_gross_step_floor_pct),
+                "min_step_pct_required": float(min_step_pct_required),
                 "step_pct_actual": float(step_pct_actual),
                 "step_price": float(step_price),
+                "step_cost_ok": bool(step_cost_block_reason is None),
+                "step_cost_block_reason": str(step_cost_block_reason) if step_cost_block_reason is not None else None,
+                "cost_model_source": str(cost_floor.get("source", "static")),
+                "cost_floor": {
+                    "source": str(cost_floor.get("source", "static")),
+                    "static_floor_pct": float(static_gross_min),
+                    "chosen_floor_pct": float(min_step_pct_required),
+                    "empirical": cost_floor.get("empirical_snapshot", {}),
+                    "empirical_sample": cost_floor.get("empirical_sample", {}),
+                },
+                "n_selection": {
+                    "candidate_n": int(sizing.get("candidate_n", n_levels)),
+                    "clamped_n": int(sizing.get("clamped_n", n_levels)),
+                    "bounds": {"min": int(n_low), "max": int(n_high)},
+                    "volatility_adapter": dict(n_bounds_diag),
+                    "cost_validation": {
+                        "min_step_pct_required": float(min_step_pct_required),
+                        "step_pct_actual": float(step_pct_actual),
+                        "ok": bool(step_cost_block_reason is None),
+                        "attempts": list(sizing.get("attempts", [])),
+                    },
+                },
+                "tick_size": float(self._infer_tick_size(step_price)),
                 "post_only": True,
+                "fill_detection": {
+                    "fill_confirmation_mode": str(self.fill_confirmation_mode),
+                    "no_repeat_lsi_guard": bool(self.fill_no_repeat_lsi_guard),
+                    "cooldown_bars": int(self.fill_no_repeat_cooldown_bars),
+                },
                 "rung_density_bias": {
                     "enabled": bool(self.micro_vap_enabled),
                     "source": "micro_vap_hvn_lvn",
@@ -4374,14 +5866,17 @@ class GridBrainV1Core(IStrategy):
                 "sl_price": float(sl_price),
                 "tp_step_multiple": float(self.tp_step_multiple),
                 "sl_step_multiple": float(self.sl_step_multiple),
-                "source": "box_plus_step_multiples",
+                "source": "nearest_conservative",
                 "tp_candidates": tp_candidates,
+                "sl_selection": sl_selection,
             },
             "signals": {
                 "mode": str(active_mode),
                 "neutral_mode_active": bool(neutral_mode_active),
                 "mode_pause": bool(mode_pause),
                 "mode_desired": str(desired_mode),
+                "planner_health_state": str(planner_health_state),
+                "planner_health_ok": bool(planner_health_ok),
                 "adx_4h": adx4h,
                 "adx_enter_max_4h": float(gate_adx_4h_max),
                 "adx_exit_min_4h": float(gate_adx_4h_exit_min),
@@ -4399,13 +5894,19 @@ class GridBrainV1Core(IStrategy):
                 "bb_width_1h": bbw1h,
                 "bb_width_4h": bbw4h,
                 "bb_width_1h_pct": bbw1h_pct,
+                "bb_width_percentile_ok_1h": bool(bbw_percentile_ok),
+                "bb_width_trend_nonexpanding_1h": bool(bbw_trend_nonexp_ok),
                 "bb_width_nonexpanding_1h": bool(bbw_nonexp),
+                "bb_width_nonexp_lookback_bars_1h": int(gate_bbw_nonexp_lookback_bars),
+                "bb_width_nonexp_tolerance_frac_1h": float(gate_bbw_nonexp_tolerance_frac),
                 "bbwp_15m_pct": bbwp_s,
                 "bbwp_1h_pct": bbwp_m,
                 "bbwp_4h_pct": bbwp_l,
                 "bbwp_allow": bool(bbwp_allow),
                 "bbwp_veto": bool(bbwp_veto),
                 "bbwp_cooloff": bool(bbwp_cooloff),
+                "bbwp_nonexp_bars": int(self.bbwp_nonexp_bars),
+                "bbwp_nonexp_ok": bool(bbwp_nonexp_ok),
                 "bbwp_s_enter_low": float(gate_bbwp_s_enter_low),
                 "bbwp_s_enter_high": float(gate_bbwp_s_enter_high),
                 "bbwp_m_enter_low": float(gate_bbwp_m_enter_low),
@@ -4415,6 +5916,11 @@ class GridBrainV1Core(IStrategy):
                 "bbwp_stop_high": float(gate_bbwp_stop_high),
                 "bbwp_expansion_stop": bool(bbwp_expansion_stop),
                 "bbwp_gate_ok": bool(bbwp_gate_ok),
+                "band_slope_veto_enabled": bool(self.band_slope_veto_enabled),
+                "band_slope_pct": float(band_slope_pct) if band_slope_pct is not None else None,
+                "band_slope_gate_ok": bool(band_slope_gate_ok),
+                "excursion_asymmetry_ratio": float(excursion_asymmetry_ratio) if excursion_asymmetry_ratio is not None else None,
+                "excursion_asymmetry_gate_ok": bool(excursion_asymmetry_gate_ok),
                 "ema50_1h": ema50,
                 "ema100_1h": ema100,
                 "ema_dist_frac_1h": ema_dist_frac,
@@ -4427,12 +5933,33 @@ class GridBrainV1Core(IStrategy):
                 "atr_mode_max": float(gate_atr_pct_max),
                 "atr_ok": bool(atr_ok),
                 "vol_ratio_1h": vol_ratio,
+                "vol_ratio_ok_1h": bool(vol_1h_ok),
                 "rvol_15m": rvol_15m,
+                "rvol_15m_ok": bool(rvol_15m_ok),
+                "rvol_15m_max": float(gate_rvol_15m_max),
                 "inside_7d": bool(inside_7d),
+                "inside_7d_gate_ok": bool(inside_7d_gate_ok),
+                "context_7d_hard_veto": bool(gate_context_7d_hard_veto),
+                "box_position": float(box_position),
+                "start_box_position_ok": bool(start_box_position_ok),
+                "box_diagnostics": dict(box_diag) if box_diag else None,
+                "basis_raw_15m": basis_raw_now,
+                "basis_prev_15m": basis_raw_prev,
+                "basis_mid_15m": basis_mid,
+                "basis_upper_15m": basis_upper,
+                "basis_lower_15m": basis_lower,
+                "basis_cross_confirm": bool(basis_cross_confirm),
+                "basis_cross_ok": bool(basis_cross_ok),
                 "squeeze_on_1h": bool(squeeze_on_1h) if squeeze_on_1h is not None else None,
                 "squeeze_released_1h": bool(squeeze_released_1h),
+                "squeeze_val_1h": squeeze_val_1h,
+                "squeeze_val_prev_1h": squeeze_val_prev_1h,
                 "squeeze_gate_ok": bool(squeeze_gate_ok),
                 "squeeze_require_on_1h": bool(self.squeeze_require_on_1h),
+                "squeeze_release_against_bias": bool(squeeze_release_against_bias),
+                "squeeze_momentum_flip_against_edge": bool(squeeze_momentum_flip_against_edge),
+                "squeeze_momentum_decelerating": bool(squeeze_momentum_decelerating),
+                "squeeze_tp_nudged": bool(squeeze_tp_nudged),
                 "vrvp_box_ok": bool(vrvp_box_ok),
                 "micro_vap_ok": bool(micro_vap_ok),
                 "fvg_gate_ok": bool(fvg_gate_ok),
@@ -4445,6 +5972,7 @@ class GridBrainV1Core(IStrategy):
                 "mrvd_overlap_count": int(mrvd_overlap_count),
                 "mrvd_overlap_ok": bool(mrvd_overlap_ok),
                 "mrvd_near_any_poc": bool(mrvd_near_any_poc),
+                "mrvd_proximity_ok": bool(mrvd_proximity_ok),
                 "mrvd_pause_entries": bool(mrvd_pause_entries),
                 "mrvd_drift_guard_triggered": bool(mrvd_drift_guard_triggered),
                 "mrvd_drift_delta_steps": mrvd_drift_delta_steps,
@@ -4469,6 +5997,13 @@ class GridBrainV1Core(IStrategy):
                 "cvd_freeze_bars_left": int(cvd_freeze_left),
                 "cvd_freeze_active": bool(cvd_freeze_active),
                 "cvd_gate_ok": bool(cvd_gate_ok),
+                "drift_slope_gate_ok": bool(drift_slope_gate_ok),
+                "breakout_detected": bool(breakout),
+                "breakout_direction": str(breakout_direction) if breakout_direction is not None else None,
+                "breakout_last_up_level": breakout_up_level,
+                "breakout_last_dn_level": breakout_dn_level,
+                "breakout_bars_since": int(breakout_bars_since) if breakout_bars_since is not None else None,
+                "breakout_fresh_block_active": bool(breakout_fresh_block_active),
                 "ml_overlay_enabled": bool(self.freqai_overlay_enabled),
                 "ml_overlay_source": ml_source,
                 "ml_do_predict": ml_do_predict,
@@ -4487,6 +6022,31 @@ class GridBrainV1Core(IStrategy):
                 "os_dev_zero_persist_bars": int(os_dev_zero_persist),
                 "os_dev_rvol_ok": bool(os_dev_rvol_ok),
                 "os_dev_build_ok": bool(os_dev_build_ok),
+                "funding_filter_enabled": bool(self.funding_filter_enabled),
+                "fr_8h_pct": float(fr_8h_pct) if fr_8h_pct is not None else None,
+                "funding_bias": int(funding_bias),
+                "funding_gate_ok": bool(funding_gate_ok),
+                "hvp_enabled": bool(self.hvp_enabled),
+                "hvp_current": float(hvp_current) if hvp_current is not None else None,
+                "hvp_sma": float(hvp_sma) if hvp_sma is not None else None,
+                "hvp_gate_ok": bool(hvp_gate_ok),
+                "hvp_quiet_exit_bias": bool(hvp_quiet_exit_bias),
+                "hvp_quiet_exit_tp_nudged": bool(hvp_quiet_exit_tp_nudged),
+                "cost_model_source": str(cost_floor.get("source", "static")),
+                "min_step_pct_required": float(min_step_pct_required),
+                "step_pct_actual": float(step_pct_actual),
+                "step_cost_ok": bool(step_cost_block_reason is None),
+                "step_cost_block_reason": str(step_cost_block_reason) if step_cost_block_reason is not None else None,
+                "n_candidate": int(sizing.get("candidate_n", n_levels)),
+                "n_clamped": int(sizing.get("clamped_n", n_levels)),
+                "n_final": int(n_levels),
+                "capacity_hint_available": bool(capacity_hint.get("available", False)),
+                "capacity_hint_allow_start": bool(capacity_hint_allow),
+                "capacity_hint_advisory_only": bool(capacity_hint_advisory_only),
+                "capacity_hint_ok": bool(capacity_hint_ok),
+                "capacity_hint_reason": capacity_hint.get("reason"),
+                "preferred_rung_cap_hint": capacity_hint.get("preferred_rung_cap"),
+                "max_concurrent_rebuilds_hint": capacity_hint.get("max_concurrent_rebuilds"),
                 "gate_profile": gate_profile,
                 "regime_threshold_profile": str(self._active_threshold_profile()),
                 "gate_pass_count": int(gate_pass_count),
@@ -4494,13 +6054,21 @@ class GridBrainV1Core(IStrategy):
                 "gate_pass_ratio": float(gate_pass_ratio),
                 "gate_required_ratio": float(gate_start_min_pass_ratio),
                 "gate_ratio_ok": bool(gate_ratio_ok),
+                "start_stability_score": float(start_stability.get("score", 0.0)),
+                "start_stability_passed": int(start_stability.get("passed", 0)),
+                "start_stability_total": int(start_stability.get("total", 0)),
+                "start_stability_k_required": int(start_stability.get("k_required", 0)),
+                "start_stability_min_score": float(start_stability.get("min_score", 0.0)),
+                "start_stability_ok": bool(start_stability_ok),
                 "core_gates_ok": bool(core_gates_ok),
+                "meta_drift_soft_block": bool(meta_drift_soft_block),
                 "rsi_15m": rsi,
                 "vwap_15m": vwap,
                 "rule_range_ok": bool(rule_range_ok),
                 "rule_range_fail_reasons": rule_range_fail_reasons,
                 "mode_handoff_required_stop": bool(mode_handoff_required_stop),
                 "router_pause_stop": bool(router_pause_stop),
+                "start_filters": dict(start_filter_states),
                 "p_range": p_range,
                 "p_breakout": p_breakout,
                 "ml_confidence": ml_confidence,
@@ -4525,6 +6093,7 @@ class GridBrainV1Core(IStrategy):
                     "adx_di_down_risk_stop": bool(stop_reason_flags_raw["adx_di_down_risk_stop"]),
                     "bbwp_expansion_stop": bool(stop_reason_flags_raw["bbwp_expansion_stop"]),
                     "squeeze_release_break_stop": bool(stop_reason_flags_raw["squeeze_release_break_stop"]),
+                    "squeeze_release_against_bias": bool(squeeze_release_against_bias),
                     "os_dev_trend_stop": bool(stop_reason_flags_raw["os_dev_trend_stop"]),
                     "lvn_corridor_stop_override": bool(stop_reason_flags_raw["lvn_corridor_stop_override"]),
                     "lvn_corridor_stop_up": bool(stop_reason_flags_raw["lvn_corridor_stop_up"]),
@@ -4538,6 +6107,9 @@ class GridBrainV1Core(IStrategy):
                     "neutral_box_break_stop": bool(stop_reason_flags_raw["neutral_box_break_stop"]),
                     "mode_handoff_required_stop": bool(stop_reason_flags_raw["mode_handoff_required_stop"]),
                     "router_pause_stop": bool(stop_reason_flags_raw["router_pause_stop"]),
+                    "fresh_breakout_idle_reclaim_stop": bool(
+                        stop_reason_flags_raw["fresh_breakout_idle_reclaim_stop"]
+                    ),
                     "upper_edge_lvn": bool(upper_edge_lvn),
                     "lower_edge_lvn": bool(lower_edge_lvn),
                     "close_outside_up": bool(flags["close_outside_up"]),
@@ -4559,6 +6131,7 @@ class GridBrainV1Core(IStrategy):
                     "s_max": float(gate_bbwp_s_max),
                     "m_max": float(gate_bbwp_m_max),
                     "l_max": float(gate_bbwp_l_max),
+                    "nonexp_bars": int(self.bbwp_nonexp_bars),
                     "veto_pct": float(gate_bbwp_veto_pct),
                     "cooloff_trigger_pct": float(gate_bbwp_cooloff_trigger_pct),
                     "cooloff_release_s": float(gate_bbwp_cooloff_release_s),
@@ -4567,6 +6140,9 @@ class GridBrainV1Core(IStrategy):
                 "squeeze": {
                     "enabled": bool(self.squeeze_enabled),
                     "require_on_1h": bool(self.squeeze_require_on_1h),
+                    "momentum_block_enabled": bool(self.squeeze_momentum_block_enabled),
+                    "tp_nudge_enabled": bool(self.squeeze_tp_nudge_enabled),
+                    "tp_nudge_step_multiple": float(self.squeeze_tp_nudge_step_multiple),
                     "kc_atr_mult": float(self.kc_atr_mult),
                 },
                 "os_dev": {
@@ -4587,8 +6163,12 @@ class GridBrainV1Core(IStrategy):
                     "adx_4h_exit_max": float(gate_adx_4h_exit_max),
                     "adx_rising_bars": int(gate_adx_rising_bars),
                     "bbw_1h_pct_max": float(gate_bbw_1h_pct_max),
+                    "bbw_nonexp_lookback_bars": int(gate_bbw_nonexp_lookback_bars),
+                    "bbw_nonexp_tolerance_frac": float(gate_bbw_nonexp_tolerance_frac),
                     "ema_dist_max_frac": float(gate_ema_dist_max_frac),
                     "vol_spike_mult": float(gate_vol_spike_mult),
+                    "rvol_15m_max": float(gate_rvol_15m_max),
+                    "context_7d_hard_veto": bool(gate_context_7d_hard_veto),
                     "atr_source": str(gate_atr_source),
                     "atr_pct_max": float(gate_atr_pct_max),
                     "bbwp_s_enter_low": float(gate_bbwp_s_enter_low),
@@ -4598,6 +6178,31 @@ class GridBrainV1Core(IStrategy):
                     "bbwp_l_enter_low": float(gate_bbwp_l_enter_low),
                     "bbwp_l_enter_high": float(gate_bbwp_l_enter_high),
                     "bbwp_stop_high": float(gate_bbwp_stop_high),
+                    "band_slope_pct": float(self.band_slope_veto_pct),
+                    "band_slope_bars": int(self.band_slope_veto_bars),
+                    "band_slope_enabled": bool(self.band_slope_veto_enabled),
+                    "excursion_asymmetry_min_ratio": float(self.excursion_asymmetry_min_ratio),
+                    "excursion_asymmetry_max_ratio": float(self.excursion_asymmetry_max_ratio),
+                    "excursion_asymmetry_enabled": bool(self.excursion_asymmetry_veto_enabled),
+                    "drift_slope_veto_enabled": bool(self.drift_slope_veto_enabled),
+                    "funding_filter_enabled": bool(self.funding_filter_enabled),
+                    "funding_filter_pct": float(self.funding_filter_pct),
+                    "hvp_enabled": bool(self.hvp_enabled),
+                    "hvp_lookback_bars": int(self.hvp_lookback_bars),
+                    "hvp_sma_bars": int(self.hvp_sma_bars),
+                    "hvp_quiet_exit_bias_enabled": bool(self.hvp_quiet_exit_bias_enabled),
+                    "hvp_quiet_exit_step_multiple": float(self.hvp_quiet_exit_step_multiple),
+                    "planner_health_quarantine_on_gap": bool(self.planner_health_quarantine_on_gap),
+                    "planner_health_quarantine_on_misalign": bool(self.planner_health_quarantine_on_misalign),
+                    "meta_drift_soft_block_enabled": bool(self.meta_drift_soft_block_enabled),
+                    "meta_drift_soft_block_steps": float(self.meta_drift_soft_block_steps),
+                    "start_stability_min_score": float(self.start_stability_min_score),
+                    "start_stability_k_fraction": float(self.start_stability_k_fraction),
+                    "start_box_position_guard_enabled": bool(self.start_box_position_guard_enabled),
+                    "start_box_position_min_frac": float(self.start_box_position_min_frac),
+                    "start_box_position_max_frac": float(self.start_box_position_max_frac),
+                    "basis_cross_confirm_enabled": bool(self.basis_cross_confirm_enabled),
+                    "capacity_hint_hard_block": bool(self.capacity_hint_hard_block),
                 },
                 "regime_router": {
                     "enabled": bool(self.regime_router_enabled),
@@ -4689,6 +6294,24 @@ class GridBrainV1Core(IStrategy):
                     "cooldown_minutes": int(self.cooldown_minutes),
                     "min_runtime_hours": float(self.min_runtime_hours),
                     "min_runtime_secs": int(min_runtime_secs),
+                    "breakout_idle_reclaim_on_fresh": bool(self.breakout_idle_reclaim_on_fresh),
+                },
+                "cost_model": {
+                    "target_net_step_pct": float(cost_floor.get("target_net_step_pct", self.target_net_step_pct)),
+                    "static_floor_pct": float(static_gross_min),
+                    "chosen_floor_pct": float(min_step_pct_required),
+                    "source": str(cost_floor.get("source", "static")),
+                    "empirical_enabled": bool(self.empirical_cost_enabled),
+                    "empirical_window": int(self.empirical_cost_window),
+                    "empirical_percentile": float(self.empirical_cost_percentile),
+                    "empirical_min_samples": int(self.empirical_cost_min_samples),
+                    "empirical_stale_bars": int(self.empirical_cost_stale_bars),
+                },
+                "fill_detection": {
+                    "mode": str(self.fill_confirmation_mode),
+                    "no_repeat_lsi_guard": bool(self.fill_no_repeat_lsi_guard),
+                    "cooldown_bars": int(self.fill_no_repeat_cooldown_bars),
+                    "tick_size": float(self._infer_tick_size(step_price)),
                 },
             },
             "runtime_state": {
@@ -4717,9 +6340,15 @@ class GridBrainV1Core(IStrategy):
                 "router_desired_mode": router_state.get("desired_mode"),
                 "router_desired_reason": router_state.get("desired_reason"),
                 "router_switched": bool(router_state.get("switched", False)),
+                "planner_health_state": str(planner_health_state),
+                "planner_health_ok": bool(planner_health_ok),
                 "start_signal": bool(start_signal),
                 "start_blocked": bool(start_blocked),
+                "start_stability_score": float(start_stability.get("score", 0.0)),
+                "start_stability_ok": bool(start_stability_ok),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
+                "start_filters": dict(start_filter_states),
+                "warning_codes": warning_codes,
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
                 "stop_reason_flags_applied_active": [str(x) for x in stop_reason_flags_applied_active],
                 "neutral_runtime": {
@@ -4736,12 +6365,18 @@ class GridBrainV1Core(IStrategy):
             "diagnostics": {
                 "active_mode": str(active_mode),
                 "mode_pause": bool(mode_pause),
+                "planner_health_state": str(planner_health_state),
+                "planner_health_ok": bool(planner_health_ok),
                 "start_gate_ok": bool(start_gate_ok),
+                "start_stability_score": float(start_stability.get("score", 0.0)),
+                "start_stability_ok": bool(start_stability_ok),
                 "price_in_box": bool(price_in_box),
                 "rsi_ok": bool(rsi_ok),
                 "start_signal": bool(start_signal),
                 "start_blocked": bool(start_blocked),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
+                "start_filters": dict(start_filter_states),
+                "warning_codes": warning_codes,
                 "stop_rule_triggered": bool(stop_rule),
                 "stop_rule_triggered_raw": bool(raw_stop_rule),
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
@@ -4754,8 +6389,24 @@ class GridBrainV1Core(IStrategy):
             },
             "capital_policy": {
                 "mode": "QUOTE_ONLY",
+                "inventory_mode": str(self.inventory_mode),
                 "grid_budget_pct": float(grid_budget_pct_effective),
                 "reserve_pct": float(self.reserve_pct),
+                "inventory_target_bands": {
+                    "base_min_pct": float(self.inventory_target_base_min_pct),
+                    "base_max_pct": float(self.inventory_target_base_max_pct),
+                },
+                "topup_policy": str(self.topup_policy),
+                "max_concurrent_rebuilds": int(
+                    capacity_hint.get("max_concurrent_rebuilds")
+                    if capacity_hint.get("max_concurrent_rebuilds") is not None
+                    else self.max_concurrent_rebuilds
+                ),
+                "preferred_rung_cap": int(
+                    capacity_hint.get("preferred_rung_cap")
+                    if capacity_hint.get("preferred_rung_cap") is not None
+                    else self.preferred_rung_cap
+                ),
             },
             "notes": {
                 "brain_mode": "deterministic_v1",
