@@ -565,6 +565,10 @@ class GridBrainV1Core(IStrategy):
     breakout_override_allowed = True
     breakout_straddle_step_buffer_frac = 0.25
     breakout_reason_code = BlockReason.BLOCK_FRESH_BREAKOUT
+    min_range_len_bars = 20
+    breakout_confirm_bars = 2
+    breakout_confirm_buffer_mode = "step"  # step | atr | pct | abs
+    breakout_confirm_buffer_value = 1.0
 
     atr_period_15m = 20
     atr_pad_mult = 0.35
@@ -1312,6 +1316,124 @@ class GridBrainV1Core(IStrategy):
         if bear_break:
             return True, "bear", hi_max, lo_min
         return False, None, hi_max, lo_min
+
+    def _breakout_confirm_buffer(
+        self,
+        *,
+        step_price: float,
+        atr_15m: Optional[float],
+        close: float,
+    ) -> float:
+        mode = str(getattr(self, "breakout_confirm_buffer_mode", "step") or "step").strip().lower()
+        value = float(max(self._safe_float(getattr(self, "breakout_confirm_buffer_value", 0.0)) or 0.0, 0.0))
+        if mode == "step":
+            return float(value * max(float(step_price), 0.0))
+        if mode == "atr":
+            return float(value * max(float(atr_15m or 0.0), 0.0))
+        if mode == "pct":
+            return float(value * max(float(close), 0.0))
+        if mode == "abs":
+            return float(value)
+        # Unknown modes fall back to step semantics to keep behavior deterministic.
+        return float(value * max(float(step_price), 0.0))
+
+    @staticmethod
+    def _breakout_confirm_state(
+        dataframe: DataFrame,
+        *,
+        box_low: float,
+        box_high: float,
+        buffer: float,
+        confirm_bars: int,
+    ) -> Dict[str, object]:
+        k = max(int(confirm_bars), 0)
+        out: Dict[str, object] = {
+            "enabled": bool(k > 0),
+            "confirm_bars": int(k),
+            "buffer": float(max(float(buffer), 0.0)),
+            "enough_history": False,
+            "up_threshold": float(box_high + max(float(buffer), 0.0)),
+            "dn_threshold": float(box_low - max(float(buffer), 0.0)),
+            "confirmed_up": False,
+            "confirmed_dn": False,
+        }
+        if k <= 0 or "close" not in dataframe.columns:
+            return out
+        closes = pd.to_numeric(dataframe["close"], errors="coerce").dropna().astype(float)
+        if len(closes) < k:
+            return out
+        window = closes.iloc[-k:]
+        if len(window) < k:
+            return out
+        up_threshold = float(out["up_threshold"])
+        dn_threshold = float(out["dn_threshold"])
+        confirmed_up = bool((window > up_threshold).all())
+        confirmed_dn = bool((window < dn_threshold).all())
+        out.update(
+            {
+                "enough_history": True,
+                "confirmed_up": bool(confirmed_up),
+                "confirmed_dn": bool(confirmed_dn),
+            }
+        )
+        return out
+
+    @staticmethod
+    def _range_len_gate_state(
+        *,
+        current_bar_index: int,
+        box_built_at_bar_index: int,
+        min_range_len_bars: int,
+        box_gen_id: str,
+    ) -> Dict[str, object]:
+        required = max(int(min_range_len_bars), 1)
+        built_idx = int(box_built_at_bar_index)
+        cur_idx = int(current_bar_index)
+        range_len = int(max(cur_idx - built_idx + 1, 1))
+        ok = bool(range_len >= required)
+        return {
+            "ok": bool(ok),
+            "range_len_bars_current": int(range_len),
+            "min_range_len_bars": int(required),
+            "box_gen_id": str(box_gen_id),
+            "block_reason": (
+                str(BlockReason.BLOCK_MIN_RANGE_LEN_NOT_MET)
+                if not ok
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _breakout_confirm_reason_state(
+        *,
+        confirmed_up: bool,
+        confirmed_dn: bool,
+        running_active: bool,
+    ) -> Dict[str, object]:
+        stop_reason = None
+        block_reason = None
+        if bool(confirmed_up):
+            if bool(running_active):
+                stop_reason = str(StopReason.STOP_BREAKOUT_CONFIRM_UP)
+            else:
+                block_reason = str(BlockReason.BLOCK_BREAKOUT_CONFIRM_UP)
+        elif bool(confirmed_dn):
+            if bool(running_active):
+                stop_reason = str(StopReason.STOP_BREAKOUT_CONFIRM_DN)
+            else:
+                block_reason = str(BlockReason.BLOCK_BREAKOUT_CONFIRM_DN)
+        return {
+            "running_active": bool(running_active),
+            "confirmed_up": bool(confirmed_up),
+            "confirmed_dn": bool(confirmed_dn),
+            "stop_reason": stop_reason,
+            "block_reason": block_reason,
+            "stop_up": bool(stop_reason == str(StopReason.STOP_BREAKOUT_CONFIRM_UP)),
+            "stop_dn": bool(stop_reason == str(StopReason.STOP_BREAKOUT_CONFIRM_DN)),
+            "block_up": bool(block_reason == str(BlockReason.BLOCK_BREAKOUT_CONFIRM_UP)),
+            "block_dn": bool(block_reason == str(BlockReason.BLOCK_BREAKOUT_CONFIRM_DN)),
+            "gate_ok": bool(block_reason is None),
+        }
 
     @staticmethod
     def _bbw_nonexpanding(series: Optional[pd.Series], lookback: int, tolerance_frac: float) -> bool:
@@ -5231,6 +5353,7 @@ class GridBrainV1Core(IStrategy):
         if self.vrvp_reject_if_still_outside and vrvp_poc is not None and vrvp_dist_frac is not None:
             vrvp_box_ok = bool(vrvp_dist_frac <= self.vrvp_poc_outside_box_max_frac)
 
+        current_bar_index = max(int(len(dataframe)) - 1, 0)
         candidate_mid = float((hi_p + lo_p) / 2.0) if (hi_p + lo_p) else 0.0
         candidate_signature = self._box_signature(lo_p, hi_p, used_lb, pad)
         candidate_box = {
@@ -5279,10 +5402,24 @@ class GridBrainV1Core(IStrategy):
         box_rebuild_skipped = bool(neutral_mode_active and stored_box is not None and not use_candidate)
         box_rebuild_wait_bars = 0
         if use_candidate:
+            stored_gen_id = str(stored_box.get("box_gen_id")) if isinstance(stored_box, dict) and stored_box.get("box_gen_id") else None
+            stored_built_idx = (
+                int(self._safe_float(stored_box.get("built_at_bar_index")) or current_bar_index)
+                if isinstance(stored_box, dict)
+                else int(current_bar_index)
+            )
+            if signature_changed or stored_box is None:
+                box_gen_id = str(candidate_signature)
+                box_built_at_index = int(current_bar_index)
+            else:
+                box_gen_id = str(stored_gen_id or candidate_signature)
+                box_built_at_index = int(stored_built_idx)
             active_box = {
                 **candidate_box,
                 "width_pct": float(width_pct),
                 "vrvp": dict(candidate_vrvp),
+                "box_gen_id": str(box_gen_id),
+                "built_at_bar_index": int(box_built_at_index),
             }
             active_vrvp = candidate_vrvp
             self._box_state_by_pair[pair] = dict(active_box)
@@ -5295,13 +5432,31 @@ class GridBrainV1Core(IStrategy):
             self._record_box_history(pair, lo_p, hi_p)
             box_rebuild_wait_bars = 0
         else:
-            active_box = stored_box or candidate_box
+            active_box = dict(stored_box or candidate_box)
+            if "box_gen_id" not in active_box or not str(active_box.get("box_gen_id")).strip():
+                active_box["box_gen_id"] = str(stored_signature or candidate_signature)
+            if "built_at_bar_index" not in active_box:
+                active_box["built_at_bar_index"] = int(current_bar_index)
             active_vrvp = stored_box.get("vrvp") if stored_box else candidate_vrvp
+            self._box_state_by_pair[pair] = dict(active_box)
             self._box_rebuild_bars_since_by_pair[pair] = bars_since + 1
             box_rebuild_wait_bars = bars_since + 1
         lo_p = float(active_box["lo"])
         hi_p = float(active_box["hi"])
         pad_effective = float(active_box.get("pad", pad))
+        box_gen_id = str(active_box.get("box_gen_id") or candidate_signature)
+        box_built_at_bar_index = int(
+            self._safe_float(active_box.get("built_at_bar_index")) or current_bar_index
+        )
+        range_len_state = self._range_len_gate_state(
+            current_bar_index=int(current_bar_index),
+            box_built_at_bar_index=int(box_built_at_bar_index),
+            min_range_len_bars=int(self.min_range_len_bars),
+            box_gen_id=str(box_gen_id),
+        )
+        range_len_bars_current = int(range_len_state.get("range_len_bars_current", 1))
+        min_range_len_required = int(range_len_state.get("min_range_len_bars", self.min_range_len_bars))
+        min_range_len_ok = bool(range_len_state.get("ok", True))
         session_new_print = bool(fvg_state.get("session_new_print", False))
         session_gate_ok = bool(fvg_state.get("session_gate_ok", True))
         if session_new_print and session_gate_ok and pad_effective > 0.0:
@@ -5476,6 +5631,39 @@ class GridBrainV1Core(IStrategy):
                     if step_below_empirical
                     else BlockReason.BLOCK_STEP_BELOW_COST
                 )
+
+        breakout_confirm_buffer = self._breakout_confirm_buffer(
+            step_price=float(step_price),
+            atr_15m=atr_15m_value,
+            close=float(close),
+        )
+        breakout_confirm_state = self._breakout_confirm_state(
+            dataframe,
+            box_low=float(lo_p),
+            box_high=float(hi_p),
+            buffer=float(breakout_confirm_buffer),
+            confirm_bars=int(self.breakout_confirm_bars),
+        )
+        breakout_confirmed_up = bool(breakout_confirm_state.get("confirmed_up", False))
+        breakout_confirmed_dn = bool(breakout_confirm_state.get("confirmed_dn", False))
+        breakout_confirm_reason_state = self._breakout_confirm_reason_state(
+            confirmed_up=bool(breakout_confirmed_up),
+            confirmed_dn=bool(breakout_confirmed_dn),
+            running_active=bool(running_active_hint),
+        )
+        breakout_confirm_stop_up = bool(breakout_confirm_reason_state.get("stop_up", False))
+        breakout_confirm_stop_dn = bool(breakout_confirm_reason_state.get("stop_dn", False))
+        breakout_confirm_block_up = bool(breakout_confirm_reason_state.get("block_up", False))
+        breakout_confirm_block_dn = bool(breakout_confirm_reason_state.get("block_dn", False))
+        breakout_confirm_gate_ok = bool(breakout_confirm_reason_state.get("gate_ok", True))
+        min_range_len_block_reason: Optional[BlockReason] = (
+            None if min_range_len_ok else BlockReason.BLOCK_MIN_RANGE_LEN_NOT_MET
+        )
+        breakout_confirm_block_reason: Optional[BlockReason] = None
+        if breakout_confirm_reason_state.get("block_reason") == str(BlockReason.BLOCK_BREAKOUT_CONFIRM_UP):
+            breakout_confirm_block_reason = BlockReason.BLOCK_BREAKOUT_CONFIRM_UP
+        elif breakout_confirm_reason_state.get("block_reason") == str(BlockReason.BLOCK_BREAKOUT_CONFIRM_DN):
+            breakout_confirm_block_reason = BlockReason.BLOCK_BREAKOUT_CONFIRM_DN
 
         # MRVD (day/week/month) profile gates + drift pause.
         mrvd_day = self._mrvd_profile(
@@ -6070,6 +6258,8 @@ class GridBrainV1Core(IStrategy):
         stop_reason_flags_raw = {
             "two_consecutive_outside_up": bool(two_up),
             "two_consecutive_outside_dn": bool(two_dn),
+            str(StopReason.STOP_BREAKOUT_CONFIRM_UP): bool(breakout_confirm_stop_up),
+            str(StopReason.STOP_BREAKOUT_CONFIRM_DN): bool(breakout_confirm_stop_dn),
             "fast_outside_up": bool(flags["fast_outside_up"]),
             "fast_outside_dn": bool(flags["fast_outside_dn"]),
             "adx_hysteresis_stop": bool(adx_exit_overheat),
@@ -6099,6 +6289,10 @@ class GridBrainV1Core(IStrategy):
             stop_reason_enum_active.append(self.STOP_REASON_VOL_EXPANSION)
         if neutral_box_break_stop:
             stop_reason_enum_active.append(self.STOP_REASON_BOX_BREAK)
+        if breakout_confirm_stop_up:
+            stop_reason_enum_active.append(str(StopReason.STOP_BREAKOUT_CONFIRM_UP))
+        if breakout_confirm_stop_dn:
+            stop_reason_enum_active.append(str(StopReason.STOP_BREAKOUT_CONFIRM_DN))
         if meta_drift_hard_stop:
             stop_reason_enum_active.append(self.STOP_REASON_META_DRIFT_HARD)
         stop_reason_primary = str(stop_reason_enum_active[0]) if stop_reason_enum_active else None
@@ -6118,7 +6312,7 @@ class GridBrainV1Core(IStrategy):
             or fresh_breakout_idle_reclaim_stop
             or meta_drift_hard_stop
         )
-        raw_stop_rule = bool(two_up or two_dn or hard_stop or shift_stop)
+        raw_stop_rule = bool(breakout_confirm_stop_up or breakout_confirm_stop_dn or hard_stop or shift_stop)
 
         # ---- Entry sanity (15m) ----
         price_in_box = (close >= lo_p) and (close <= hi_p)
@@ -6151,6 +6345,10 @@ class GridBrainV1Core(IStrategy):
                 phase2_gate_failures.append(BlockReason.COOLOFF_BBWP_EXTREME)
         if breakout_fresh_block_active:
             phase2_gate_failures.append(BlockReason.BLOCK_FRESH_BREAKOUT)
+        if min_range_len_block_reason is not None:
+            phase2_gate_failures.append(min_range_len_block_reason)
+        if breakout_confirm_block_reason is not None:
+            phase2_gate_failures.append(breakout_confirm_block_reason)
         if not funding_gate_ok:
             phase2_gate_failures.append(BlockReason.BLOCK_FUNDING_FILTER)
         if not hvp_gate_ok:
@@ -6197,6 +6395,8 @@ class GridBrainV1Core(IStrategy):
             ("atr_ok", bool(atr_ok)),
             ("inside_7d", bool(inside_7d_gate_ok)),
             ("breakout_fresh_gate_ok", bool(not breakout_fresh_block_active)),
+            ("min_range_len_ok", bool(min_range_len_ok)),
+            ("breakout_confirm_gate_ok", bool(breakout_confirm_gate_ok)),
             ("vrvp_box_ok", bool(vrvp_box_ok)),
             ("bbwp_gate_ok", bool(bbwp_gate_ok)),
             ("squeeze_gate_ok", bool(squeeze_gate_ok)),
@@ -6234,6 +6434,8 @@ class GridBrainV1Core(IStrategy):
             "vol_ok",
             "atr_ok",
             "inside_7d",
+            "min_range_len_ok",
+            "breakout_confirm_gate_ok",
             "vrvp_box_ok",
             "step_cost_ok",
             "start_box_position_ok",
@@ -6351,6 +6553,8 @@ class GridBrainV1Core(IStrategy):
             and basis_cross_ok
             and mrvd_proximity_ok
             and bool(step_cost_block_reason is None)
+            and bool(min_range_len_ok)
+            and bool(breakout_confirm_gate_ok)
             and bool(capacity_hint_ok)
             and bool(volatility_strictness_ok)
             and (not box_block_active)
@@ -6377,6 +6581,10 @@ class GridBrainV1Core(IStrategy):
             start_block_reasons.append(str(BlockReason.BLOCK_START_STABILITY_LOW))
         if step_cost_block_reason is not None:
             start_block_reasons.append(str(step_cost_block_reason))
+        if min_range_len_block_reason is not None:
+            start_block_reasons.append(str(min_range_len_block_reason))
+        if breakout_confirm_block_reason is not None:
+            start_block_reasons.append(str(breakout_confirm_block_reason))
         if not start_box_position_ok:
             start_block_reasons.append(str(BlockReason.BLOCK_START_BOX_POSITION))
         if not basis_cross_ok:
@@ -6483,6 +6691,8 @@ class GridBrainV1Core(IStrategy):
             "reclaim_ok": bool(not reclaim_active),
             "capacity_hint_ok": bool(capacity_hint_ok),
             "cost_step_ok": bool(step_cost_block_reason is None),
+            "min_range_len_ok": bool(min_range_len_ok),
+            "breakout_confirm_gate_ok": bool(breakout_confirm_gate_ok),
             "volatility_policy_ok": bool(volatility_strictness_ok),
         }
 
@@ -6571,6 +6781,24 @@ class GridBrainV1Core(IStrategy):
                         "required": bool(self.poc_acceptance_enabled),
                         "satisfied": bool(poc_acceptance_satisfied),
                         "lookback_bars": int(self.poc_acceptance_lookback_bars),
+                    },
+                    "min_range_len": {
+                        "required_bars": int(min_range_len_required),
+                        "range_len_bars_current": int(range_len_bars_current),
+                        "ok": bool(min_range_len_ok),
+                        "box_gen_id": str(box_gen_id),
+                    },
+                    "breakout_confirm": {
+                        "enabled": bool(breakout_confirm_state.get("enabled", False)),
+                        "confirm_bars": int(breakout_confirm_state.get("confirm_bars", 0)),
+                        "buffer": float(breakout_confirm_state.get("buffer", 0.0)),
+                        "up_threshold": float(breakout_confirm_state.get("up_threshold", hi_p)),
+                        "dn_threshold": float(breakout_confirm_state.get("dn_threshold", lo_p)),
+                        "confirmed_up": bool(breakout_confirmed_up),
+                        "confirmed_dn": bool(breakout_confirmed_dn),
+                        "gate_ok": bool(breakout_confirm_gate_ok),
+                        "block_reason": breakout_confirm_reason_state.get("block_reason"),
+                        "stop_reason": breakout_confirm_reason_state.get("stop_reason"),
                     },
                 },
                 "micro_vap": {
@@ -6877,6 +7105,17 @@ class GridBrainV1Core(IStrategy):
                 "breakout_last_dn_level": breakout_dn_level,
                 "breakout_bars_since": int(breakout_bars_since) if breakout_bars_since is not None else None,
                 "breakout_fresh_block_active": bool(breakout_fresh_block_active),
+                "breakout_confirm_bars": int(breakout_confirm_state.get("confirm_bars", 0)),
+                "breakout_confirm_buffer": float(breakout_confirm_state.get("buffer", 0.0)),
+                "breakout_confirmed_up": bool(breakout_confirmed_up),
+                "breakout_confirmed_dn": bool(breakout_confirmed_dn),
+                "breakout_confirm_gate_ok": bool(breakout_confirm_gate_ok),
+                "breakout_confirm_block_reason": breakout_confirm_reason_state.get("block_reason"),
+                "breakout_confirm_stop_reason": breakout_confirm_reason_state.get("stop_reason"),
+                "min_range_len_bars": int(min_range_len_required),
+                "range_len_bars_current": int(range_len_bars_current),
+                "min_range_len_ok": bool(min_range_len_ok),
+                "box_gen_id": str(box_gen_id),
                 "ml_overlay_enabled": bool(self.freqai_overlay_enabled),
                 "ml_overlay_source": ml_source,
                 "ml_do_predict": ml_do_predict,
@@ -6978,6 +7217,12 @@ class GridBrainV1Core(IStrategy):
                 "stop_reasons": {
                     "two_consecutive_outside_up": bool(stop_reason_flags_raw["two_consecutive_outside_up"]),
                     "two_consecutive_outside_dn": bool(stop_reason_flags_raw["two_consecutive_outside_dn"]),
+                    str(StopReason.STOP_BREAKOUT_CONFIRM_UP): bool(
+                        stop_reason_flags_raw[str(StopReason.STOP_BREAKOUT_CONFIRM_UP)]
+                    ),
+                    str(StopReason.STOP_BREAKOUT_CONFIRM_DN): bool(
+                        stop_reason_flags_raw[str(StopReason.STOP_BREAKOUT_CONFIRM_DN)]
+                    ),
                     "fast_outside_up": bool(stop_reason_flags_raw["fast_outside_up"]),
                     "fast_outside_dn": bool(stop_reason_flags_raw["fast_outside_dn"]),
                     "adx_hysteresis_stop": bool(stop_reason_flags_raw["adx_hysteresis_stop"]),
@@ -7009,6 +7254,14 @@ class GridBrainV1Core(IStrategy):
                     "range_shift_stop": bool(stop_reason_flags_raw["range_shift_stop"]),
                     "range_shift_frac": shift_frac,
                     "neutral_box_break_bars": int(box_break_bars),
+                    "breakout_confirm_bars": int(breakout_confirm_state.get("confirm_bars", 0)),
+                    "breakout_confirm_buffer": float(breakout_confirm_state.get("buffer", 0.0)),
+                    "breakout_confirm_up_threshold": float(
+                        breakout_confirm_state.get("up_threshold", hi_p)
+                    ),
+                    "breakout_confirm_dn_threshold": float(
+                        breakout_confirm_state.get("dn_threshold", lo_p)
+                    ),
                 },
                 "stop_reason_primary": stop_reason_primary,
                 "stop_policy": "DANGER_TO_QUOTE",
@@ -7118,6 +7371,10 @@ class GridBrainV1Core(IStrategy):
                     "start_box_position_guard_enabled": bool(self.start_box_position_guard_enabled),
                     "start_box_position_min_frac": float(self.start_box_position_min_frac),
                     "start_box_position_max_frac": float(self.start_box_position_max_frac),
+                    "min_range_len_bars": int(self.min_range_len_bars),
+                    "breakout_confirm_bars": int(self.breakout_confirm_bars),
+                    "breakout_confirm_buffer_mode": str(self.breakout_confirm_buffer_mode),
+                    "breakout_confirm_buffer_value": float(self.breakout_confirm_buffer_value),
                     "basis_cross_confirm_enabled": bool(self.basis_cross_confirm_enabled),
                     "capacity_hint_hard_block": bool(self.capacity_hint_hard_block),
                 },

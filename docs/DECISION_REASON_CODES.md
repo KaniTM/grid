@@ -215,6 +215,24 @@ Use these fields (or equivalent):
 - **Applies to:** `REBUILD`, `START`
 - **Severity:** hard
 
+### `BLOCK_BREAKOUT_CONFIRM_UP`
+- **Module:** breakout confirmation bars gate
+- **Meaning:** Consecutive close confirmation above `box_high + buffer` is active; block new `START`/`REBUILD`.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** hard
+
+### `BLOCK_BREAKOUT_CONFIRM_DN`
+- **Module:** breakout confirmation bars gate
+- **Meaning:** Consecutive close confirmation below `box_low - buffer` is active; block new `START`/`REBUILD`.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** hard
+
+### `BLOCK_MIN_RANGE_LEN_NOT_MET`
+- **Module:** minimum range length gate
+- **Meaning:** Active box generation has not persisted for the configured minimum number of bars.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** hard
+
 ### `BLOCK_OS_DEV_DIRECTIONAL`
 - **Module:** Range DI / deviation-pivot regime (`os_dev`)
 - **Meaning:** `os_dev` is directional (`-1` or `+1`) and neutral/range state is required.
@@ -612,6 +630,18 @@ Use these fields (or equivalent):
 ### `STOP_BREAKOUT_2STRIKE_DN`
 - **Module:** STOP framework (2-strike breakout)
 - **Meaning:** Downward breakout confirmed by 2-strike logic beyond box/structure.
+- **Applies to:** running grid
+- **Severity:** hard
+
+### `STOP_BREAKOUT_CONFIRM_UP`
+- **Module:** breakout confirmation bars gate
+- **Meaning:** Running grid is stopped after configured consecutive closes above `box_high + buffer`.
+- **Applies to:** running grid
+- **Severity:** hard
+
+### `STOP_BREAKOUT_CONFIRM_DN`
+- **Module:** breakout confirmation bars gate
+- **Meaning:** Running grid is stopped after configured consecutive closes below `box_low - buffer`.
 - **Applies to:** running grid
 - **Severity:** hard
 

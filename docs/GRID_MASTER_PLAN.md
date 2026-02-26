@@ -2249,7 +2249,7 @@ Status values used:
 
 - `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M007`, `M008`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
-- `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
+- `M201`, `M202`, `M203`, `M205`, `M206`, `M207`, `M208`, `M210`, `M211`
 - `M301`, `M302`, `M303`, `M304`, `M305`
 - `M401`, `M402`, `M403`, `M405`
 - `M501`, `M503`, `M504`
@@ -2367,12 +2367,16 @@ Status values used:
     - Strengthened `freqtrade/user_data/tests/test_chaos_replay_harness.py` to assert per-perturbation counter activation and matching operational rail effects for latency/spread/reject/missing/delayed/data-gap profiles.
     - Added deterministic replay assertions for seeded chaos counters and deterministic-vs-chaos delta parity.
     - Added explicit “explain changes under chaos” assertions via non-zero deterministic-vs-chaos deltas plus reason-distribution payload presence in replay summary.
+15. [DONE 2026-02-26] Complete M205 minimum range length + breakout confirmation bars gates.
+    - Added deterministic planner gates for minimum range age (`min_range_len_bars`) and breakout confirmation (`breakout_confirm_bars` + configurable buffer mode/value) in `GridBrainV1`.
+    - START/REBUILD now block with canonical reasons `BLOCK_MIN_RANGE_LEN_NOT_MET`, `BLOCK_BREAKOUT_CONFIRM_UP`, and `BLOCK_BREAKOUT_CONFIRM_DN`.
+    - Running grids now emit canonical STOP reasons `STOP_BREAKOUT_CONFIRM_UP` / `STOP_BREAKOUT_CONFIRM_DN` on confirmed breakout bars.
+    - Added focused coverage in `freqtrade/user_data/tests/test_min_range_and_breakout_confirm.py` (range-age threshold, breakout confirmation, buffer modes, determinism).
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M205` Minimum range length + breakout confirm bars
 - `M209` Log-space quartiles + 1.386 extensions (log-space detail incomplete)
 - `M213` Midline bias fallback (full policy incomplete)
 - `M404` Protections layer (drawdown/protection extensions incomplete)
@@ -2441,7 +2445,7 @@ Status values used:
 - `M202` DONE
 - `M203` DONE
 - `M204` NOT_IMPLEMENTED
-- `M205` PARTIAL
+- `M205` DONE
 - `M206` DONE
 - `M207` DONE
 - `M208` DONE
