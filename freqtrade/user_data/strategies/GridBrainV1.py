@@ -12,6 +12,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Iterable
+from uuid import uuid4
 import numpy as np
 import pandas as pd
 from pandas import DataFrame
@@ -19,8 +20,10 @@ from pandas import DataFrame
 from freqtrade.configuration import Configuration as Config
 from freqtrade.strategy import IStrategy, informative
 import talib.abstract as ta
+from core.atomic_json import write_json_atomic
 from technical import qtpylib
 from core.enums import BlockReason, MaterialityClass, StopReason, WarningCode
+from core.plan_signature import PLAN_SCHEMA_VERSION, PLANNER_VERSION_DEFAULT, compute_plan_hash
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
 REQUIRED_OHLC_COLUMNS = ("date", "open", "high", "low", "close", "volume")
@@ -893,11 +896,16 @@ class GridBrainV1Core(IStrategy):
     tick_size_floor = 1e-8
 
     plans_root_rel = "grid_plans"
+    plan_schema_version = PLAN_SCHEMA_VERSION
+    planner_version = PLANNER_VERSION_DEFAULT
+    plan_expiry_seconds = 0
 
     # -------- internal state (best-effort, per process) --------
     _last_written_ts_by_pair: Dict[str, int] = {}
     _last_plan_hash_by_pair: Dict[str, str] = {}
     _last_plan_base_hash_by_pair: Dict[str, str] = {}
+    _last_plan_id_by_pair: Dict[str, str] = {}
+    _last_decision_seq_by_pair: Dict[str, int] = {}
     _last_mid_by_pair: Dict[str, float] = {}
     _last_box_step_by_pair: Dict[str, float] = {}
     _reclaim_until_ts_by_pair: Dict[str, int] = {}
@@ -1404,16 +1412,8 @@ class GridBrainV1Core(IStrategy):
             "ok": ok,
         }
 
-    def _atomic_write_file(self, path: str, payload: str) -> None:
-        tmp_path = f"{path}.tmp"
-        parent = os.path.dirname(path)
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent, exist_ok=True)
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+    def _atomic_write_json(self, path: str, payload: Dict[str, object]) -> None:
+        write_json_atomic(path, payload)
 
     def _evaluate_materiality(
         self,
@@ -2347,6 +2347,8 @@ class GridBrainV1Core(IStrategy):
             self._last_written_ts_by_pair,
             self._last_plan_hash_by_pair,
             self._last_plan_base_hash_by_pair,
+            self._last_plan_id_by_pair,
+            self._last_decision_seq_by_pair,
             self._last_mid_by_pair,
             self._last_box_step_by_pair,
             self._reclaim_until_ts_by_pair,
@@ -2403,6 +2405,49 @@ class GridBrainV1Core(IStrategy):
             root_base = os.path.join("/freqtrade/user_data", self.plans_root_rel)
         return os.path.join(root_base, exchange_name, safe_pair)
 
+    def _seed_plan_signature_state(self, exchange_name: str, pair: str) -> None:
+        need_seq = pair not in self._last_decision_seq_by_pair
+        need_id = pair not in self._last_plan_id_by_pair
+        need_hash = pair not in self._last_plan_hash_by_pair
+        if not (need_seq or need_id or need_hash):
+            return
+
+        latest_path = os.path.join(self._plan_dir(exchange_name, pair), "grid_plan.latest.json")
+        if not os.path.isfile(latest_path):
+            return
+        try:
+            with open(latest_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return
+        except Exception:
+            return
+
+        if need_seq:
+            try:
+                seq = int(payload.get("decision_seq") or 0)
+                if seq > 0:
+                    self._last_decision_seq_by_pair[pair] = seq
+            except Exception:
+                pass
+
+        if need_id:
+            plan_id = str(payload.get("plan_id") or "").strip()
+            if plan_id:
+                self._last_plan_id_by_pair[pair] = plan_id
+
+        if need_hash:
+            plan_hash = str(payload.get("plan_hash") or "").strip()
+            if plan_hash:
+                self._last_plan_hash_by_pair[pair] = plan_hash
+
+    def _next_plan_identity(self, exchange_name: str, pair: str) -> Tuple[str, int, Optional[str]]:
+        self._seed_plan_signature_state(exchange_name, pair)
+        supersedes_plan_id = self._last_plan_id_by_pair.get(pair)
+        prev_seq = int(self._last_decision_seq_by_pair.get(pair, 0))
+        decision_seq = max(prev_seq + 1, 1)
+        return str(uuid4()), int(decision_seq), supersedes_plan_id
+
     def _write_plan(
         self,
         exchange_name: str,
@@ -2415,6 +2460,7 @@ class GridBrainV1Core(IStrategy):
 
         out_dir = self._plan_dir(exchange_name, pair)
         os.makedirs(out_dir, exist_ok=True)
+        self._seed_plan_signature_state(exchange_name, pair)
 
         ts_safe = None
         cts = plan.get("candle_ts")
@@ -2445,19 +2491,29 @@ class GridBrainV1Core(IStrategy):
         latest_path = os.path.join(out_dir, "grid_plan.latest.json")
         archive_path = os.path.join(out_dir, f"grid_plan.{ts_safe}.json")
 
-        payload = json.dumps(plan, indent=2, sort_keys=True)
-
-        payload_hash = str(hash(payload))
+        payload_hash = str(plan.get("plan_hash") or "").strip()
+        if not payload_hash:
+            payload_hash = compute_plan_hash(plan)
+            plan["plan_hash"] = payload_hash
         last_hash = self._last_plan_hash_by_pair.get(pair)
         if last_hash == payload_hash:
             if base_plan_hash is not None:
                 self._last_plan_base_hash_by_pair[pair] = base_plan_hash
             return
 
-        self._atomic_write_file(latest_path, payload)
-        self._atomic_write_file(archive_path, payload)
+        self._atomic_write_json(latest_path, plan)
+        self._atomic_write_json(archive_path, plan)
 
         self._last_plan_hash_by_pair[pair] = payload_hash
+        plan_id = str(plan.get("plan_id") or "").strip()
+        if plan_id:
+            self._last_plan_id_by_pair[pair] = plan_id
+        try:
+            decision_seq = int(plan.get("decision_seq") or 0)
+            if decision_seq > 0:
+                self._last_decision_seq_by_pair[pair] = decision_seq
+        except Exception:
+            pass
         if base_plan_hash is not None:
             self._last_plan_base_hash_by_pair[pair] = base_plan_hash
 
@@ -6868,8 +6924,117 @@ class GridBrainV1Core(IStrategy):
             },
         }
 
-        plan_payload_base = json.dumps(plan, indent=2, sort_keys=True)
-        base_plan_hash = str(hash(plan_payload_base))
+        mode_scores_raw = router_state.get("scores", {})
+        mode_scores = mode_scores_raw if isinstance(mode_scores_raw, dict) else {}
+        mode_score = self._safe_float(mode_scores.get(str(active_mode)))
+        materiality_class = str(materiality_info.get("class", MaterialityClass.NOOP))
+        replan_reasons = [str(x) for x in materiality_info.get("reasons", [])]
+        replan_decision = "publish" if bool(materiality_info.get("publish", False)) else "defer"
+        valid_for_candle_ts = int(candle_ts) if candle_ts is not None else int(clock_ts)
+        expires_at = None
+        if int(self.plan_expiry_seconds) > 0:
+            expires_at = self._ts_to_iso(valid_for_candle_ts + int(self.plan_expiry_seconds))
+
+        if action == "STOP":
+            action_reason = str(stop_reason_primary or "STOP_RULE_TRIGGERED")
+        elif action == "START":
+            action_reason = "START_GATES_PASSED"
+        else:
+            action_reason = str(start_block_reasons[0]) if start_block_reasons else "HOLD_NO_ACTION"
+
+        changed_fields: List[str] = []
+        if abs(float(materiality_info.get("delta_mid_steps", 0.0))) > 0:
+            changed_fields.append("box.mid")
+        if abs(float(materiality_info.get("delta_width_pct", 0.0))) > 0:
+            changed_fields.append("box.width_pct")
+        if abs(float(materiality_info.get("delta_tp_steps", 0.0))) > 0:
+            changed_fields.append("risk.tp_price")
+        if abs(float(materiality_info.get("delta_sl_steps", 0.0))) > 0:
+            changed_fields.append("risk.sl_price")
+
+        plan["schema_version"] = str(self.plan_schema_version)
+        plan["planner_version"] = str(self.planner_version)
+        plan["pair"] = str(pair)
+        plan["mode_score"] = mode_score
+        plan["action_reason"] = action_reason
+        plan["blockers"] = [str(x) for x in start_block_reasons]
+        plan["planner_health_state"] = str(planner_health_state)
+        plan["materiality_class"] = materiality_class
+        plan["replan_decision"] = replan_decision
+        plan["replan_reasons"] = replan_reasons
+        plan["generated_at"] = str(ts)
+        plan["valid_for_candle_ts"] = int(valid_for_candle_ts)
+        plan["expires_at"] = expires_at
+        plan["supersedes_plan_id"] = None
+        plan["range_diagnostics"] = {
+            "lookback_bars_used": int(used_lb),
+            "pad": float(pad),
+            "box_block_reasons": [str(x) for x in box_block_reasons],
+            "breakout_fresh_block_active": bool(breakout_fresh_block_active),
+            "breakout_levels": {
+                "up": float(breakout_up_level),
+                "dn": float(breakout_dn_level),
+            },
+        }
+        plan["box"] = {
+            "low": float(lo_p),
+            "high": float(hi_p),
+            "mid": float(mid),
+            "width_pct": float(width_pct),
+            "lookback_bars_used": int(used_lb),
+            "pad": float(pad),
+            "quartiles": {"q1": float(q1), "q2": float(q2), "q3": float(q3)},
+        }
+        plan["signals_snapshot"] = dict(plan.get("signals", {}))
+        plan["runtime_hints"] = {
+            "clock_ts": int(clock_ts),
+            "clock_time_utc": self._ts_to_iso(int(clock_ts)),
+            "running": bool(running_now),
+            "running_mode": (
+                self._normalize_mode_name(self._running_mode_by_pair.get(pair))
+                if bool(running_now)
+                else None
+            ),
+            "reclaim_active": bool(reclaim_active_now),
+            "cooldown_active": bool(cooldown_active_now),
+            "router_target_mode": router_state.get("target_mode"),
+            "router_desired_mode": router_state.get("desired_mode"),
+            "capacity_hint": dict(capacity_hint),
+        }
+        plan["start_stability_score"] = float(start_stability.get("score", 0.0))
+        plan["meta_drift_state"] = {
+            "detected": bool(meta_drift_state.get("drift_detected", False)),
+            "severity": str(meta_drift_state.get("severity", "none")),
+            "recommended_action": str(meta_drift_recommended_action),
+            "channels": [str(x) for x in meta_drift_state.get("drift_channels", [])],
+            "hard_stop": bool(meta_drift_hard_stop),
+            "cooldown_extended": bool(meta_drift_cooldown_extended),
+        }
+        plan["cost_model_snapshot"] = {
+            "source": str(cost_floor.get("source", "static")),
+            "target_net_step_pct": float(cost_floor.get("target_net_step_pct", self.target_net_step_pct)),
+            "static_floor_pct": float(static_gross_min),
+            "chosen_floor_pct": float(min_step_pct_required),
+            "step_pct_actual": float(step_pct_actual),
+            "empirical_snapshot": cost_floor.get("empirical_snapshot", {}),
+            "empirical_sample": cost_floor.get("empirical_sample", {}),
+        }
+        plan["module_states"] = {
+            "cost_model": {"source": str(cost_floor.get("source", "static"))},
+            "start_stability": {"ok": bool(start_stability_ok)},
+            "planner_health": {"state": str(planner_health_state)},
+            "meta_drift_guard": {"enabled": bool(self.meta_drift_guard_enabled)},
+            "poc_acceptance_gate": {"enabled": bool(self.poc_acceptance_enabled)},
+            "fill_detection": {
+                "mode": str(self.fill_confirmation_mode),
+                "no_repeat_lsi_guard": bool(self.fill_no_repeat_lsi_guard),
+                "cooldown_bars": int(self.fill_no_repeat_cooldown_bars),
+            },
+        }
+        if changed_fields:
+            plan["changed_fields"] = changed_fields
+
+        base_plan_hash = compute_plan_hash(plan)
         last_base_hash = self._last_plan_base_hash_by_pair.get(pair)
         base_hash_changed = bool(last_base_hash is None or (base_plan_hash != last_base_hash))
 
@@ -6883,6 +7048,12 @@ class GridBrainV1Core(IStrategy):
             else:
                 should_write = True
             if should_write:
+                plan_id, decision_seq, supersedes_plan_id = self._next_plan_identity(ex_name, pair)
+                plan["plan_id"] = str(plan_id)
+                plan["decision_seq"] = int(decision_seq)
+                plan["plan_hash"] = str(base_plan_hash)
+                plan["generated_at"] = datetime.now(timezone.utc).isoformat()
+                plan["supersedes_plan_id"] = supersedes_plan_id
                 plan_guard_decision_count = int(self._plan_guard_decision_count_by_pair.get(pair, 0) + 1)
                 self._plan_guard_decision_count_by_pair[pair] = plan_guard_decision_count
                 plan["plan_guard"] = {

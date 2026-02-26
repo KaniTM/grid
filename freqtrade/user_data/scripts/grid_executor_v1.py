@@ -6,9 +6,10 @@ from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from core.plan_signature import compute_plan_hash, plan_is_expired, plan_pair, validate_signature_fields
 
 try:
     import ccxt  # optional, only needed for --mode ccxt
@@ -49,8 +50,20 @@ def _plan_context(plan: Optional[Dict]) -> Dict[str, object]:
     path = plan.get("_plan_path") or plan.get("plan_path") or plan.get("path")
     if path:
         out["plan_path"] = str(path)
+    pair = plan_pair(plan)
+    if pair:
+        out["pair"] = pair
     if plan.get("ts"):
         out["plan_ts"] = str(plan.get("ts"))
+    if plan.get("plan_id"):
+        out["plan_id"] = str(plan.get("plan_id"))
+    if plan.get("decision_seq") is not None:
+        try:
+            out["decision_seq"] = int(plan.get("decision_seq"))
+        except Exception:
+            out["decision_seq"] = str(plan.get("decision_seq"))
+    if plan.get("plan_hash"):
+        out["plan_hash"] = str(plan.get("plan_hash"))
     try:
         out["plan_keys"] = sorted(plan.keys())
     except Exception:
@@ -76,11 +89,17 @@ class RestingOrder:
 
 @dataclass
 class ExecutorState:
+    schema_version: str
     ts: float
     exchange: str
+    pair: str
     symbol: str
     plan_ts: str
     mode: str
+    last_applied_plan_id: Optional[str]
+    last_applied_seq: int
+    last_plan_hash: Optional[str]
+    executor_state_machine: str
 
     step: float
     n_levels: int
@@ -97,6 +116,7 @@ class ExecutorState:
 
     runtime: Dict
     orders: List[Dict]
+    applied_plan_ids: List[str]
 
 
 # -----------------------------
@@ -417,6 +437,7 @@ class GridExecutorV1:
         self.ccxt_retries = int(ccxt_retries)
         self.use_exchange_balance = bool(use_exchange_balance)
         self.close_on_stop = bool(close_on_stop)
+        self._state_schema_version = "1.0.0"
 
         # runtime
         self._prev_plan: Optional[Dict] = None
@@ -482,6 +503,11 @@ class GridExecutorV1:
         self._last_ccxt_error: Optional[str] = None
         self._recovery_loaded: bool = False
         self._recovery_error: Optional[str] = None
+        self._last_applied_plan_id: Optional[str] = None
+        self._last_applied_seq: int = 0
+        self._last_applied_plan_hash: Optional[str] = None
+        self._applied_plan_ids: Deque[str] = deque(maxlen=4096)
+        self._applied_plan_id_set: Set[str] = set()
 
         if self.mode == "ccxt":
             if ccxt is None:
@@ -588,6 +614,23 @@ class GridExecutorV1:
                 self._post_only_reprice_count_total,
             )
 
+            last_applied_plan_id = payload.get("last_applied_plan_id") or runtime.get("last_applied_plan_id")
+            if last_applied_plan_id:
+                self._last_applied_plan_id = str(last_applied_plan_id)
+            self._last_applied_seq = max(
+                _safe_int(payload.get("last_applied_seq"), self._last_applied_seq),
+                _safe_int(runtime.get("last_applied_seq"), self._last_applied_seq),
+            )
+            last_plan_hash = payload.get("last_plan_hash") or runtime.get("last_plan_hash")
+            if last_plan_hash:
+                self._last_applied_plan_hash = str(last_plan_hash)
+
+            for pid in payload.get("applied_plan_ids") or []:
+                if pid is not None:
+                    self._remember_applied_plan_id(str(pid))
+            if self._last_applied_plan_id:
+                self._remember_applied_plan_id(self._last_applied_plan_id)
+
             loaded_orders: List[RestingOrder] = []
             for row in payload.get("orders") or []:
                 if not isinstance(row, dict):
@@ -642,6 +685,105 @@ class GridExecutorV1:
         c = str(code).strip()
         if c and c not in self._runtime_pause_reasons:
             self._runtime_pause_reasons.append(c)
+
+    def _remember_applied_plan_id(self, plan_id: str) -> None:
+        pid = str(plan_id or "").strip()
+        if not pid or pid in self._applied_plan_id_set:
+            return
+        if len(self._applied_plan_ids) >= self._applied_plan_ids.maxlen:
+            oldest = self._applied_plan_ids.popleft()
+            self._applied_plan_id_set.discard(oldest)
+        self._applied_plan_ids.append(pid)
+        self._applied_plan_id_set.add(pid)
+
+    def _record_applied_plan(self, plan: Dict) -> None:
+        plan_id = str(plan.get("plan_id") or "").strip()
+        if plan_id:
+            self._remember_applied_plan_id(plan_id)
+            self._last_applied_plan_id = plan_id
+        try:
+            self._last_applied_seq = max(int(plan.get("decision_seq") or 0), self._last_applied_seq)
+        except Exception:
+            pass
+        plan_hash = str(plan.get("plan_hash") or "").strip()
+        if plan_hash:
+            self._last_applied_plan_hash = plan_hash
+
+    def _reject_plan_intake(self, plan: Dict, code: str, reason: str) -> None:
+        self._append_runtime_exec_event(code)
+        self._last_raw_action = "HOLD"
+        self._last_effective_action = "HOLD"
+        self._last_action_suppression_reason = f"plan_rejected:{code}"
+        log_event(
+            "warning",
+            "plan_rejected",
+            plan=plan,
+            code=code,
+            reason=reason,
+            last_applied_seq=int(self._last_applied_seq),
+            last_applied_plan_id=self._last_applied_plan_id,
+        )
+
+    def _validate_plan_intake(self, plan: Dict) -> Tuple[bool, Optional[str]]:
+        if not isinstance(plan, dict):
+            self._reject_plan_intake({}, "EXEC_PLAN_SCHEMA_INVALID", "plan_not_object")
+            return False, "EXEC_PLAN_SCHEMA_INVALID"
+
+        schema_errors = validate_signature_fields(plan)
+        if "range" not in plan or "grid" not in plan:
+            schema_errors.append("missing:range_grid")
+        if schema_errors:
+            self._reject_plan_intake(plan, "EXEC_PLAN_SCHEMA_INVALID", ",".join(schema_errors))
+            return False, "EXEC_PLAN_SCHEMA_INVALID"
+
+        expected_hash = compute_plan_hash(plan)
+        provided_hash = str(plan.get("plan_hash") or "").strip()
+        if expected_hash != provided_hash:
+            self._reject_plan_intake(
+                plan,
+                "EXEC_PLAN_HASH_MISMATCH",
+                f"expected={expected_hash} provided={provided_hash}",
+            )
+            return False, "EXEC_PLAN_HASH_MISMATCH"
+
+        if plan_is_expired(plan):
+            self._reject_plan_intake(plan, "EXEC_PLAN_EXPIRED_IGNORED", "plan_expired")
+            return False, "EXEC_PLAN_EXPIRED_IGNORED"
+
+        plan_id = str(plan.get("plan_id") or "").strip()
+        if plan_id and (plan_id in self._applied_plan_id_set):
+            self._reject_plan_intake(plan, "EXEC_PLAN_DUPLICATE_IGNORED", "duplicate_plan_id")
+            return False, "EXEC_PLAN_DUPLICATE_IGNORED"
+
+        try:
+            decision_seq = int(plan.get("decision_seq") or 0)
+        except Exception:
+            decision_seq = 0
+        if decision_seq <= int(self._last_applied_seq):
+            self._reject_plan_intake(
+                plan,
+                "EXEC_PLAN_STALE_SEQ_IGNORED",
+                f"decision_seq={decision_seq} last_applied_seq={self._last_applied_seq}",
+            )
+            return False, "EXEC_PLAN_STALE_SEQ_IGNORED"
+
+        if self._last_applied_plan_hash and provided_hash == self._last_applied_plan_hash:
+            self._reject_plan_intake(plan, "EXEC_PLAN_DUPLICATE_IGNORED", "duplicate_plan_hash")
+            return False, "EXEC_PLAN_DUPLICATE_IGNORED"
+
+        return True, None
+
+    def _write_rejected_plan_state(self, plan: Dict) -> None:
+        ex_name = str(plan.get("exchange") or self.exchange_name or "unknown")
+        symbol = plan_pair(plan) or self.symbol or "UNKNOWN/UNKNOWN"
+        self.symbol = symbol
+        range_block = plan.get("range") if isinstance(plan.get("range"), dict) else {}
+        grid_block = plan.get("grid") if isinstance(plan.get("grid"), dict) else {}
+        box_low = _safe_float(range_block.get("low"), default=0.0) or 0.0
+        box_high = _safe_float(range_block.get("high"), default=0.0) or 0.0
+        n_levels = max(_safe_int(grid_block.get("n_levels"), 1), 1)
+        step = _safe_float(grid_block.get("step_price"), default=0.0) or 0.0
+        self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
 
     def _execution_cfg(self, plan: Dict) -> Dict:
         candidates = [
@@ -1423,16 +1565,22 @@ class GridExecutorV1:
 
     # ---------- main tick ----------
     def step(self, plan: Dict) -> None:
-        if "range" not in plan or "grid" not in plan:
-            raise KeyError("Plan schema mismatch: expected keys ['range','grid'].")
         self._reset_runtime_diagnostics()
+        intake_ok, _ = self._validate_plan_intake(plan)
+        if not intake_ok:
+            self._write_rejected_plan_state(plan if isinstance(plan, dict) else {})
+            return
+
+        self._append_runtime_exec_event("EXEC_PLAN_APPLIED")
         self._apply_execution_hardening_config(plan)
 
         raw_action = str(plan.get("action", "HOLD")).upper()
+        if raw_action == "REBUILD":
+            raw_action = "START"
         if raw_action not in ("START", "HOLD", "STOP"):
             raw_action = "HOLD"
-        ex_name = plan.get("exchange", "unknown")
-        symbol = plan.get("symbol", "UNKNOWN/UNKNOWN")
+        ex_name = str(plan.get("exchange", "unknown"))
+        symbol = plan_pair(plan) or str(plan.get("symbol", "UNKNOWN/UNKNOWN"))
         self.symbol = symbol
 
         box_low = float(plan["range"]["low"])
@@ -1613,6 +1761,7 @@ class GridExecutorV1:
                     pass
 
             self._orders = []
+            self._record_applied_plan(plan)
             self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
             self._prev_plan = plan
             self._last_effective_action_signature = _action_signature(
@@ -1626,6 +1775,7 @@ class GridExecutorV1:
         # HOLD: manage only existing ladder, never seed from empty.
         if effective_action == "HOLD":
             if not has_active_orders:
+                self._record_applied_plan(plan)
                 self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
                 self._prev_plan = plan
                 self._last_effective_action_signature = _action_signature("HOLD", plan_sig)
@@ -1646,6 +1796,7 @@ class GridExecutorV1:
                 desired = [o for o in self._orders if o.status in ("open", "partial")]
                 self._ccxt_reconcile_set(desired, symbol, limits)
 
+            self._record_applied_plan(plan)
             self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
             self._prev_plan = plan
             self._last_effective_action_signature = _action_signature("HOLD", plan_sig)
@@ -1684,13 +1835,26 @@ class GridExecutorV1:
             # START and no plan change: keep current set.
             pass
 
+        self._record_applied_plan(plan)
         self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
         self._prev_plan = plan
         self._last_effective_action_signature = _action_signature("START", plan_sig)
 
+    def _executor_state_machine(self) -> str:
+        has_active_orders = bool(any(o.status in ("open", "partial") for o in self._orders))
+        effective = str(self._last_effective_action or "").upper()
+        if effective == "STOP":
+            return "stopping"
+        if effective == "START":
+            return "rebuilding" if self._prev_plan is not None else "running"
+        if has_active_orders:
+            return "running"
+        return "idle"
+
     def _write_state(self, plan: Dict, exchange_name: str, symbol: str, step: float, n_levels: int, box_low: float, box_high: float) -> None:
         q_res, b_res = self._reserved_balances_intent()
         q_free, b_free = self._free_balances_intent()
+        executor_state_machine = self._executor_state_machine()
 
         runtime = {
             "last_trade_ms": self._last_trade_ms,
@@ -1724,14 +1888,24 @@ class GridExecutorV1:
             "last_ccxt_error": self._last_ccxt_error,
             "state_recovery_loaded": bool(self._recovery_loaded),
             "state_recovery_error": self._recovery_error,
+            "last_applied_plan_id": self._last_applied_plan_id,
+            "last_applied_seq": int(self._last_applied_seq),
+            "last_plan_hash": self._last_applied_plan_hash,
+            "executor_state_machine": executor_state_machine,
         }
 
         payload = ExecutorState(
+            schema_version=str(self._state_schema_version),
             ts=time.time(),
             exchange=exchange_name,
+            pair=symbol,
             symbol=symbol,
             plan_ts=str(plan.get("ts", "")),
             mode=self.mode,
+            last_applied_plan_id=self._last_applied_plan_id,
+            last_applied_seq=int(self._last_applied_seq),
+            last_plan_hash=self._last_applied_plan_hash,
+            executor_state_machine=executor_state_machine,
 
             step=step,
             n_levels=n_levels,
@@ -1748,6 +1922,7 @@ class GridExecutorV1:
 
             runtime=runtime,
             orders=[asdict(o) for o in self._orders],
+            applied_plan_ids=list(self._applied_plan_ids),
         )
         write_json(self.state_out, asdict(payload))
 
@@ -1810,12 +1985,14 @@ def main():
 
     if args.once:
         plan = load_json(args.plan)
+        plan["_plan_path"] = args.plan
         ex.step(plan)
         return
 
     while True:
         try:
             plan = load_json(args.plan)
+            plan["_plan_path"] = args.plan
             ex.step(plan)
         except Exception as e:
             write_json(args.state_out, {"error": str(e), "ts": time.time()})
