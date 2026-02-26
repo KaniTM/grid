@@ -2234,7 +2234,7 @@ Status values used:
 - `Step 2` -> `PARTIAL`
 - `Step 3` -> `PARTIAL`
 - `Step 4` -> `PARTIAL`
-- `Step 5` -> `PARTIAL`
+- `Step 5` -> `DONE`
 - `Step 6` -> `DONE`
 - `Step 7` -> `DONE`
 - `Step 8` -> `DONE`
@@ -2247,7 +2247,7 @@ Status values used:
 
 ### 26.1.3 Module registry items that are DONE (complete list)
 
-- `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M009`, `M010`
+- `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M007`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
 - `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
 - `M301`, `M302`, `M303`, `M304`, `M305`
@@ -2358,12 +2358,16 @@ Status values used:
     - Adapter now drives runtime-view adjustments for box width band, `n_min/n_max`, min-step buffer bps, cooldown minutes, min-runtime minutes, and strictness flags.
     - Planner now logs base vs adapted thresholds and `vol_bucket` under plan diagnostics/update policy/module state, and enforces strictness via `BLOCK_VOL_BUCKET_UNSTABLE` when required.
     - Added coverage in `freqtrade/tests/scripts/test_section21_modules.py` and validated integration in `freqtrade/user_data/tests/test_phase3_validation.py`.
+13. [DONE 2026-02-26] Complete M007 empirical execution-cost calibration policy integration.
+    - Planner empirical calibration now tracks sample provenance (`proxy|lifecycle|artifact_*`) and market-state bucket metadata through `EmpiricalCostCalibrator`.
+    - Cost-floor selection now enforces conservative empirical candidates (`configured percentile`, `p75`, `p90`, `recommended`) with explicit `selection_reason` diagnostics.
+    - Empirical promotion now requires live samples when configured; proxy-only warmups stay static and emit `WARN_COST_MODEL_STALE` until readiness is met.
+    - Executor lifecycle calibration now tags samples as `lifecycle`, and tests cover proxy-only fallback, artifact-backed promotion, and live-sample accounting.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M007` Empirical execution cost calibration loop
 - `M008` Stress/chaos replay harness
 - `M205` Minimum range length + breakout confirm bars
 - `M209` Log-space quartiles + 1.386 extensions (log-space detail incomplete)
@@ -2411,7 +2415,7 @@ Status values used:
 - `M004` DONE
 - `M005` DONE
 - `M006` DONE
-- `M007` PARTIAL
+- `M007` DONE
 - `M008` PARTIAL
 - `M009` DONE
 - `M010` DONE

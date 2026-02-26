@@ -172,10 +172,14 @@ def test_execution_cost_calibrator_module() -> None:
             missed_fill_rate=0.2,
             retry_penalty_pct=0.0002,
             missed_fill_penalty_pct=0.0004,
+            sample_source="lifecycle",
+            market_state_bucket="normal",
         )
     snap = cal.snapshot("ETH/USDT", percentile=75, min_samples=5, stale_bars=100)
     assert snap["sample_count"] == 10
     assert snap["empirical_floor_pct"] is not None
+    assert int(snap.get("live_sample_count", 0)) == 10
+    assert bool(snap.get("has_live_samples", False))
     assert snap["stale"] is False
 
 

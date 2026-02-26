@@ -740,6 +740,9 @@ class GridBrainV1Core(IStrategy):
     empirical_cost_min_samples = 24
     empirical_cost_stale_bars = 96
     empirical_cost_percentile = 90.0
+    empirical_cost_conservative_mode = True
+    empirical_cost_require_live_samples = True
+    empirical_cost_min_live_samples = 0
     empirical_spread_proxy_scale = 0.10
     empirical_adverse_selection_scale = 0.25
     empirical_retry_penalty_pct = 0.0010
@@ -4099,6 +4102,7 @@ class GridBrainV1Core(IStrategy):
         artifact_used = False
         artifact_source = None
         artifact_generated_at = None
+        sample_source = "proxy"
         if isinstance(artifact, dict) and not bool(artifact.get("stale", False)):
             artifact_spread = self._safe_float(artifact.get("spread_pct"))
             artifact_adverse = self._safe_float(artifact.get("adverse_selection_pct"))
@@ -4113,12 +4117,31 @@ class GridBrainV1Core(IStrategy):
             artifact_used = True
             artifact_source = str(artifact.get("cost_model_source") or "empirical")
             artifact_generated_at = artifact.get("generated_at")
+
+        if retry_reject_rate is not None or missed_fill_rate is not None or recommended_floor_pct is not None:
+            sample_source = "lifecycle"
+        if artifact_used:
+            sample_source = (
+                "artifact_empirical"
+                if str(artifact_source).lower() == "empirical"
+                else "artifact_static"
+            )
+
+        market_state_bucket = last_row.get("market_state_bucket")
+        if market_state_bucket is None:
+            market_state_bucket = last_row.get("vol_bucket")
+        if market_state_bucket is not None:
+            market_state_bucket = str(market_state_bucket).strip() or None
+
         return {
             "spread_pct": spread_direct,
             "adverse_selection_pct": adverse_pct,
             "retry_reject_rate": retry_reject_rate,
             "missed_fill_rate": missed_fill_rate,
             "recommended_floor_pct": recommended_floor_pct,
+            "sample_source": str(sample_source),
+            "market_state_bucket": market_state_bucket,
+            "live_sample": bool(sample_source in {"artifact_empirical", "lifecycle"}),
             "artifact_used": bool(artifact_used),
             "artifact_source": artifact_source,
             "artifact_generated_at": artifact_generated_at,
@@ -4259,12 +4282,22 @@ class GridBrainV1Core(IStrategy):
         target_net = float(max(float(self.target_net_step_pct), 0.0040))
         static_floor = float(target_net + max(float(self.est_fee_pct), 0.0) + max(float(self.est_spread_pct), 0.0))
         static_floor = float(max(static_floor, float(self.majors_gross_step_floor_pct), float(self.empirical_cost_floor_min_pct)))
+        empirical_conservative_mode = bool(getattr(self, "empirical_cost_conservative_mode", True))
+        require_live_samples = bool(getattr(self, "empirical_cost_require_live_samples", True))
+        min_live_samples_cfg = self._safe_float(getattr(self, "empirical_cost_min_live_samples", None))
+        min_live_samples = int(max(min_live_samples_cfg or float(self.empirical_cost_min_samples), 1.0))
 
         warning_codes: List[str] = []
         empirical_snapshot: Dict[str, object] = {
             "enabled": bool(self.empirical_cost_enabled),
             "sample_count": 0,
             "stale": True,
+            "effective_stale": True,
+            "live_sample_count": 0,
+            "live_sample_requirement_met": not require_live_samples,
+            "requires_live_samples": bool(require_live_samples),
+            "min_live_samples_required": int(min_live_samples),
+            "conservative_mode": bool(empirical_conservative_mode),
             "spread_pct_percentile": None,
             "adverse_selection_pct_percentile": None,
             "retry_reject_rate_percentile": None,
@@ -4273,9 +4306,12 @@ class GridBrainV1Core(IStrategy):
             "missed_fill_penalty_pct_percentile": None,
             "total_cost_pct_percentile": None,
             "recommended_floor_pct_percentile": None,
+            "floor_candidates_pct": {},
+            "selected_empirical_floor_pct": None,
             "empirical_floor_pct": None,
         }
         empirical_sample: Dict[str, Optional[float]] = {}
+        selected_empirical_floor: Optional[float] = None
 
         if self.empirical_cost_enabled:
             if not hasattr(self, "_empirical_cost_calibrator") or self._empirical_cost_calibrator is None:
@@ -4292,6 +4328,8 @@ class GridBrainV1Core(IStrategy):
                 retry_penalty_pct=float(self.empirical_retry_penalty_pct),
                 missed_fill_penalty_pct=float(self.empirical_missed_fill_penalty_pct),
                 recommended_floor_pct=empirical_sample.get("recommended_floor_pct"),
+                sample_source=empirical_sample.get("sample_source"),
+                market_state_bucket=empirical_sample.get("market_state_bucket"),
             )
             empirical_snapshot.update(
                 {
@@ -4300,6 +4338,8 @@ class GridBrainV1Core(IStrategy):
                     "last_sample_retry_reject_rate": observed.get("retry_reject_rate"),
                     "last_sample_missed_fill_rate": observed.get("missed_fill_rate"),
                     "last_sample_total_cost_pct": observed.get("total_pct"),
+                    "last_sample_source": observed.get("sample_source"),
+                    "last_market_state_bucket": observed.get("market_state_bucket"),
                     "artifact_used": bool(empirical_sample.get("artifact_used", False)),
                     "artifact_source": empirical_sample.get("artifact_source"),
                     "artifact_generated_at": empirical_sample.get("artifact_generated_at"),
@@ -4313,23 +4353,107 @@ class GridBrainV1Core(IStrategy):
                 min_samples=int(self.empirical_cost_min_samples),
                 stale_bars=int(self.empirical_cost_stale_bars),
             )
+            snapshot_p75 = self._empirical_cost_calibrator.snapshot(
+                pair,
+                percentile=75.0,
+                min_samples=int(self.empirical_cost_min_samples),
+                stale_bars=int(self.empirical_cost_stale_bars),
+            )
+            snapshot_p90 = self._empirical_cost_calibrator.snapshot(
+                pair,
+                percentile=90.0,
+                min_samples=int(self.empirical_cost_min_samples),
+                stale_bars=int(self.empirical_cost_stale_bars),
+            )
             empirical_snapshot.update(snapshot)
-            if bool(empirical_snapshot.get("stale", True)):
+            floor_p75 = self._safe_float(snapshot_p75.get("empirical_floor_pct"))
+            floor_p90 = self._safe_float(snapshot_p90.get("empirical_floor_pct"))
+            recommended_floor = self._safe_float(
+                max(
+                    x
+                    for x in [
+                        self._safe_float(snapshot.get("recommended_floor_pct_percentile")),
+                        self._safe_float(snapshot_p75.get("recommended_floor_pct_percentile")),
+                        self._safe_float(snapshot_p90.get("recommended_floor_pct_percentile")),
+                    ]
+                    if x is not None
+                )
+            ) if any(
+                x is not None
+                for x in [
+                    self._safe_float(snapshot.get("recommended_floor_pct_percentile")),
+                    self._safe_float(snapshot_p75.get("recommended_floor_pct_percentile")),
+                    self._safe_float(snapshot_p90.get("recommended_floor_pct_percentile")),
+                ]
+            ) else None
+            configured_floor = self._safe_float(snapshot.get("empirical_floor_pct"))
+            if empirical_conservative_mode:
+                selected_empirical_floor = self._safe_float(
+                    max(
+                        x
+                        for x in [configured_floor, floor_p75, floor_p90, recommended_floor]
+                        if x is not None
+                    )
+                ) if any(x is not None for x in [configured_floor, floor_p75, floor_p90, recommended_floor]) else None
+            else:
+                selected_empirical_floor = self._safe_float(
+                    max(x for x in [configured_floor, recommended_floor] if x is not None)
+                ) if any(x is not None for x in [configured_floor, recommended_floor]) else None
+
+            live_sample_count = int(self._safe_float(snapshot.get("live_sample_count")) or 0)
+            live_sample_requirement_met = bool(
+                (not require_live_samples) or (live_sample_count >= int(min_live_samples))
+            )
+            effective_stale = bool(snapshot.get("stale", True) or (not live_sample_requirement_met))
+
+            empirical_snapshot.update(
+                {
+                    "effective_stale": bool(effective_stale),
+                    "live_sample_count": int(live_sample_count),
+                    "live_sample_requirement_met": bool(live_sample_requirement_met),
+                    "requires_live_samples": bool(require_live_samples),
+                    "min_live_samples_required": int(min_live_samples),
+                    "conservative_mode": bool(empirical_conservative_mode),
+                    "floor_candidates_pct": {
+                        "configured_percentile": configured_floor,
+                        "p75": floor_p75,
+                        "p90": floor_p90,
+                        "recommended": recommended_floor,
+                    },
+                    "selected_empirical_floor_pct": selected_empirical_floor,
+                }
+            )
+            if bool(empirical_snapshot.get("effective_stale", True)):
                 warning_codes.append(str(WarningCode.WARN_COST_MODEL_STALE))
 
-        empirical_floor = self._safe_float(empirical_snapshot.get("empirical_floor_pct"))
+        empirical_floor = self._safe_float(
+            empirical_snapshot.get("selected_empirical_floor_pct")
+            if self.empirical_cost_enabled
+            else None
+        )
         chosen_floor = float(static_floor)
         source = "static"
-        if empirical_floor is not None:
+        selection_reason = "empirical_disabled"
+        if self.empirical_cost_enabled:
+            selection_reason = "empirical_unavailable"
+            if bool(empirical_snapshot.get("stale", True)):
+                selection_reason = "empirical_snapshot_stale"
+            if not bool(empirical_snapshot.get("live_sample_requirement_met", True)):
+                selection_reason = "empirical_live_samples_insufficient"
+        if empirical_floor is not None and (not bool(empirical_snapshot.get("effective_stale", True))):
             chosen_floor = float(max(static_floor, empirical_floor))
             if empirical_floor > static_floor:
                 source = "empirical"
+                selection_reason = "empirical_floor_above_static"
+            else:
+                selection_reason = "static_floor_dominates"
 
         return {
             "target_net_step_pct": float(target_net),
             "static_floor_pct": float(static_floor),
             "chosen_floor_pct": float(chosen_floor),
             "source": str(source),
+            "selection_reason": str(selection_reason),
             "empirical_snapshot": empirical_snapshot,
             "empirical_sample": empirical_sample,
             "warning_codes": warning_codes,
@@ -6558,8 +6682,10 @@ class GridBrainV1Core(IStrategy):
                 "step_cost_ok": bool(step_cost_block_reason is None),
                 "step_cost_block_reason": str(step_cost_block_reason) if step_cost_block_reason is not None else None,
                 "cost_model_source": str(cost_floor.get("source", "static")),
+                "cost_model_selection_reason": str(cost_floor.get("selection_reason", "unknown")),
                 "cost_floor": {
                     "source": str(cost_floor.get("source", "static")),
+                    "selection_reason": str(cost_floor.get("selection_reason", "unknown")),
                     "static_floor_pct": float(static_gross_min),
                     "chosen_floor_base_pct": float(min_step_pct_required_base),
                     "chosen_floor_pct": float(min_step_pct_required),
@@ -6783,6 +6909,7 @@ class GridBrainV1Core(IStrategy):
                 "hvp_quiet_exit_bias": bool(hvp_quiet_exit_bias),
                 "hvp_quiet_exit_tp_nudged": bool(hvp_quiet_exit_tp_nudged),
                 "cost_model_source": str(cost_floor.get("source", "static")),
+                "cost_model_selection_reason": str(cost_floor.get("selection_reason", "unknown")),
                 "min_step_pct_required": float(min_step_pct_required),
                 "step_pct_actual": float(step_pct_actual),
                 "step_cost_ok": bool(step_cost_block_reason is None),
@@ -7105,11 +7232,17 @@ class GridBrainV1Core(IStrategy):
                     "chosen_floor_pct": float(min_step_pct_required),
                     "min_step_buffer_bps": float(min_step_buffer_bps_effective),
                     "source": str(cost_floor.get("source", "static")),
+                    "selection_reason": str(cost_floor.get("selection_reason", "unknown")),
                     "empirical_enabled": bool(self.empirical_cost_enabled),
+                    "empirical_conservative_mode": bool(self.empirical_cost_conservative_mode),
                     "empirical_window": int(self.empirical_cost_window),
                     "empirical_percentile": float(self.empirical_cost_percentile),
                     "empirical_min_samples": int(self.empirical_cost_min_samples),
                     "empirical_stale_bars": int(self.empirical_cost_stale_bars),
+                    "empirical_require_live_samples": bool(self.empirical_cost_require_live_samples),
+                    "empirical_min_live_samples": int(
+                        self._safe_float(getattr(self, "empirical_cost_min_live_samples", 0.0)) or 0
+                    ),
                 },
                 "fill_detection": {
                     "mode": str(self.fill_confirmation_mode),
@@ -7336,6 +7469,7 @@ class GridBrainV1Core(IStrategy):
         }
         plan["cost_model_snapshot"] = {
             "source": str(cost_floor.get("source", "static")),
+            "selection_reason": str(cost_floor.get("selection_reason", "unknown")),
             "target_net_step_pct": float(cost_floor.get("target_net_step_pct", self.target_net_step_pct)),
             "static_floor_pct": float(static_gross_min),
             "chosen_floor_base_pct": float(min_step_pct_required_base),
@@ -7346,7 +7480,10 @@ class GridBrainV1Core(IStrategy):
             "empirical_sample": cost_floor.get("empirical_sample", {}),
         }
         plan["module_states"] = {
-            "cost_model": {"source": str(cost_floor.get("source", "static"))},
+            "cost_model": {
+                "source": str(cost_floor.get("source", "static")),
+                "selection_reason": str(cost_floor.get("selection_reason", "unknown")),
+            },
             "start_stability": {"ok": bool(start_stability_ok)},
             "planner_health": {"state": str(planner_health_state)},
             "meta_drift_guard": {"enabled": bool(self.meta_drift_guard_enabled)},

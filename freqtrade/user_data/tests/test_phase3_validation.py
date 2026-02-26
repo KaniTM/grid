@@ -1,6 +1,7 @@
 # ruff: noqa: S101
 
 from collections import deque
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -372,10 +373,19 @@ def _cost_strategy() -> GridBrainV1Core:
     strategy.empirical_cost_min_samples = 3
     strategy.empirical_cost_stale_bars = 32
     strategy.empirical_cost_percentile = 90.0
+    strategy.empirical_cost_conservative_mode = True
+    strategy.empirical_cost_require_live_samples = True
+    strategy.empirical_cost_min_live_samples = 0
     strategy.empirical_spread_proxy_scale = 0.10
     strategy.empirical_adverse_selection_scale = 0.25
     strategy.empirical_retry_penalty_pct = 0.001
     strategy.empirical_missed_fill_penalty_pct = 0.001
+    strategy.execution_cost_artifact_enabled = False
+    strategy.execution_cost_artifact_dir = "artifacts/execution_cost"
+    strategy.execution_cost_artifact_filename = "execution_cost_calibration.latest.json"
+    strategy.execution_cost_artifact_max_age_minutes = 180.0
+    strategy._execution_cost_artifact_cache_by_pair = {}
+    strategy._execution_cost_artifact_mtime_by_pair = {}
     strategy.n_min = 6
     strategy.n_max = 12
     strategy.n_volatility_adapter_enabled = True
@@ -425,6 +435,79 @@ def test_effective_cost_floor_switches_to_empirical_when_higher() -> None:
     assert info["chosen_floor_pct"] >= info["static_floor_pct"]
     if info["source"] == "empirical":
         assert info["chosen_floor_pct"] > info["static_floor_pct"]
+
+
+def test_effective_cost_floor_proxy_only_samples_do_not_promote_empirical() -> None:
+    strategy = _cost_strategy()
+    strategy.empirical_cost_min_samples = 1
+    strategy.empirical_cost_min_live_samples = 1
+    strategy.empirical_cost_stale_bars = 128
+    last = pd.Series(
+        {
+            "open": 100.0,
+            "high": 106.0,
+            "low": 94.0,
+            "close": 100.0,
+        }
+    )
+    for _ in range(3):
+        info = strategy._effective_cost_floor("PAIR/PROXY", last, 100.0)
+    assert info["source"] == "static"
+    assert info["selection_reason"] == "empirical_live_samples_insufficient"
+    assert str(WarningCode.WARN_COST_MODEL_STALE) in info["warning_codes"]
+    snapshot = info["empirical_snapshot"]
+    assert int(snapshot.get("live_sample_count", 0)) == 0
+    assert bool(snapshot.get("effective_stale", True))
+
+
+def test_effective_cost_floor_promotes_with_empirical_artifact(tmp_path: Path) -> None:
+    strategy = _cost_strategy()
+    strategy.empirical_cost_min_samples = 1
+    strategy.empirical_cost_min_live_samples = 1
+    strategy.empirical_cost_stale_bars = 128
+    strategy.config = {"user_data_dir": str(tmp_path)}
+    strategy.execution_cost_artifact_enabled = True
+
+    pair = "PAIR/EMP_ART"
+    pair_fs = pair.replace("/", "_").replace(":", "_")
+    artifact_dir = tmp_path / "artifacts" / "execution_cost" / pair_fs
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "execution_cost_calibration.latest.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0.0",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "pair": pair,
+                "window": 256,
+                "sample_count": 128,
+                "cost_model_source": "empirical",
+                "percentile": 90.0,
+                "realized_spread_pct": 0.0040,
+                "adverse_selection_pct": 0.0018,
+                "post_only_retry_reject_rate": 0.35,
+                "missed_fill_opportunity_rate": 0.20,
+                "recommended_cost_floor_bps": 95.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    info = strategy._effective_cost_floor(
+        pair,
+        pd.Series({"open": 100.0, "high": 100.5, "low": 99.5, "close": 100.0}),
+        100.0,
+    )
+    assert info["source"] == "empirical"
+    assert info["selection_reason"] == "empirical_floor_above_static"
+    assert info["chosen_floor_pct"] > info["static_floor_pct"]
+    assert str(WarningCode.WARN_COST_MODEL_STALE) not in info["warning_codes"]
+    snapshot = info["empirical_snapshot"]
+    assert int(snapshot.get("live_sample_count", 0)) >= 1
+    assert bool(snapshot.get("live_sample_requirement_met", False))
+    assert not bool(snapshot.get("effective_stale", True))
+    floor_candidates = snapshot.get("floor_candidates_pct", {})
+    assert strategy._safe_float(floor_candidates.get("recommended")) is not None
 
 
 def test_tp_selection_prefers_nearest_conservative() -> None:

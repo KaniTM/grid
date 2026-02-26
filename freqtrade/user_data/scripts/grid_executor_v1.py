@@ -1615,6 +1615,8 @@ class GridExecutorV1:
             retry_penalty_pct=float(self._execution_cost_retry_penalty_pct),
             missed_fill_penalty_pct=float(self._execution_cost_missed_fill_penalty_pct),
             recommended_floor_pct=None,
+            sample_source="lifecycle",
+            market_state_bucket=str(plan.get("mode") or "unknown"),
         )
         snapshot = self._execution_cost_calibrator.snapshot(
             symbol,
