@@ -24,6 +24,7 @@ from core.atomic_json import write_json_atomic
 from technical import qtpylib
 from core.enums import (
     BlockReason,
+    EventType,
     MaterialityClass,
     ModuleName,
     Severity,
@@ -784,6 +785,12 @@ class GridBrainV1Core(IStrategy):
     neutral_stop_adx_bars = 3
     neutral_box_break_bars = 2
     neutral_box_break_step_multiple = 1.0
+    drawdown_guard_enabled = True
+    drawdown_guard_lookback_bars = 96
+    drawdown_guard_max_pct = 0.030
+    max_stops_window_enabled = True
+    max_stops_window_minutes = 360
+    max_stops_window_count = 4
 
     # Gate tuning profile (START gating debug/tune helper)
     gate_profile = "strict"  # strict | balanced | aggressive
@@ -941,6 +948,9 @@ class GridBrainV1Core(IStrategy):
     basis_band_window = 96
     basis_band_stds = 2.0
     fvg_vp_enabled = False
+    fvg_vp_bins = 32
+    fvg_vp_lookback_bars = 256
+    fvg_vp_poc_tag_step_frac = 0.30
     sl_lvn_avoid_steps = 0.25
     sl_fvg_buffer_steps = 0.10
     box_quality_log_space = True
@@ -960,6 +970,35 @@ class GridBrainV1Core(IStrategy):
     fill_no_repeat_cooldown_bars = 1
     tick_size_step_frac = 0.01
     tick_size_floor = 1e-8
+
+    # M505 / M809 / M1003 / M702 / M703 / M805 extensions.
+    micro_reentry_pause_bars = 4
+    micro_reentry_require_poc_reclaim = True
+    micro_reentry_poc_buffer_steps = 0.25
+    buy_ratio_bias_enabled = True
+    buy_ratio_midband_half_width = 0.35
+    buy_ratio_bullish_threshold = 0.58
+    buy_ratio_bearish_threshold = 0.42
+    buy_ratio_rung_bias_strength = 0.35
+    buy_ratio_bearish_tp_step_multiple = 0.50
+    smart_channel_enabled = True
+    smart_channel_breakout_step_buffer = 0.25
+    smart_channel_volume_confirm_enabled = True
+    smart_channel_volume_rvol_min = 1.10
+    smart_channel_tp_nudge_step_multiple = 0.50
+    zigzag_contraction_enabled = True
+    zigzag_contraction_lookback_bars = 12
+    zigzag_contraction_ratio_max = 0.95
+    session_sweep_enabled = True
+    session_sweep_retest_lookback_bars = 2
+    order_flow_enabled = True
+    order_flow_spread_soft_max_pct = 0.0030
+    order_flow_depth_thin_soft_max = 0.65
+    order_flow_imbalance_extreme = 0.85
+    order_flow_jump_soft_max_pct = 0.0080
+    order_flow_soft_veto_min_flags = 2
+    order_flow_hard_block = False
+    order_flow_confidence_penalty_per_flag = 0.10
 
     plans_root_rel = "grid_plans"
     plan_schema_version = PLAN_SCHEMA_VERSION
@@ -983,6 +1022,8 @@ class GridBrainV1Core(IStrategy):
     _last_box_step_by_pair: Dict[str, float] = {}
     _reclaim_until_ts_by_pair: Dict[str, int] = {}
     _cooldown_until_ts_by_pair: Dict[str, int] = {}
+    _micro_reentry_pause_until_ts_by_pair: Dict[str, int] = {}
+    _stop_timestamps_by_pair: Dict[str, deque] = {}
     _active_since_ts_by_pair: Dict[str, int] = {}
     _running_by_pair: Dict[str, bool] = {}
     _bbwp_cooloff_by_pair: Dict[str, bool] = {}
@@ -2612,6 +2653,8 @@ class GridBrainV1Core(IStrategy):
             self._last_box_step_by_pair,
             self._reclaim_until_ts_by_pair,
             self._cooldown_until_ts_by_pair,
+            self._micro_reentry_pause_until_ts_by_pair,
+            self._stop_timestamps_by_pair,
             self._active_since_ts_by_pair,
             self._running_by_pair,
             self._bbwp_cooloff_by_pair,
@@ -2807,11 +2850,32 @@ class GridBrainV1Core(IStrategy):
     @staticmethod
     def _severity_for_code(code: str) -> str:
         cat = category_of_code(str(code)) if is_canonical_code(str(code)) else str(code).split("_", 1)[0]
+        c = str(code or "")
         if cat in {"BLOCK", "STOP"}:
             return str(Severity.HARD)
         if cat == "PAUSE":
             return str(Severity.SOFT)
         if cat == "WARN":
+            return str(Severity.ADVISORY)
+        if c in {
+            str(EventType.EVENT_META_DRIFT_HARD),
+            str(EventType.EVENT_CHANNEL_STRONG_BREAK_UP),
+            str(EventType.EVENT_CHANNEL_STRONG_BREAK_DN),
+            str(EventType.EVENT_DONCHIAN_STRONG_BREAK_UP),
+            str(EventType.EVENT_DONCHIAN_STRONG_BREAK_DN),
+            str(EventType.EVENT_SWEEP_BREAK_RETEST_HIGH),
+            str(EventType.EVENT_SWEEP_BREAK_RETEST_LOW),
+            str(EventType.EVENT_DATA_GAP_DETECTED),
+            str(EventType.EVENT_DATA_MISALIGN_DETECTED),
+        }:
+            return str(Severity.HARD)
+        if c in {
+            str(EventType.EVENT_META_DRIFT_SOFT),
+            str(EventType.EVENT_SPREAD_SPIKE),
+            str(EventType.EVENT_DEPTH_THIN),
+            str(EventType.EVENT_JUMP_DETECTED),
+            str(EventType.EVENT_POST_ONLY_REJECT_BURST),
+        }:
             return str(Severity.ADVISORY)
         return str(Severity.INFO)
 
@@ -2820,11 +2884,60 @@ class GridBrainV1Core(IStrategy):
         c = str(code or "")
         if c.startswith("BLOCK_STEP_") or c.startswith("WARN_COST_MODEL_"):
             return str(ModuleName.COST_MODEL)
+        if c in {
+            str(BlockReason.BLOCK_DRAWDOWN_GUARD),
+            str(BlockReason.BLOCK_MAX_STOPS_WINDOW),
+            str(StopReason.STOP_DRAWDOWN_GUARD),
+        }:
+            return str(ModuleName.PROTECTIONS)
         if c.startswith("BLOCK_CAPACITY_") or c.startswith("EXEC_CAPACITY_"):
             return str(ModuleName.CAPACITY_GUARD)
+        if c in {
+            str(StopReason.STOP_CHANNEL_STRONG_BREAK),
+            str(EventType.EVENT_CHANNEL_STRONG_BREAK_UP),
+            str(EventType.EVENT_CHANNEL_STRONG_BREAK_DN),
+            str(EventType.EVENT_CHANNEL_MIDLINE_TOUCH),
+            str(EventType.EVENT_DONCHIAN_STRONG_BREAK_UP),
+            str(EventType.EVENT_DONCHIAN_STRONG_BREAK_DN),
+        }:
+            return str(ModuleName.CHANNEL_MODULE)
+        if c in {
+            str(EventType.EVENT_SWEEP_WICK_HIGH),
+            str(EventType.EVENT_SWEEP_WICK_LOW),
+            str(EventType.EVENT_SWEEP_BREAK_RETEST_HIGH),
+            str(EventType.EVENT_SWEEP_BREAK_RETEST_LOW),
+            str(EventType.EVENT_SESSION_HIGH_SWEEP),
+            str(EventType.EVENT_SESSION_LOW_SWEEP),
+            str(StopReason.STOP_LIQUIDITY_SWEEP_BREAK_RETEST),
+        }:
+            return str(ModuleName.LIQUIDITY_SWEEPS)
+        if c in {
+            str(EventType.EVENT_FVG_POC_TAG),
+        }:
+            return str(ModuleName.FVG_VP)
+        if c in {
+            str(EventType.EVENT_VRVP_POC_SHIFT),
+            str(EventType.EVENT_MICRO_POC_SHIFT),
+            str(EventType.EVENT_HVN_TOUCH),
+            str(EventType.EVENT_LVN_TOUCH),
+            str(EventType.EVENT_LVN_VOID_EXIT),
+        }:
+            return str(ModuleName.MICRO_VAP)
+        if c in {
+            str(EventType.EVENT_SPREAD_SPIKE),
+            str(EventType.EVENT_DEPTH_THIN),
+            str(EventType.EVENT_JUMP_DETECTED),
+            str(EventType.EVENT_POST_ONLY_REJECT_BURST),
+        }:
+            return str(ModuleName.CONFIRM_ENTRY_HOOK)
         if c.startswith("STOP_"):
             return str(ModuleName.STOP_FRAMEWORK)
         if c.startswith("BLOCK_DATA_") or c.startswith("PAUSE_DATA_"):
+            return str(ModuleName.DATA_QUALITY_MONITOR)
+        if c in {
+            str(EventType.EVENT_DATA_GAP_DETECTED),
+            str(EventType.EVENT_DATA_MISALIGN_DETECTED),
+        }:
             return str(ModuleName.DATA_QUALITY_MONITOR)
         if c.startswith("BLOCK_META_DRIFT_") or c.startswith("EVENT_META_DRIFT_"):
             return str(ModuleName.META_DRIFT_GUARD)
@@ -2856,6 +2969,8 @@ class GridBrainV1Core(IStrategy):
         warning_codes: List[str],
         stop_codes: List[str],
         close_price: float,
+        event_types: Optional[List[str]] = None,
+        event_metadata: Optional[Dict[str, Dict[str, object]]] = None,
     ) -> List[str]:
         event_ids: List[str] = []
         valid_for_candle_ts = int(plan.get("valid_for_candle_ts") or 0)
@@ -2864,10 +2979,15 @@ class GridBrainV1Core(IStrategy):
         ts = str(plan.get("generated_at") or datetime.now(timezone.utc).isoformat())
 
         if bool(getattr(self, "event_log_enabled", True)):
-            event_codes = [str(x) for x in blocker_codes + warning_codes + stop_codes if str(x).strip()]
+            reason_codes = [str(x) for x in blocker_codes + warning_codes + stop_codes if str(x).strip()]
+            taxonomy_codes = [str(x) for x in (event_types or []) if str(x).strip()]
+            event_codes = list(dict.fromkeys(reason_codes + taxonomy_codes))
+            metadata_by_type = event_metadata if isinstance(event_metadata, dict) else {}
             safe_price = float(close_price) if math.isfinite(float(close_price)) else 0.0
             for code in event_codes:
                 event_id = self._next_event_id(pair, valid_for_candle_ts)
+                event_meta = dict(metadata_by_type.get(str(code), {})) if str(code) in metadata_by_type else {}
+                event_kind = "taxonomy_event" if str(code).startswith("EVENT_") else "reason_code"
                 event_row: Dict[str, object] = {
                     "event_id": event_id,
                     "ts": ts,
@@ -2881,8 +3001,12 @@ class GridBrainV1Core(IStrategy):
                         "action": str(plan.get("action") or ""),
                         "planner_health_state": str(planner_health_state),
                         "canonical_code": bool(is_canonical_code(str(code))),
+                        "event_kind": str(event_kind),
+                        "taxonomy_event": bool(event_kind == "taxonomy_event"),
                     },
                 }
+                if event_meta:
+                    event_row["metadata"].update(event_meta)
                 if validate_schema(event_row, "event_log.schema.json"):
                     continue
                 self._append_jsonl(event_path, event_row)
@@ -5047,6 +5171,491 @@ class GridBrainV1Core(IStrategy):
             "fast_outside_dn": fast_dn,
         }
 
+    @staticmethod
+    def _micro_buy_ratio_state(
+        edges: List[float],
+        density: List[float],
+        *,
+        box_low: float,
+        box_high: float,
+        close: float,
+        midband_half_width: float,
+        bullish_threshold: float,
+        bearish_threshold: float,
+    ) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "ready": False,
+            "buy_ratio": 0.5,
+            "sell_ratio": 0.5,
+            "bias": 0,
+            "in_midband": False,
+            "bullish_threshold": float(bullish_threshold),
+            "bearish_threshold": float(bearish_threshold),
+        }
+        try:
+            edges_arr = np.array(edges, dtype=float)
+            dens_arr = np.array(density, dtype=float)
+        except Exception:
+            return out
+        if len(dens_arr) == 0 or len(edges_arr) != (len(dens_arr) + 1):
+            return out
+        width = float(box_high - box_low)
+        if width <= 0:
+            return out
+        dens_total = float(np.sum(dens_arr))
+        if dens_total <= 0:
+            return out
+        centers = (edges_arr[:-1] + edges_arr[1:]) / 2.0
+        mid = float((box_low + box_high) / 2.0)
+        buy_mass = float(np.sum(dens_arr[centers <= mid]))
+        sell_mass = float(np.sum(dens_arr[centers > mid]))
+        ratio = float(np.clip(buy_mass / max(buy_mass + sell_mass, 1e-12), 0.0, 1.0))
+        box_pos = float(np.clip((close - box_low) / width, 0.0, 1.0))
+        in_midband = bool(abs(box_pos - 0.5) <= max(float(midband_half_width), 0.0))
+        bull_thr = float(np.clip(bullish_threshold, 0.5, 1.0))
+        bear_thr = float(np.clip(bearish_threshold, 0.0, 0.5))
+        bias = 0
+        if in_midband:
+            if ratio >= bull_thr:
+                bias = 1
+            elif ratio <= bear_thr:
+                bias = -1
+        out.update(
+            {
+                "ready": True,
+                "buy_ratio": float(ratio),
+                "sell_ratio": float(1.0 - ratio),
+                "bias": int(bias),
+                "in_midband": bool(in_midband),
+            }
+        )
+        return out
+
+    @staticmethod
+    def _apply_buy_ratio_rung_bias(
+        levels: np.ndarray,
+        rung_weights: List[float],
+        *,
+        box_low: float,
+        box_high: float,
+        bias: int,
+        strength: float,
+        w_min: float,
+        w_max: float,
+    ) -> List[float]:
+        if int(bias) == 0:
+            return [float(x) for x in rung_weights]
+        if len(levels) == 0 or len(rung_weights) != len(levels):
+            return [float(x) for x in rung_weights]
+        width = float(box_high - box_low)
+        if width <= 0:
+            return [float(x) for x in rung_weights]
+        lev = np.array(levels, dtype=float)
+        w = np.array(rung_weights, dtype=float)
+        pos = np.clip((lev - float(box_low)) / width, 0.0, 1.0)
+        s = float(np.clip(strength, 0.0, 1.0))
+        if int(bias) > 0:
+            mult = 1.0 + (s * (1.0 - pos))
+        else:
+            mult = 1.0 - (0.8 * s * (1.0 - pos))
+            mult = np.clip(mult, 0.2, None)
+        out = np.clip(w * mult, float(w_min), float(w_max))
+        return [float(x) for x in out.tolist()]
+
+    def _fvg_vp_state(
+        self,
+        df: DataFrame,
+        *,
+        fvg_state: Dict[str, object],
+        close: float,
+        step_price: float,
+    ) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.fvg_vp_enabled),
+            "bins": int(self.fvg_vp_bins),
+            "lookback_bars": int(self.fvg_vp_lookback_bars),
+            "bull_poc": None,
+            "bear_poc": None,
+            "nearest_poc": None,
+            "nearest_poc_side": None,
+            "poc_tagged": False,
+            "tag_side": None,
+            "zones_used": 0,
+        }
+        if not self.fvg_vp_enabled:
+            return out
+        if len(df) < 2:
+            return out
+        work = df.iloc[-max(int(self.fvg_vp_lookback_bars), 8):]
+        highs = pd.to_numeric(work.get("high"), errors="coerce").to_numpy(dtype=float)
+        lows = pd.to_numeric(work.get("low"), errors="coerce").to_numpy(dtype=float)
+        closes = pd.to_numeric(work.get("close"), errors="coerce").to_numpy(dtype=float)
+        vols = pd.to_numeric(work.get("volume"), errors="coerce").to_numpy(dtype=float)
+        typ = (highs + lows + closes) / 3.0
+
+        def zone_poc(zone: Optional[Dict[str, object]]) -> Optional[float]:
+            if not isinstance(zone, dict):
+                return None
+            zl = self._safe_float(zone.get("low"))
+            zh = self._safe_float(zone.get("high"))
+            if zl is None or zh is None or zh <= zl:
+                return None
+            mask = (
+                np.isfinite(typ)
+                & np.isfinite(vols)
+                & (vols > 0)
+                & (typ >= float(zl))
+                & (typ <= float(zh))
+            )
+            if int(np.sum(mask)) < 2:
+                return None
+            p = typ[mask]
+            w = vols[mask]
+            bins = max(int(self.fvg_vp_bins), 4)
+            edges = np.linspace(float(zl), float(zh), bins + 1, dtype=float)
+            idx = np.searchsorted(edges, p, side="right") - 1
+            idx = np.clip(idx, 0, bins - 1)
+            hist = np.zeros(bins, dtype=float)
+            for ii, ww in zip(idx, w):
+                hist[int(ii)] += float(ww)
+            if float(np.sum(hist)) <= 0:
+                return None
+            centers = (edges[:-1] + edges[1:]) / 2.0
+            return float(centers[int(np.argmax(hist))])
+
+        bull_zone = fvg_state.get("nearest_bullish") if isinstance(fvg_state, dict) else None
+        bear_zone = fvg_state.get("nearest_bearish") if isinstance(fvg_state, dict) else None
+        bull_poc = zone_poc(bull_zone)
+        bear_poc = zone_poc(bear_zone)
+        out["bull_poc"] = bull_poc
+        out["bear_poc"] = bear_poc
+        out["zones_used"] = int((1 if bull_poc is not None else 0) + (1 if bear_poc is not None else 0))
+        pool: List[Tuple[str, float]] = []
+        if bull_poc is not None:
+            pool.append(("bull", float(bull_poc)))
+        if bear_poc is not None:
+            pool.append(("bear", float(bear_poc)))
+        if pool:
+            side, price = min(pool, key=lambda x: abs(float(x[1]) - float(close)))
+            out["nearest_poc"] = float(price)
+            out["nearest_poc_side"] = str(side)
+            tag_dist = float(max(float(step_price) * float(self.fvg_vp_poc_tag_step_frac), 0.0))
+            if abs(float(close) - float(price)) <= tag_dist:
+                out["poc_tagged"] = True
+                out["tag_side"] = str(side)
+        return out
+
+    def _smart_channel_state(
+        self,
+        dataframe: DataFrame,
+        *,
+        close: float,
+        step_price: float,
+        channel_midline: Optional[float],
+        channel_upper: Optional[float],
+        channel_lower: Optional[float],
+        donchian_high: Optional[float],
+        donchian_low: Optional[float],
+        rvol_15m: Optional[float],
+    ) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.smart_channel_enabled),
+            "volume_confirm_enabled": bool(self.smart_channel_volume_confirm_enabled),
+            "volume_confirmed": True,
+            "strong_break_up": False,
+            "strong_break_dn": False,
+            "donchian_break_up": False,
+            "donchian_break_dn": False,
+            "midline_touch": False,
+            "stop_triggered": False,
+            "tp_nudge": None,
+        }
+        if not self.smart_channel_enabled or len(dataframe) < 2:
+            return out
+        prev_close = self._safe_float(dataframe["close"].iloc[-2])
+        if prev_close is None:
+            return out
+        buffer = float(max(self.smart_channel_breakout_step_buffer, 0.0) * max(step_price, 0.0))
+        vol_confirm = True
+        if self.smart_channel_volume_confirm_enabled:
+            vol_confirm = bool(
+                rvol_15m is not None and float(rvol_15m) >= float(self.smart_channel_volume_rvol_min)
+            )
+        out["volume_confirmed"] = bool(vol_confirm)
+        if channel_upper is not None:
+            up_thr = float(channel_upper) + buffer
+            out["strong_break_up"] = bool((float(close) > up_thr) and (float(prev_close) <= up_thr))
+        if channel_lower is not None:
+            dn_thr = float(channel_lower) - buffer
+            out["strong_break_dn"] = bool((float(close) < dn_thr) and (float(prev_close) >= dn_thr))
+        if donchian_high is not None:
+            up_thr_d = float(donchian_high) + buffer
+            out["donchian_break_up"] = bool((float(close) > up_thr_d) and (float(prev_close) <= up_thr_d))
+        if donchian_low is not None:
+            dn_thr_d = float(donchian_low) - buffer
+            out["donchian_break_dn"] = bool((float(close) < dn_thr_d) and (float(prev_close) >= dn_thr_d))
+        if channel_midline is not None:
+            mid = float(channel_midline)
+            out["midline_touch"] = bool(
+                (float(prev_close) <= mid <= float(close))
+                or (float(prev_close) >= mid >= float(close))
+            )
+            if mid > float(close):
+                out["tp_nudge"] = float(min(mid, float(close) + (float(self.smart_channel_tp_nudge_step_multiple) * max(step_price, 0.0))))
+        stop_hit = bool(
+            (out["strong_break_up"] or out["strong_break_dn"] or out["donchian_break_up"] or out["donchian_break_dn"])
+            and vol_confirm
+        )
+        out["stop_triggered"] = bool(stop_hit)
+        return out
+
+    def _zigzag_contraction_state(self, dataframe: DataFrame) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.zigzag_contraction_enabled),
+            "lookback_bars": int(self.zigzag_contraction_lookback_bars),
+            "ratio_max": float(self.zigzag_contraction_ratio_max),
+            "ready": False,
+            "ok": True,
+            "recent_range": None,
+            "prev_range": None,
+            "ratio": None,
+        }
+        if not self.zigzag_contraction_enabled:
+            return out
+        lb = max(int(self.zigzag_contraction_lookback_bars), 2)
+        if len(dataframe) < (2 * lb):
+            return out
+        highs = pd.to_numeric(dataframe["high"], errors="coerce")
+        lows = pd.to_numeric(dataframe["low"], errors="coerce")
+        recent_high = self._safe_float(highs.iloc[-lb:].max())
+        recent_low = self._safe_float(lows.iloc[-lb:].min())
+        prev_high = self._safe_float(highs.iloc[-(2 * lb):-lb].max())
+        prev_low = self._safe_float(lows.iloc[-(2 * lb):-lb].min())
+        if None in {recent_high, recent_low, prev_high, prev_low}:
+            return out
+        recent_range = float(max(float(recent_high) - float(recent_low), 0.0))
+        prev_range = float(max(float(prev_high) - float(prev_low), 0.0))
+        ratio = (recent_range / prev_range) if prev_range > 0 else None
+        ok = bool(ratio is None or ratio <= float(self.zigzag_contraction_ratio_max))
+        out.update(
+            {
+                "ready": True,
+                "ok": bool(ok),
+                "recent_range": float(recent_range),
+                "prev_range": float(prev_range),
+                "ratio": float(ratio) if ratio is not None else None,
+            }
+        )
+        return out
+
+    def _session_sweep_state(self, dataframe: DataFrame) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.session_sweep_enabled),
+            "session_high_prev": None,
+            "session_low_prev": None,
+            "sweep_high": False,
+            "sweep_low": False,
+            "break_retest_high": False,
+            "break_retest_low": False,
+            "tp_nudge": None,
+            "stop_triggered": False,
+            "block_start": False,
+        }
+        if not self.session_sweep_enabled or len(dataframe) < 3:
+            return out
+        if "date" in dataframe.columns:
+            dates = pd.to_datetime(dataframe["date"], utc=True, errors="coerce")
+        else:
+            dates = pd.to_datetime(dataframe.index, utc=True, errors="coerce")
+        if dates.isna().all():
+            return out
+        current_day = dates.iloc[-1].floor("D")
+        session = dataframe.loc[dates.dt.floor("D") == current_day]
+        if len(session) < 2:
+            return out
+        prev_rows = session.iloc[:-1]
+        cur = session.iloc[-1]
+        sh = self._safe_float(pd.to_numeric(prev_rows["high"], errors="coerce").max())
+        sl = self._safe_float(pd.to_numeric(prev_rows["low"], errors="coerce").min())
+        hi = self._safe_float(cur.get("high"))
+        lo = self._safe_float(cur.get("low"))
+        cl = self._safe_float(cur.get("close"))
+        if None in {sh, sl, hi, lo, cl}:
+            return out
+        closes = pd.to_numeric(session["close"], errors="coerce").dropna().astype(float)
+        prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else None
+        sweep_high = bool(float(hi) > float(sh) and float(cl) < float(sh))
+        sweep_low = bool(float(lo) < float(sl) and float(cl) > float(sl))
+        break_retest_high = bool(prev_close is not None and prev_close > float(sh) and float(cl) < float(sh))
+        break_retest_low = bool(prev_close is not None and prev_close < float(sl) and float(cl) > float(sl))
+        tp_nudge = float(sh) if sweep_high and float(sh) > float(cl) else None
+        stop_triggered = bool(break_retest_high or break_retest_low)
+        out.update(
+            {
+                "session_high_prev": float(sh),
+                "session_low_prev": float(sl),
+                "sweep_high": bool(sweep_high),
+                "sweep_low": bool(sweep_low),
+                "break_retest_high": bool(break_retest_high),
+                "break_retest_low": bool(break_retest_low),
+                "tp_nudge": tp_nudge,
+                "stop_triggered": bool(stop_triggered),
+                "block_start": bool(stop_triggered),
+            }
+        )
+        return out
+
+    def _order_flow_state(
+        self,
+        *,
+        last_row: pd.Series,
+        close: float,
+        prev_close: Optional[float],
+    ) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.order_flow_enabled),
+            "spread_pct": None,
+            "depth_thinning_score": None,
+            "orderbook_imbalance": None,
+            "jump_pct": None,
+            "flags": [],
+            "soft_veto": False,
+            "hard_block": False,
+            "confidence_modifier": 1.0,
+        }
+        if not self.order_flow_enabled:
+            return out
+        spread_pct = self._safe_float(last_row.get("spread_pct"))
+        if spread_pct is None and close > 0:
+            hi = self._safe_float(last_row.get("high"))
+            lo = self._safe_float(last_row.get("low"))
+            if hi is not None and lo is not None and hi >= lo:
+                spread_pct = float(((hi - lo) / close) * 0.10)
+        depth = self._safe_float(last_row.get("depth_thinning_score"))
+        imbalance = self._safe_float(last_row.get("orderbook_imbalance"))
+        jump_pct = None
+        if prev_close is not None and prev_close > 0:
+            jump_pct = float(abs(float(close) - float(prev_close)) / float(prev_close))
+        flags: List[str] = []
+        if spread_pct is not None and spread_pct >= float(self.order_flow_spread_soft_max_pct):
+            flags.append(str(EventType.EVENT_SPREAD_SPIKE))
+        if depth is not None and depth >= float(self.order_flow_depth_thin_soft_max):
+            flags.append(str(EventType.EVENT_DEPTH_THIN))
+        if imbalance is not None and abs(float(imbalance)) >= float(self.order_flow_imbalance_extreme):
+            flags.append(str(EventType.EVENT_POST_ONLY_REJECT_BURST))
+        if jump_pct is not None and jump_pct >= float(self.order_flow_jump_soft_max_pct):
+            flags.append(str(EventType.EVENT_JUMP_DETECTED))
+        flags = list(dict.fromkeys(flags))
+        soft_veto = bool(len(flags) >= int(max(self.order_flow_soft_veto_min_flags, 1)))
+        hard_block = bool(self.order_flow_hard_block and soft_veto)
+        penalty = float(max(float(self.order_flow_confidence_penalty_per_flag), 0.0))
+        confidence = float(np.clip(1.0 - (penalty * len(flags)), 0.05, 1.0))
+        out.update(
+            {
+                "spread_pct": spread_pct,
+                "depth_thinning_score": depth,
+                "orderbook_imbalance": imbalance,
+                "jump_pct": jump_pct,
+                "flags": flags,
+                "soft_veto": bool(soft_veto),
+                "hard_block": bool(hard_block),
+                "confidence_modifier": float(confidence),
+            }
+        )
+        return out
+
+    def _drawdown_guard_state(self, dataframe: DataFrame) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.drawdown_guard_enabled),
+            "lookback_bars": int(self.drawdown_guard_lookback_bars),
+            "max_pct": float(self.drawdown_guard_max_pct),
+            "peak_price": None,
+            "drawdown_pct": 0.0,
+            "triggered": False,
+        }
+        if not self.drawdown_guard_enabled:
+            return out
+        closes = pd.to_numeric(dataframe["close"], errors="coerce").dropna().astype(float)
+        lb = max(int(self.drawdown_guard_lookback_bars), 2)
+        if len(closes) < 2:
+            return out
+        window = closes.iloc[-lb:] if len(closes) > lb else closes
+        peak = self._safe_float(window.max())
+        if peak is None or peak <= 0:
+            return out
+        current = float(window.iloc[-1])
+        dd = float(np.clip((float(peak) - float(current)) / float(peak), 0.0, 1.0))
+        triggered = bool(dd >= float(self.drawdown_guard_max_pct))
+        out.update(
+            {
+                "peak_price": float(peak),
+                "drawdown_pct": float(dd),
+                "triggered": bool(triggered),
+            }
+        )
+        return out
+
+    def _max_stops_window_state(self, pair: str, clock_ts: int) -> Dict[str, object]:
+        dq = self._stop_timestamps_by_pair.get(pair)
+        if dq is None:
+            dq = deque()
+            self._stop_timestamps_by_pair[pair] = dq
+        window_secs = int(max(float(self.max_stops_window_minutes), 0.0) * 60.0)
+        cutoff = int(clock_ts - max(window_secs, 0))
+        while dq and int(dq[0]) < cutoff:
+            dq.popleft()
+        count = int(len(dq))
+        blocked = bool(
+            self.max_stops_window_enabled
+            and int(self.max_stops_window_count) > 0
+            and count >= int(self.max_stops_window_count)
+        )
+        return {
+            "enabled": bool(self.max_stops_window_enabled),
+            "window_minutes": float(self.max_stops_window_minutes),
+            "max_count": int(self.max_stops_window_count),
+            "count": int(count),
+            "blocked": bool(blocked),
+            "block_reason": str(BlockReason.BLOCK_MAX_STOPS_WINDOW) if blocked else None,
+        }
+
+    def _register_stop_timestamp(self, pair: str, clock_ts: int) -> None:
+        dq = self._stop_timestamps_by_pair.get(pair)
+        if dq is None:
+            dq = deque()
+            self._stop_timestamps_by_pair[pair] = dq
+        dq.append(int(clock_ts))
+
+    def _micro_reentry_state(
+        self,
+        *,
+        pair: str,
+        clock_ts: int,
+        close: float,
+        micro_poc: Optional[float],
+        step_price: float,
+    ) -> Dict[str, object]:
+        until_ts = int(self._micro_reentry_pause_until_ts_by_pair.get(pair, 0) or 0)
+        active = bool(until_ts > int(clock_ts))
+        reclaim_ok = True
+        if bool(self.micro_reentry_require_poc_reclaim) and micro_poc is not None and step_price > 0:
+            reclaim_floor = float(micro_poc) - (float(self.micro_reentry_poc_buffer_steps) * float(step_price))
+            reclaim_ok = bool(float(close) >= reclaim_floor)
+        if active and reclaim_ok:
+            self._micro_reentry_pause_until_ts_by_pair.pop(pair, None)
+            until_ts = 0
+            active = False
+        block = bool(active and (not reclaim_ok))
+        return {
+            "enabled": True,
+            "active": bool(active),
+            "until_ts": int(until_ts) if until_ts > 0 else None,
+            "until_utc": self._ts_to_iso(int(until_ts)) if until_ts > 0 else None,
+            "reclaim_ok": bool(reclaim_ok),
+            "block_reason": str(BlockReason.BLOCK_RECLAIM_NOT_CONFIRMED) if block else None,
+            "pause_bars": int(max(int(self.micro_reentry_pause_bars), 0)),
+        }
+
     # ========== Main indicators + plan write ==========
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         pair = metadata.get("pair", "UNKNOWN/UNKNOWN")
@@ -5720,9 +6329,18 @@ class GridBrainV1Core(IStrategy):
             shift_frac >= float(self.neutral_rebuild_shift_pct)
         )
         rebuild_for_time = bars_since >= int(self.neutral_rebuild_max_bars)
+        zigzag_contraction_state = self._zigzag_contraction_state(dataframe)
+        zigzag_contraction_gate_ok = bool(
+            (not self.zigzag_contraction_enabled)
+            or (not neutral_mode_active)
+            or (not rebuild_for_time)
+            or bool(zigzag_contraction_state.get("ok", True))
+        )
         use_candidate = True
         if neutral_mode_active and stored_box is not None:
             use_candidate = bool(rebuild_for_shift or rebuild_for_time)
+        if use_candidate and (not zigzag_contraction_gate_ok):
+            use_candidate = False
         if bool(width_avg_state.get("veto", False)):
             use_candidate = False
             box_block_reasons.append(BlockReason.BLOCK_BOX_WIDTH_TOO_WIDE)
@@ -5800,8 +6418,8 @@ class GridBrainV1Core(IStrategy):
         range_len_bars_current = int(range_len_state.get("range_len_bars_current", 1))
         min_range_len_required = int(range_len_state.get("min_range_len_bars", self.min_range_len_bars))
         min_range_len_ok = bool(range_len_state.get("ok", True))
-        session_new_print = bool(fvg_state.get("session_new_print", False))
-        session_gate_ok = bool(fvg_state.get("session_gate_ok", True))
+        session_new_print = False
+        session_gate_ok = True
         if session_new_print and session_gate_ok and pad_effective > 0.0:
             shrink_pct = float(np.clip(self.session_box_pad_shrink_pct, 0.0, 1.0))
             target_pad = float(pad_effective * (1.0 - shrink_pct))
@@ -6222,6 +6840,16 @@ class GridBrainV1Core(IStrategy):
         micro_top_void = float(self._safe_float(micro_vap.get("top_void")) or 0.0)
         micro_bottom_void = float(self._safe_float(micro_vap.get("bottom_void")) or 0.0)
         micro_void_slope = float(self._safe_float(micro_vap.get("void_slope")) or 0.0)
+        buy_ratio_state = self._micro_buy_ratio_state(
+            micro_vap.get("edges") or [],
+            micro_vap.get("density") or [],
+            box_low=lo_p,
+            box_high=hi_p,
+            close=close,
+            midband_half_width=float(self.buy_ratio_midband_half_width),
+            bullish_threshold=float(self.buy_ratio_bullish_threshold),
+            bearish_threshold=float(self.buy_ratio_bearish_threshold),
+        )
         poc_candidates = [x for x in (final_vrvp_poc, micro_poc) if x is not None]
         poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, poc_candidates)
         poc_alignment = self._poc_alignment_state(
@@ -6254,6 +6882,12 @@ class GridBrainV1Core(IStrategy):
         fvg_fresh_pause = bool(fvg_state.get("fresh_defensive_pause", False))
         session_fvg_pause_active = bool(fvg_state.get("session_pause_active", False))
         session_fvg_inside_block = bool(fvg_state.get("session_inside_block", False))
+        fvg_vp_state = self._fvg_vp_state(
+            dataframe,
+            fvg_state=fvg_state,
+            close=close,
+            step_price=step_price,
+        )
         box_block_reasons.extend(self._derive_box_block_reasons(fvg_state))
         if self._box_straddles_cached_breakout(pair, lo_p, hi_p, step_price):
             box_block_reasons.append(BlockReason.BLOCK_BOX_STRADDLE_BREAKOUT_LEVEL)
@@ -6288,10 +6922,32 @@ class GridBrainV1Core(IStrategy):
             and ((basis_raw_prev <= 0.0 <= basis_raw_now) or (basis_raw_prev >= 0.0 >= basis_raw_now))
         )
         hvn_nearest_above = self._nearest_above(close, micro_hvn_levels)
-        fvg_poc = micro_poc if self.fvg_vp_enabled else None
+        fvg_poc = self._safe_float(fvg_vp_state.get("nearest_poc")) if self.fvg_vp_enabled else None
+        if fvg_poc is None and self.fvg_vp_enabled:
+            fvg_poc = micro_poc
         channel_midline = self._safe_float(last.get("bb_mid_15m"))
         channel_upper = bb_upper_15m
         channel_lower = bb_lower_15m
+        donchian_high = self._safe_float(last.get("donchian_high_15m"))
+        donchian_low = self._safe_float(last.get("donchian_low_15m"))
+        smart_channel_state = self._smart_channel_state(
+            dataframe,
+            close=close,
+            step_price=step_price,
+            channel_midline=channel_midline,
+            channel_upper=channel_upper,
+            channel_lower=channel_lower,
+            donchian_high=donchian_high,
+            donchian_low=donchian_low,
+            rvol_15m=rvol_15m,
+        )
+        session_sweep_state = self._session_sweep_state(dataframe)
+        prev_close_for_flow = self._safe_float(dataframe["close"].iloc[-2]) if len(dataframe) >= 2 else None
+        order_flow_state = self._order_flow_state(
+            last_row=last,
+            close=close,
+            prev_close=prev_close_for_flow,
+        )
         midline_bias = self._midline_bias_fallback_state(
             close=close,
             box_low=lo_p,
@@ -6327,9 +6983,13 @@ class GridBrainV1Core(IStrategy):
             "fvg_position_down_avg": self._safe_float(fvg_state.get("positioning_down_avg")),
             "hvn_nearest": hvn_nearest_above,
             "fvg_poc": fvg_poc,
+            "fvg_vp_poc_bull": self._safe_float(fvg_vp_state.get("bull_poc")),
+            "fvg_vp_poc_bear": self._safe_float(fvg_vp_state.get("bear_poc")),
             "channel_midline": channel_midline,
             "channel_upper": channel_upper,
             "channel_lower": channel_lower,
+            "smart_channel_tp_nudge": self._safe_float(smart_channel_state.get("tp_nudge")),
+            "session_sweep_tp_nudge": self._safe_float(session_sweep_state.get("tp_nudge")),
             "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
             "ml_quick_tp_candidate": ml_quick_tp_candidate,
         }
@@ -6377,11 +7037,15 @@ class GridBrainV1Core(IStrategy):
             "basis_mid": basis_mid,
             "hvn_nearest": hvn_nearest_above,
             "fvg_poc": fvg_poc,
+            "fvg_vp_poc_bull": self._safe_float(fvg_vp_state.get("bull_poc")),
+            "fvg_vp_poc_bear": self._safe_float(fvg_vp_state.get("bear_poc")),
             "channel_midline": channel_midline,
             "channel_upper": channel_upper,
             "channel_lower": channel_lower,
             "session_high": session_high,
             "session_low": session_low,
+            "session_sweep_tp_nudge": self._safe_float(session_sweep_state.get("tp_nudge")),
+            "smart_channel_tp_nudge": self._safe_float(smart_channel_state.get("tp_nudge")),
             "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
             "cvd_quick_tp_trigger": bool(cvd_quick_tp_trigger),
             "ml_quick_tp_candidate": ml_quick_tp_candidate,
@@ -6452,6 +7116,26 @@ class GridBrainV1Core(IStrategy):
             nudge_tp = close + (float(self.hvp_quiet_exit_step_multiple) * step_price)
             tp_price_plan = float(min(tp_price_plan, nudge_tp))
             hvp_quiet_exit_tp_nudged = True
+        smart_channel_tp_nudged = False
+        smart_channel_tp = self._safe_float(smart_channel_state.get("tp_nudge"))
+        if smart_channel_tp is not None and smart_channel_tp > close and tp_price_plan > close:
+            tp_price_plan = float(min(tp_price_plan, smart_channel_tp))
+            smart_channel_tp_nudged = True
+        session_sweep_tp_nudged = False
+        session_sweep_tp = self._safe_float(session_sweep_state.get("tp_nudge"))
+        if session_sweep_tp is not None and session_sweep_tp > close and tp_price_plan > close:
+            tp_price_plan = float(min(tp_price_plan, session_sweep_tp))
+            session_sweep_tp_nudged = True
+        buy_ratio_tp_nudged = False
+        if (
+            bool(self.buy_ratio_bias_enabled)
+            and int(buy_ratio_state.get("bias", 0)) < 0
+            and step_price > 0
+            and tp_price_plan > close
+        ):
+            nudge_tp = close + (float(self.buy_ratio_bearish_tp_step_multiple) * step_price)
+            tp_price_plan = float(min(tp_price_plan, nudge_tp))
+            buy_ratio_tp_nudged = True
         sl_price, sl_selection = self._select_sl_price(
             sl_base=sl_price,
             step_price=step_price,
@@ -6481,6 +7165,22 @@ class GridBrainV1Core(IStrategy):
             self.rung_weight_min,
             self.rung_weight_max,
         )
+        rung_weights = self._apply_buy_ratio_rung_bias(
+            levels_arr,
+            rung_weights,
+            box_low=lo_p,
+            box_high=hi_p,
+            bias=int(buy_ratio_state.get("bias", 0)) if self.buy_ratio_bias_enabled else 0,
+            strength=float(self.buy_ratio_rung_bias_strength),
+            w_min=float(self.rung_weight_min),
+            w_max=float(self.rung_weight_max),
+        )
+        order_flow_confidence = float(order_flow_state.get("confidence_modifier", 1.0) or 1.0)
+        if order_flow_confidence < 0.999:
+            rung_weights = [
+                float(np.clip(float(w) * order_flow_confidence, float(self.rung_weight_min), float(self.rung_weight_max)))
+                for w in rung_weights
+            ]
         rung_weights_before_ml = [float(x) for x in rung_weights]
         rung_weights = self._apply_ml_rung_safety(
             levels_arr,
@@ -6552,6 +7252,11 @@ class GridBrainV1Core(IStrategy):
             os_dev_rvol_ok = True
             os_dev_build_ok = True
             os_dev_trend_stop = False
+
+        drawdown_state = self._drawdown_guard_state(dataframe)
+        drawdown_guard_triggered = bool(drawdown_state.get("triggered", False))
+        smart_channel_stop = bool(smart_channel_state.get("stop_triggered", False))
+        session_break_retest_stop = bool(session_sweep_state.get("stop_triggered", False))
 
         neutral_adx_overheat_stop = bool(
             neutral_mode_active
@@ -6626,6 +7331,11 @@ class GridBrainV1Core(IStrategy):
         fvg_conflict_stop_up = bool(flags["close_outside_up"] and bool(fvg_state.get("defensive_bear_conflict", False)))
         fvg_conflict_stop_dn = bool(flags["close_outside_dn"] and bool(fvg_state.get("defensive_bull_conflict", False)))
         fvg_conflict_stop_override = bool(fvg_conflict_stop_up or fvg_conflict_stop_dn)
+        fvg_vp_tagged = bool(fvg_vp_state.get("poc_tagged", False))
+        fvg_vp_stop_override = bool(
+            fvg_vp_tagged
+            and (flags["close_outside_up"] or flags["close_outside_dn"])
+        )
         fresh_breakout_idle_reclaim_stop = bool(
             self.breakout_idle_reclaim_on_fresh
             and breakout_fresh_block_active
@@ -6649,6 +7359,10 @@ class GridBrainV1Core(IStrategy):
             "fvg_conflict_stop_override": bool(fvg_conflict_stop_override),
             "fvg_conflict_stop_up": bool(fvg_conflict_stop_up),
             "fvg_conflict_stop_dn": bool(fvg_conflict_stop_dn),
+            "fvg_vp_stop_override": bool(fvg_vp_stop_override),
+            "smart_channel_stop": bool(smart_channel_stop),
+            "session_break_retest_stop": bool(session_break_retest_stop),
+            "drawdown_guard_triggered": bool(drawdown_guard_triggered),
             "neutral_adx_overheat_stop": bool(neutral_adx_overheat_stop),
             "neutral_bbwp_expansion_stop": bool(neutral_bbwp_expansion_stop),
             "neutral_box_break_stop": bool(neutral_box_break_stop),
@@ -6669,6 +7383,14 @@ class GridBrainV1Core(IStrategy):
             stop_reason_enum_active.append(str(StopReason.STOP_BREAKOUT_CONFIRM_UP))
         if breakout_confirm_stop_dn:
             stop_reason_enum_active.append(str(StopReason.STOP_BREAKOUT_CONFIRM_DN))
+        if smart_channel_stop:
+            stop_reason_enum_active.append(str(StopReason.STOP_CHANNEL_STRONG_BREAK))
+        if session_break_retest_stop:
+            stop_reason_enum_active.append(str(StopReason.STOP_LIQUIDITY_SWEEP_BREAK_RETEST))
+        if drawdown_guard_triggered:
+            stop_reason_enum_active.append(str(StopReason.STOP_DRAWDOWN_GUARD))
+        if fvg_vp_stop_override:
+            stop_reason_enum_active.append(str(StopReason.STOP_FVG_VOID_CONFLUENCE))
         if meta_drift_hard_stop:
             stop_reason_enum_active.append(self.STOP_REASON_META_DRIFT_HARD)
         stop_reason_primary = str(stop_reason_enum_active[0]) if stop_reason_enum_active else None
@@ -6683,6 +7405,10 @@ class GridBrainV1Core(IStrategy):
             or os_dev_trend_stop
             or lvn_corridor_stop_override
             or fvg_conflict_stop_override
+            or fvg_vp_stop_override
+            or smart_channel_stop
+            or session_break_retest_stop
+            or drawdown_guard_triggered
             or mode_handoff_required_stop
             or router_pause_stop
             or fresh_breakout_idle_reclaim_stop
@@ -6712,6 +7438,8 @@ class GridBrainV1Core(IStrategy):
             phase2_gate_failures.append(BlockReason.BLOCK_EXCURSION_ASYMMETRY)
         if not drift_slope_gate_ok:
             phase2_gate_failures.append(BlockReason.BLOCK_DRIFT_SLOPE_HIGH)
+        if not zigzag_contraction_gate_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_START_PERSISTENCE_FAIL)
         if self.bbwp_enabled:
             if not bbwp_allow:
                 phase2_gate_failures.append(BlockReason.BLOCK_BBWP_HIGH)
@@ -6729,6 +7457,12 @@ class GridBrainV1Core(IStrategy):
             phase2_gate_failures.append(BlockReason.BLOCK_FUNDING_FILTER)
         if not hvp_gate_ok:
             phase2_gate_failures.append(BlockReason.BLOCK_HVP_EXPANDING)
+        if drawdown_guard_triggered:
+            phase2_gate_failures.append(BlockReason.BLOCK_DRAWDOWN_GUARD)
+        if bool(session_sweep_state.get("block_start", False)):
+            phase2_gate_failures.append(BlockReason.BLOCK_LIQ_SWEEP_OPPOSITE_STRUCTURE)
+        if bool(order_flow_state.get("hard_block", False)):
+            phase2_gate_failures.append(BlockReason.BLOCK_CAPACITY_THIN)
         if meta_drift_soft_block:
             phase2_gate_failures.append(BlockReason.BLOCK_META_DRIFT_SOFT)
         if not planner_health_ok:
@@ -6787,6 +7521,7 @@ class GridBrainV1Core(IStrategy):
             ("band_slope_gate_ok", bool(band_slope_gate_ok)),
             ("excursion_asymmetry_gate_ok", bool(excursion_asymmetry_gate_ok)),
             ("drift_slope_gate_ok", bool(drift_slope_gate_ok)),
+            ("zigzag_contraction_gate_ok", bool(zigzag_contraction_gate_ok)),
             ("step_cost_ok", bool(step_cost_block_reason is None)),
             ("width_avg_veto_ok", bool(not width_avg_state.get("veto", False))),
             ("start_box_position_ok", bool(start_box_position_ok)),
@@ -6796,6 +7531,8 @@ class GridBrainV1Core(IStrategy):
             ("mrvd_proximity_ok", bool(mrvd_proximity_ok)),
             ("basis_cross_ok", bool(basis_cross_ok)),
             ("capacity_hint_ok", bool(capacity_hint_ok)),
+            ("order_flow_hard_block_ok", bool(not order_flow_state.get("hard_block", False))),
+            ("drawdown_guard_ok", bool(not drawdown_guard_triggered)),
             ("meta_drift_soft_block_ok", bool(not meta_drift_soft_block)),
             ("funding_gate_ok", bool(funding_gate_ok)),
             ("hvp_gate_ok", bool(hvp_gate_ok)),
@@ -6906,6 +7643,17 @@ class GridBrainV1Core(IStrategy):
                 meta_drift_cooldown_extended = True
             cooldown_active = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
 
+        max_stops_window_state = self._max_stops_window_state(pair, int(clock_ts))
+        max_stops_window_blocked = bool(max_stops_window_state.get("blocked", False))
+        micro_reentry_state = self._micro_reentry_state(
+            pair=pair,
+            clock_ts=int(clock_ts),
+            close=float(close),
+            micro_poc=micro_poc,
+            step_price=float(step_price),
+        )
+        micro_reentry_blocked = bool(micro_reentry_state.get("block_reason"))
+
         stop_rule = bool(raw_stop_rule)
         min_runtime_blocked_stop = False
         if (
@@ -6925,6 +7673,10 @@ class GridBrainV1Core(IStrategy):
         if not planner_health_ok:
             start_gate_ok = False
         if not start_stability_ok:
+            start_gate_ok = False
+        if max_stops_window_blocked:
+            start_gate_ok = False
+        if micro_reentry_blocked:
             start_gate_ok = False
         box_block_active = bool(len(box_block_reasons) > 0)
         start_signal = bool(
@@ -6989,6 +7741,10 @@ class GridBrainV1Core(IStrategy):
             start_block_reasons.append(str(BlockReason.BLOCK_RECLAIM_PENDING))
         if cooldown_active:
             start_block_reasons.append(str(BlockReason.BLOCK_COOLDOWN_ACTIVE))
+        if max_stops_window_blocked:
+            start_block_reasons.append(str(BlockReason.BLOCK_MAX_STOPS_WINDOW))
+        if micro_reentry_blocked:
+            start_block_reasons.append(str(BlockReason.BLOCK_RECLAIM_NOT_CONFIRMED))
         if mode_handoff_required_stop:
             start_block_reasons.append("mode_handoff_required_stop")
         if stop_rule:
@@ -7024,6 +7780,19 @@ class GridBrainV1Core(IStrategy):
         if action == "STOP":
             reclaim_until_ts = int(clock_ts) + reclaim_secs
             cooldown_until_ts = int(clock_ts) + cooldown_secs
+            self._register_stop_timestamp(pair, int(clock_ts))
+            if (
+                bool(self.micro_reentry_pause_bars > 0)
+                and (
+                    lvn_corridor_stop_override
+                    or fvg_conflict_stop_override
+                    or fvg_vp_stop_override
+                    or session_break_retest_stop
+                )
+            ):
+                pause_secs = int(max(int(self.micro_reentry_pause_bars), 0) * int(self.data_quality_expected_candle_seconds))
+                if pause_secs > 0:
+                    self._micro_reentry_pause_until_ts_by_pair[pair] = int(clock_ts) + pause_secs
             self._reclaim_until_ts_by_pair[pair] = reclaim_until_ts
             self._cooldown_until_ts_by_pair[pair] = cooldown_until_ts
             self._running_by_pair[pair] = False
@@ -7036,6 +7805,7 @@ class GridBrainV1Core(IStrategy):
             if (not running_prev) or (active_since_ts is None):
                 self._active_since_ts_by_pair[pair] = int(clock_ts)
                 active_since_ts = int(clock_ts)
+            self._micro_reentry_pause_until_ts_by_pair.pop(pair, None)
             self._running_by_pair[pair] = True
             self._running_mode_by_pair[pair] = self._normalize_mode_name(active_mode)
             runtime_secs = max(int(clock_ts) - int(active_since_ts), 0)
@@ -7050,11 +7820,21 @@ class GridBrainV1Core(IStrategy):
                 active_since_ts = None
                 runtime_secs = None
 
+        max_stops_window_state = self._max_stops_window_state(pair, int(clock_ts))
         running_now = bool(self._running_by_pair.get(pair, False))
         reclaim_active_now = bool(reclaim_until_ts and int(clock_ts) < reclaim_until_ts)
         cooldown_active_now = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
         stop_reason_flags_raw_active = [k for k, v in stop_reason_flags_raw.items() if bool(v)]
-        stop_reason_flags_applied_active = stop_reason_flags_raw_active if bool(stop_rule) else []
+        stop_reason_flags_applied_active = (
+            list(
+                dict.fromkeys(
+                    stop_reason_flags_raw_active
+                    + [str(x) for x in stop_reason_enum_active]
+                )
+            )
+            if bool(stop_rule)
+            else []
+        )
         materiality_info = self._evaluate_materiality(
             pair,
             mid,
@@ -7078,12 +7858,84 @@ class GridBrainV1Core(IStrategy):
             "cooldown_ok": bool(not cooldown_active),
             "reclaim_ok": bool(not reclaim_active),
             "capacity_hint_ok": bool(capacity_hint_ok),
+            "order_flow_hard_block_ok": bool(not order_flow_state.get("hard_block", False)),
+            "drawdown_guard_ok": bool(not drawdown_guard_triggered),
+            "max_stops_window_ok": bool(not max_stops_window_blocked),
+            "micro_reentry_ok": bool(not micro_reentry_blocked),
             "cost_step_ok": bool(step_cost_block_reason is None),
             "min_range_len_ok": bool(min_range_len_ok),
             "breakout_confirm_gate_ok": bool(breakout_confirm_gate_ok),
             "width_avg_veto_ok": bool(not width_avg_state.get("veto", False)),
             "volatility_policy_ok": bool(volatility_strictness_ok),
         }
+
+        structured_event_types: List[str] = []
+        structured_event_metadata: Dict[str, Dict[str, object]] = {}
+
+        def _append_structured_event(code: object, **meta: object) -> None:
+            code_s = str(code or "").strip()
+            if not code_s or not code_s.startswith("EVENT_"):
+                return
+            structured_event_types.append(code_s)
+            if meta:
+                structured_event_metadata[code_s] = {
+                    k: _normalize_runtime_value(v)
+                    for k, v in meta.items()
+                    if v is not None
+                }
+
+        if breakout and str(breakout_direction) == "bull":
+            _append_structured_event(EventType.EVENT_BREAKOUT_BULL, direction="bull")
+        elif breakout and str(breakout_direction) == "bear":
+            _append_structured_event(EventType.EVENT_BREAKOUT_BEAR, direction="bear")
+        if bool(smart_channel_state.get("strong_break_up")):
+            _append_structured_event(EventType.EVENT_CHANNEL_STRONG_BREAK_UP)
+        if bool(smart_channel_state.get("strong_break_dn")):
+            _append_structured_event(EventType.EVENT_CHANNEL_STRONG_BREAK_DN)
+        if bool(smart_channel_state.get("donchian_break_up")):
+            _append_structured_event(EventType.EVENT_DONCHIAN_STRONG_BREAK_UP)
+        if bool(smart_channel_state.get("donchian_break_dn")):
+            _append_structured_event(EventType.EVENT_DONCHIAN_STRONG_BREAK_DN)
+        if bool(smart_channel_state.get("midline_touch")):
+            _append_structured_event(EventType.EVENT_CHANNEL_MIDLINE_TOUCH, channel_midline=channel_midline)
+        if bool(session_sweep_state.get("sweep_high")):
+            _append_structured_event(EventType.EVENT_SESSION_HIGH_SWEEP, level=session_sweep_state.get("session_high_prev"))
+            _append_structured_event(EventType.EVENT_SWEEP_WICK_HIGH, level=session_sweep_state.get("session_high_prev"))
+        if bool(session_sweep_state.get("sweep_low")):
+            _append_structured_event(EventType.EVENT_SESSION_LOW_SWEEP, level=session_sweep_state.get("session_low_prev"))
+            _append_structured_event(EventType.EVENT_SWEEP_WICK_LOW, level=session_sweep_state.get("session_low_prev"))
+        if bool(session_sweep_state.get("break_retest_high")):
+            _append_structured_event(EventType.EVENT_SWEEP_BREAK_RETEST_HIGH)
+        if bool(session_sweep_state.get("break_retest_low")):
+            _append_structured_event(EventType.EVENT_SWEEP_BREAK_RETEST_LOW)
+        if bool(fvg_vp_state.get("poc_tagged")):
+            _append_structured_event(
+                EventType.EVENT_FVG_POC_TAG,
+                side=fvg_vp_state.get("tag_side"),
+                poc=fvg_vp_state.get("nearest_poc"),
+            )
+        if bool(lvn_corridor_stop_override):
+            _append_structured_event(EventType.EVENT_LVN_VOID_EXIT)
+        if bool(cvd_state.get("bull_divergence_near_bottom", False)):
+            _append_structured_event(EventType.EVENT_CVD_BULL_DIV)
+        if bool(cvd_state.get("bear_divergence_near_top", False)):
+            _append_structured_event(EventType.EVENT_CVD_BEAR_DIV)
+        if bool(cvd_state.get("bos_up", False)):
+            _append_structured_event(EventType.EVENT_CVD_BOS_UP)
+        if bool(cvd_state.get("bos_down", False)):
+            _append_structured_event(EventType.EVENT_CVD_BOS_DN)
+        if bool(meta_drift_soft_block):
+            _append_structured_event(EventType.EVENT_META_DRIFT_SOFT)
+        if bool(meta_drift_hard_stop):
+            _append_structured_event(EventType.EVENT_META_DRIFT_HARD)
+        reason_set = {str(x) for x in (data_quality_reasons or [])}
+        if str(BlockReason.BLOCK_DATA_GAP) in reason_set:
+            _append_structured_event(EventType.EVENT_DATA_GAP_DETECTED)
+        if str(BlockReason.BLOCK_DATA_MISALIGN) in reason_set:
+            _append_structured_event(EventType.EVENT_DATA_MISALIGN_DETECTED)
+        for code in order_flow_state.get("flags") or []:
+            _append_structured_event(code)
+        structured_event_types = list(dict.fromkeys(structured_event_types))
 
         plan = {
             "ts": ts,
@@ -7201,6 +8053,7 @@ class GridBrainV1Core(IStrategy):
                         "stop_reason": breakout_confirm_reason_state.get("stop_reason"),
                     },
                     "midline_bias_fallback": dict(midline_bias),
+                    "zigzag_contraction": dict(zigzag_contraction_state),
                 },
                 "micro_vap": {
                     "enabled": bool(self.micro_vap_enabled),
@@ -7213,6 +8066,7 @@ class GridBrainV1Core(IStrategy):
                     "bottom_void": float(micro_bottom_void),
                     "void_slope": float(micro_void_slope),
                     "poc_vrvp_dist_steps": micro_poc_vrvp_steps,
+                    "buy_ratio_bias": dict(buy_ratio_state),
                 },
                 "fvg": {
                     "enabled": bool(self.fvg_enabled),
@@ -7245,6 +8099,7 @@ class GridBrainV1Core(IStrategy):
                     "session_fvg_avg": self._safe_float(fvg_state.get("session_fvg_avg")),
                     "positioning_up_avg": self._safe_float(fvg_state.get("positioning_up_avg")),
                     "positioning_down_avg": self._safe_float(fvg_state.get("positioning_down_avg")),
+                    "fvg_vp": dict(fvg_vp_state),
                 },
                 "multi_range_volume": {
                     "enabled": bool(self.mrvd_enabled),
@@ -7343,11 +8198,13 @@ class GridBrainV1Core(IStrategy):
                 },
                 "rung_density_bias": {
                     "enabled": bool(self.micro_vap_enabled),
-                    "source": "micro_vap_hvn_lvn",
+                    "source": "micro_vap_hvn_lvn_cvd_buy_ratio_order_flow",
                     "hvn_boost": float(self.rung_weight_hvn_boost),
                     "lvn_penalty": float(self.rung_weight_lvn_penalty),
                     "weight_min": float(self.rung_weight_min),
                     "weight_max": float(self.rung_weight_max),
+                    "buy_ratio_bias": dict(buy_ratio_state),
+                    "order_flow_confidence_modifier": float(order_flow_state.get("confidence_modifier", 1.0) or 1.0),
                     "weights_by_level_index": [float(x) for x in rung_weights],
                 },
             },
@@ -7361,6 +8218,13 @@ class GridBrainV1Core(IStrategy):
                 "source": "nearest_conservative",
                 "tp_candidates": tp_candidates,
                 "midline_bias": dict(midline_bias),
+                "tp_nudges": {
+                    "squeeze": bool(squeeze_tp_nudged),
+                    "hvp_quiet_exit": bool(hvp_quiet_exit_tp_nudged),
+                    "smart_channel": bool(smart_channel_tp_nudged),
+                    "session_sweep": bool(session_sweep_tp_nudged),
+                    "buy_ratio_bearish": bool(buy_ratio_tp_nudged),
+                },
                 "sl_selection": sl_selection,
             },
             "signals": {
@@ -7481,6 +8345,9 @@ class GridBrainV1Core(IStrategy):
                 "squeeze_momentum_flip_against_edge": bool(squeeze_momentum_flip_against_edge),
                 "squeeze_momentum_decelerating": bool(squeeze_momentum_decelerating),
                 "squeeze_tp_nudged": bool(squeeze_tp_nudged),
+                "smart_channel_tp_nudged": bool(smart_channel_tp_nudged),
+                "session_sweep_tp_nudged": bool(session_sweep_tp_nudged),
+                "buy_ratio_tp_nudged": bool(buy_ratio_tp_nudged),
                 "vrvp_box_ok": bool(vrvp_box_ok),
                 "micro_vap_ok": bool(micro_vap_ok),
                 "fvg_gate_ok": bool(fvg_gate_ok),
@@ -7550,6 +8417,15 @@ class GridBrainV1Core(IStrategy):
                 "micro_lvn_levels": [float(x) for x in micro_lvn_levels],
                 "micro_void_slope": float(micro_void_slope),
                 "micro_poc_vrvp_dist_steps": micro_poc_vrvp_steps,
+                "buy_ratio_bias": dict(buy_ratio_state),
+                "fvg_vp_state": dict(fvg_vp_state),
+                "smart_channel": dict(smart_channel_state),
+                "session_sweep": dict(session_sweep_state),
+                "order_flow": dict(order_flow_state),
+                "drawdown_guard": dict(drawdown_state),
+                "max_stops_window": dict(max_stops_window_state),
+                "micro_reentry": dict(micro_reentry_state),
+                "zigzag_contraction": dict(zigzag_contraction_state),
                 "os_dev_raw": int(os_dev_raw),
                 "os_dev_norm": os_dev_norm,
                 "os_dev_state": int(os_dev_state),
@@ -7658,6 +8534,10 @@ class GridBrainV1Core(IStrategy):
                     "fvg_conflict_stop_override": bool(stop_reason_flags_raw["fvg_conflict_stop_override"]),
                     "fvg_conflict_stop_up": bool(stop_reason_flags_raw["fvg_conflict_stop_up"]),
                     "fvg_conflict_stop_dn": bool(stop_reason_flags_raw["fvg_conflict_stop_dn"]),
+                    "fvg_vp_stop_override": bool(stop_reason_flags_raw["fvg_vp_stop_override"]),
+                    "smart_channel_stop": bool(stop_reason_flags_raw["smart_channel_stop"]),
+                    "session_break_retest_stop": bool(stop_reason_flags_raw["session_break_retest_stop"]),
+                    "drawdown_guard_triggered": bool(stop_reason_flags_raw["drawdown_guard_triggered"]),
                     "neutral_adx_overheat_stop": bool(stop_reason_flags_raw["neutral_adx_overheat_stop"]),
                     "neutral_bbwp_expansion_stop": bool(stop_reason_flags_raw["neutral_bbwp_expansion_stop"]),
                     "neutral_box_break_stop": bool(stop_reason_flags_raw["neutral_box_break_stop"]),
@@ -7912,6 +8792,28 @@ class GridBrainV1Core(IStrategy):
                     "lvn_penalty": float(self.rung_weight_lvn_penalty),
                     "weight_min": float(self.rung_weight_min),
                     "weight_max": float(self.rung_weight_max),
+                    "buy_ratio_enabled": bool(self.buy_ratio_bias_enabled),
+                    "buy_ratio_strength": float(self.buy_ratio_rung_bias_strength),
+                },
+                "smart_channel": {
+                    "enabled": bool(self.smart_channel_enabled),
+                    "breakout_step_buffer": float(self.smart_channel_breakout_step_buffer),
+                    "volume_confirm_enabled": bool(self.smart_channel_volume_confirm_enabled),
+                    "volume_rvol_min": float(self.smart_channel_volume_rvol_min),
+                    "tp_nudge_step_multiple": float(self.smart_channel_tp_nudge_step_multiple),
+                },
+                "session_sweep": {
+                    "enabled": bool(self.session_sweep_enabled),
+                    "retest_lookback_bars": int(self.session_sweep_retest_lookback_bars),
+                },
+                "order_flow": {
+                    "enabled": bool(self.order_flow_enabled),
+                    "spread_soft_max_pct": float(self.order_flow_spread_soft_max_pct),
+                    "depth_thin_soft_max": float(self.order_flow_depth_thin_soft_max),
+                    "imbalance_extreme": float(self.order_flow_imbalance_extreme),
+                    "jump_soft_max_pct": float(self.order_flow_jump_soft_max_pct),
+                    "soft_veto_min_flags": int(self.order_flow_soft_veto_min_flags),
+                    "hard_block": bool(self.order_flow_hard_block),
                 },
                 "runtime_controls": {
                     "reclaim_hours": float(self.reclaim_hours),
@@ -7921,6 +8823,13 @@ class GridBrainV1Core(IStrategy):
                     "min_runtime_hours_base": float(self.min_runtime_hours),
                     "min_runtime_minutes": float(min_runtime_minutes_effective),
                     "min_runtime_secs": int(min_runtime_secs),
+                    "drawdown_guard_enabled": bool(self.drawdown_guard_enabled),
+                    "drawdown_guard_lookback_bars": int(self.drawdown_guard_lookback_bars),
+                    "drawdown_guard_max_pct": float(self.drawdown_guard_max_pct),
+                    "max_stops_window_enabled": bool(self.max_stops_window_enabled),
+                    "max_stops_window_minutes": float(self.max_stops_window_minutes),
+                    "max_stops_window_count": int(self.max_stops_window_count),
+                    "micro_reentry_pause_bars": int(self.micro_reentry_pause_bars),
                     "breakout_idle_reclaim_on_fresh": bool(self.breakout_idle_reclaim_on_fresh),
                 },
                 "cost_model": {
@@ -7991,8 +8900,13 @@ class GridBrainV1Core(IStrategy):
                 "meta_drift_hard_stop": bool(meta_drift_hard_stop),
                 "meta_drift_cooldown_extended": bool(meta_drift_cooldown_extended),
                 "warning_codes": warning_codes,
+                "structured_events": list(structured_event_types),
                 "vol_bucket": str(vol_bucket),
                 "volatility_policy": dict(volatility_policy),
+                "order_flow": dict(order_flow_state),
+                "drawdown_guard": dict(drawdown_state),
+                "max_stops_window": dict(max_stops_window_state),
+                "micro_reentry": dict(micro_reentry_state),
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
                 "stop_reason_flags_applied_active": [str(x) for x in stop_reason_flags_applied_active],
                 "neutral_runtime": {
@@ -8030,6 +8944,12 @@ class GridBrainV1Core(IStrategy):
                 "meta_drift_hard_stop": bool(meta_drift_hard_stop),
                 "meta_drift_cooldown_extended": bool(meta_drift_cooldown_extended),
                 "warning_codes": warning_codes,
+                "structured_events": list(structured_event_types),
+                "order_flow": dict(order_flow_state),
+                "drawdown_guard": dict(drawdown_state),
+                "max_stops_window": dict(max_stops_window_state),
+                "micro_reentry": dict(micro_reentry_state),
+                "zigzag_contraction": dict(zigzag_contraction_state),
                 "stop_rule_triggered": bool(stop_rule),
                 "stop_rule_triggered_raw": bool(raw_stop_rule),
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
@@ -8138,6 +9058,9 @@ class GridBrainV1Core(IStrategy):
                 "up": float(breakout_up_level),
                 "dn": float(breakout_dn_level),
             },
+            "zigzag_contraction": dict(zigzag_contraction_state),
+            "session_sweep": dict(session_sweep_state),
+            "smart_channel": dict(smart_channel_state),
         }
         plan["box"] = {
             "low": float(lo_p),
@@ -8170,10 +9093,17 @@ class GridBrainV1Core(IStrategy):
             "router_desired_mode": router_state.get("desired_mode"),
             "capacity_hint": dict(capacity_hint),
             "vol_bucket": str(vol_bucket),
+            "order_flow": dict(order_flow_state),
+            "max_stops_window": dict(max_stops_window_state),
+            "micro_reentry": dict(micro_reentry_state),
             "volatility_policy": {
                 "base": dict(volatility_policy_base),
                 "adapted": dict(volatility_policy_adapted),
             },
+        }
+        plan["event_signals"] = {
+            "types": list(structured_event_types),
+            "metadata": dict(structured_event_metadata),
         }
         plan["start_stability_score"] = float(start_stability.get("score", 0.0))
         plan["meta_drift_state"] = {
@@ -8216,6 +9146,19 @@ class GridBrainV1Core(IStrategy):
                 "no_repeat_lsi_guard": bool(self.fill_no_repeat_lsi_guard),
                 "cooldown_bars": int(self.fill_no_repeat_cooldown_bars),
             },
+            "protections": {
+                "drawdown_guard_enabled": bool(self.drawdown_guard_enabled),
+                "max_stops_window_enabled": bool(self.max_stops_window_enabled),
+            },
+            "structured_event_bus": {
+                "enabled": True,
+                "event_count": int(len(structured_event_types)),
+            },
+            "fvg_vp": {"enabled": bool(self.fvg_vp_enabled)},
+            "smart_channel": {"enabled": bool(self.smart_channel_enabled)},
+            "session_sweep": {"enabled": bool(self.session_sweep_enabled)},
+            "buy_ratio_bias": {"enabled": bool(self.buy_ratio_bias_enabled)},
+            "order_flow_metrics": {"enabled": bool(self.order_flow_enabled)},
         }
         prev_material_plan = self._last_material_plan_payload_by_pair.get(pair)
         max_changed_fields = max(int(self.decision_event_log_max_changed_fields), 1)
@@ -8253,6 +9196,8 @@ class GridBrainV1Core(IStrategy):
             warning_codes=[str(x) for x in warning_codes],
             stop_codes=[str(x) for x in stop_reason_flags_applied_active],
             close_price=float(close),
+            event_types=list(structured_event_types),
+            event_metadata=dict(structured_event_metadata),
         )
         if event_ids_emitted:
             plan["event_ids_emitted"] = list(event_ids_emitted)

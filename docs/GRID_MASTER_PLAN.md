@@ -2394,20 +2394,19 @@ Status values used:
     - Added strict micro-POC vs VRVP-POC alignment state (`_poc_alignment_state`) with configurable step/width thresholds and cross-confirm discipline.
     - START gating now blocks with canonical `BLOCK_POC_ALIGNMENT_FAIL` when misalignment persists without required cross confirmation.
     - Wired alignment diagnostics into `range.validation.poc_alignment`, runtime signals, start filters, and blocker aggregation.
+21. [DONE 2026-02-26] Complete remaining PARTIAL module registry items (M404, M406, M505, M606, M702, M703, M805, M809, M1003).
+    - Added protections-layer completion (`drawdown_guard` + `max_stops_window`) with canonical block/stop integration and runtime diagnostics.
+    - Extended structured event-bus taxonomy emission so planner now emits canonical `EVENT_*` records (with metadata) in addition to blocker/warn/stop reason-code events.
+    - Completed Micro-VAP re-entry + buy-ratio policy wiring (mid-band buy-ratio bias into rung density, bearish TP nudge, and micro re-entry pause/reclaim discipline).
+    - Completed FVG-VP usage (FVG-internal VP POC extraction + TP/STOP diagnostics/event wiring) and smart-channel/session-sweep runtime behaviors (channel strong-break stops, sweep/retest TP/STOP hooks).
+    - Completed order-flow soft-veto/confidence plumbing (spread/depth/imbalance/jump metrics) with deterministic diagnostics and advisory event emission.
+    - Added focused coverage in `freqtrade/user_data/tests/test_partial_module_completion.py`.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M404` Protections layer (drawdown/protection extensions incomplete)
-- `M406` Structured event taxonomy/bus contract
-- `M505` Micro-VAP bias/re-entry discipline completeness
-- `M606` FVG-VP full module behavior
-- `M702` Smart breakout channels full behavior
-- `M703` Zig-zag channel enhancement full behavior
-- `M805` Session high/low sweep + break-retest event behavior
-- `M809` Buy-ratio micro-bias policy usage
-- `M1003` Minimal order-flow metrics full module behavior
+- None.
 
 #### 26.2.2 Modules currently NOT_IMPLEMENTED
 
@@ -2483,27 +2482,27 @@ Status values used:
 - `M401` DONE
 - `M402` DONE
 - `M403` DONE
-- `M404` PARTIAL
+- `M404` DONE
 - `M405` DONE
-- `M406` PARTIAL
+- `M406` DONE
 
 - `M501` DONE
 - `M502` DONE
 - `M503` DONE
 - `M504` DONE
-- `M505` PARTIAL
+- `M505` DONE
 
 - `M601` NOT_IMPLEMENTED
 - `M602` DONE
 - `M603` DONE
 - `M604` DONE
 - `M605` DONE
-- `M606` PARTIAL
+- `M606` DONE
 - `M607` DONE
 
 - `M701` DONE
-- `M702` PARTIAL
-- `M703` PARTIAL
+- `M702` DONE
+- `M703` DONE
 - `M704` NOT_IMPLEMENTED
 - `M705` NOT_IMPLEMENTED
 
@@ -2511,11 +2510,11 @@ Status values used:
 - `M802` DONE
 - `M803` DONE
 - `M804` DONE
-- `M805` PARTIAL
+- `M805` DONE
 - `M806` DONE
 - `M807` NOT_IMPLEMENTED
 - `M808` NOT_IMPLEMENTED
-- `M809` PARTIAL
+- `M809` DONE
 
 - `M901` DONE
 - `M902` DONE
@@ -2526,7 +2525,7 @@ Status values used:
 
 - `M1001` DONE
 - `M1002` DONE
-- `M1003` PARTIAL
+- `M1003` DONE
 - `M1004` DONE
 - `M1005` DONE
 - `M1006` DONE
