@@ -12,7 +12,7 @@ from data.data_quality_assessor import assess_data_quality
 from execution.capacity_guard import compute_dynamic_capacity_state, load_capacity_hint_state
 from planner.replan_policy import ReplanThresholds, evaluate_replan_materiality
 from planner.start_stability import evaluate_start_stability
-from planner.volatility_policy_adapter import compute_n_level_bounds
+from planner.volatility_policy_adapter import compute_n_level_bounds, compute_volatility_policy_view
 from schemas.plan_signature import compute_plan_hash, validate_signature_fields
 from sim.chaos_profiles import default_chaos_profile, validate_chaos_profile
 
@@ -63,6 +63,36 @@ def test_volatility_adapter_module() -> None:
     assert n_low == 6
     assert n_high < 12
     assert diag["adjustment"] > 0
+
+
+def test_volatility_adapter_runtime_view_fields() -> None:
+    out = compute_volatility_policy_view(
+        active_mode="intraday",
+        adapter_enabled=True,
+        adapter_strength=1.0,
+        atr_pct_15m=0.03,
+        atr_pct_1h=0.04,
+        atr_mode_pct=0.04,
+        atr_mode_max=0.015,
+        bbwp_s=96.0,
+        bbwp_m=94.0,
+        bbwp_l=92.0,
+        squeeze_on_1h=False,
+        hvp_state="expanding",
+        base_n_min=6,
+        base_n_max=12,
+        base_box_width_min_pct=0.035,
+        base_box_width_max_pct=0.060,
+        base_min_step_buffer_bps=0.0,
+        base_cooldown_minutes=90.0,
+        base_min_runtime_minutes=180.0,
+    )
+    assert out["vol_bucket"] == "unstable"
+    adapted = out["adapted"]
+    assert int(adapted["n_max"]) <= 12
+    assert float(adapted["box_width_max_pct"]) >= 0.060
+    assert float(adapted["min_step_buffer_bps"]) > 0.0
+    assert bool(adapted["build_strictness"]["vol_bucket_block_start"]) is True
 
 
 def test_capacity_guard_module(tmp_path: Path) -> None:

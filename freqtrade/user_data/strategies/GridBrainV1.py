@@ -48,7 +48,10 @@ from data.data_quality_assessor import assess_data_quality
 from execution.capacity_guard import load_capacity_hint_state
 from planner.replan_policy import ReplanThresholds, evaluate_replan_materiality
 from planner.start_stability import evaluate_start_stability
-from planner.volatility_policy_adapter import compute_n_level_bounds
+from planner.volatility_policy_adapter import (
+    compute_n_level_bounds,
+    compute_volatility_policy_view,
+)
 from risk.meta_drift_guard import MetaDriftGuard as ExternalMetaDriftGuard
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
@@ -729,6 +732,7 @@ class GridBrainV1Core(IStrategy):
     n_max = 12
     n_volatility_adapter_enabled = True
     n_volatility_adapter_strength = 1.0
+    volatility_min_step_buffer_bps = 0.0
 
     # Empirical cost calibration (Section 13.2).
     empirical_cost_enabled = True
@@ -2639,7 +2643,13 @@ class GridBrainV1Core(IStrategy):
         lo = float(df["low"].rolling(lookback).min().iloc[-1])
         return lo, hi
 
-    def _build_box_15m(self, df: DataFrame) -> Tuple[float, float, float, int, float]:
+    def _build_box_15m(
+        self,
+        df: DataFrame,
+        *,
+        min_width_pct: Optional[float] = None,
+        max_width_pct: Optional[float] = None,
+    ) -> Tuple[float, float, float, int, float]:
         """
         Build 24h H/L box ± pad (0.35*ATR20 15m) and adjust width into [3.5%..6%]
         deterministically by switching lookback.
@@ -2656,21 +2666,26 @@ class GridBrainV1Core(IStrategy):
             width_pct = (hi_p - lo_p) / mid if mid > 0 else 0.0
             return lo_p, hi_p, width_pct
 
+        min_width = float(min_width_pct if min_width_pct is not None else self.min_width_pct)
+        max_width = float(max_width_pct if max_width_pct is not None else self.max_width_pct)
+        if max_width < min_width:
+            max_width = min_width
+
         # Start with 24h
         lo_p, hi_p, w = build_for(self.box_lookback_24h_bars)
         used = self.box_lookback_24h_bars
 
         # If too narrow, expand to 48h
-        if w < self.min_width_pct and len(df) >= self.box_lookback_48h_bars:
+        if w < min_width and len(df) >= self.box_lookback_48h_bars:
             lo_p, hi_p, w = build_for(self.box_lookback_48h_bars)
             used = self.box_lookback_48h_bars
 
         # If too wide, shrink to 18h then 12h
-        if w > self.max_width_pct and len(df) >= self.box_lookback_18h_bars:
+        if w > max_width and len(df) >= self.box_lookback_18h_bars:
             lo_p, hi_p, w = build_for(self.box_lookback_18h_bars)
             used = self.box_lookback_18h_bars
 
-        if w > self.max_width_pct and len(df) >= self.box_lookback_12h_bars:
+        if w > max_width and len(df) >= self.box_lookback_12h_bars:
             lo_p, hi_p, w = build_for(self.box_lookback_12h_bars)
             used = self.box_lookback_12h_bars
 
@@ -4994,8 +5009,67 @@ class GridBrainV1Core(IStrategy):
             elif fr_8h_pct < 0:
                 funding_bias = -1
 
+        volatility_policy = compute_volatility_policy_view(
+            active_mode=str(active_mode),
+            adapter_enabled=bool(self.n_volatility_adapter_enabled),
+            adapter_strength=float(self.n_volatility_adapter_strength),
+            atr_pct_15m=atr_pct_15m,
+            atr_pct_1h=atr_1h_pct,
+            atr_mode_pct=atr_mode_pct,
+            atr_mode_max=float(gate_atr_pct_max),
+            bbwp_s=bbwp_s,
+            bbwp_m=bbwp_m,
+            bbwp_l=bbwp_l,
+            squeeze_on_1h=squeeze_on_1h,
+            hvp_state=None,
+            base_n_min=int(self.n_min),
+            base_n_max=int(self.n_max),
+            base_box_width_min_pct=float(self.min_width_pct),
+            base_box_width_max_pct=float(self.max_width_pct),
+            base_min_step_buffer_bps=float(self.volatility_min_step_buffer_bps),
+            base_cooldown_minutes=float(self.cooldown_minutes),
+            base_min_runtime_minutes=float(self.min_runtime_hours) * 60.0,
+        )
+        volatility_policy_base = dict(volatility_policy.get("base", {}))
+        volatility_policy_adapted = dict(volatility_policy.get("adapted", {}))
+        volatility_policy_n_diag = dict(volatility_policy.get("n_level_diag", {}))
+        vol_bucket = str(volatility_policy.get("vol_bucket", "normal"))
+        box_width_min_effective = float(
+            volatility_policy_adapted.get("box_width_min_pct", self.min_width_pct)
+        )
+        box_width_max_effective = float(
+            volatility_policy_adapted.get("box_width_max_pct", self.max_width_pct)
+        )
+        n_low = int(volatility_policy_adapted.get("n_min", self.n_min))
+        n_high = int(volatility_policy_adapted.get("n_max", self.n_max))
+        min_step_buffer_bps_effective = float(
+            volatility_policy_adapted.get("min_step_buffer_bps", self.volatility_min_step_buffer_bps)
+        )
+        cooldown_minutes_effective = float(
+            volatility_policy_adapted.get("cooldown_minutes", self.cooldown_minutes)
+        )
+        min_runtime_minutes_effective = float(
+            volatility_policy_adapted.get("min_runtime_minutes", float(self.min_runtime_hours) * 60.0)
+        )
+        volatility_strictness = dict(volatility_policy_adapted.get("build_strictness", {}))
+        volatility_enforce_squeeze_gate = bool(volatility_strictness.get("enforce_squeeze_gate", False))
+        volatility_bucket_block_start = bool(volatility_strictness.get("vol_bucket_block_start", False))
+        volatility_gate_ratio_delta = float(volatility_policy_adapted.get("start_gate_ratio_delta", 0.0))
+        gate_start_min_pass_ratio_effective = float(
+            np.clip(float(gate_start_min_pass_ratio) + float(volatility_gate_ratio_delta), 0.0, 1.0)
+        )
+        volatility_strictness_ok = bool(
+            (not volatility_enforce_squeeze_gate or bool(squeeze_on_1h))
+            and (not volatility_bucket_block_start)
+        )
+        volatility_strictness_blocked = bool(not volatility_strictness_ok)
+
         # ---- Build box on 15m ----
-        lo_p, hi_p, width_pct, used_lb, pad = self._build_box_15m(dataframe)
+        lo_p, hi_p, width_pct, used_lb, pad = self._build_box_15m(
+            dataframe,
+            min_width_pct=box_width_min_effective,
+            max_width_pct=box_width_max_effective,
+        )
         overlap_pruned = self._box_overlap_prune(pair, lo_p, hi_p)
 
         # VRVP POC/VAH/VAL + deterministic box shift toward POC.
@@ -5207,9 +5281,25 @@ class GridBrainV1Core(IStrategy):
 
         # ---- Grid sizing (cost-aware + empirical floor) ----
         cost_floor = self._effective_cost_floor(pair, last, close)
-        min_step_pct_required = float(cost_floor.get("chosen_floor_pct", 0.0) or 0.0)
+        min_step_pct_required_base = float(cost_floor.get("chosen_floor_pct", 0.0) or 0.0)
+        min_step_pct_required = float(min_step_pct_required_base)
         static_gross_min = float(cost_floor.get("static_floor_pct", 0.0) or 0.0)
-        n_low, n_high, n_bounds_diag = self._n_level_bounds(active_mode, atr_mode_pct, gate_atr_pct_max)
+        min_step_pct_required += float(min_step_buffer_bps_effective) / 10_000.0
+        n_bounds_diag = {
+            "mode": str(active_mode),
+            "adapter_enabled": bool(self.n_volatility_adapter_enabled),
+            "vol_bucket": str(vol_bucket),
+            "base_n_min": int(volatility_policy_base.get("n_min", self.n_min)),
+            "base_n_max": int(volatility_policy_base.get("n_max", self.n_max)),
+            "adapted_n_min": int(n_low),
+            "adapted_n_max": int(n_high),
+            "chosen_floor_base_pct": float(min_step_pct_required_base),
+            "min_step_buffer_bps": float(min_step_buffer_bps_effective),
+            "min_step_pct_required": float(min_step_pct_required),
+            "box_width_min_pct": float(box_width_min_effective),
+            "box_width_max_pct": float(box_width_max_effective),
+        }
+        n_bounds_diag.update(volatility_policy_n_diag)
         sizing = self._grid_sizing(
             lo_p,
             hi_p,
@@ -6005,6 +6095,7 @@ class GridBrainV1Core(IStrategy):
             ("meta_drift_soft_block_ok", bool(not meta_drift_soft_block)),
             ("funding_gate_ok", bool(funding_gate_ok)),
             ("hvp_gate_ok", bool(hvp_gate_ok)),
+            ("volatility_policy_ok", bool(volatility_strictness_ok)),
         ]
         rule_range_ok = bool(all(ok for _, ok in gate_checks))
         gate_pass_count = int(sum(1 for _, ok in gate_checks if ok))
@@ -6026,7 +6117,7 @@ class GridBrainV1Core(IStrategy):
             "poc_acceptance_ok",
         }
         core_gates_ok = bool(all(ok for name, ok in gate_checks if name in core_gate_names))
-        gate_ratio_ok = bool(gate_pass_ratio >= gate_start_min_pass_ratio)
+        gate_ratio_ok = bool(gate_pass_ratio >= gate_start_min_pass_ratio_effective)
         start_stability = self._start_stability_state(
             gate_checks,
             self.start_stability_min_score,
@@ -6069,9 +6160,11 @@ class GridBrainV1Core(IStrategy):
 
         # ---- Reclaim / cooldown / min-runtime handling ----
         clock_ts = candle_ts if candle_ts is not None else int(router_clock_ts)
-        min_runtime_base_secs = int(max(float(self.min_runtime_hours), 0.0) * 3600.0)
+        min_runtime_base_secs_raw = int(max(float(self.min_runtime_hours), 0.0) * 3600.0)
         reclaim_secs = int(max(float(self.reclaim_hours), 0.0) * 3600.0)
-        cooldown_base_secs = int(max(float(self.cooldown_minutes), 0.0) * 60.0)
+        cooldown_base_secs_raw = int(max(float(self.cooldown_minutes), 0.0) * 60.0)
+        min_runtime_base_secs = int(max(float(min_runtime_minutes_effective), 0.0) * 60.0)
+        cooldown_base_secs = int(max(float(cooldown_minutes_effective), 0.0) * 60.0)
         neutral_min_runtime_offset_secs = int(round(float(self.neutral_min_runtime_hours_offset) * 3600.0))
         neutral_cooldown_multiplier = max(float(self.neutral_cooldown_multiplier), 1.0)
         min_runtime_secs = min_runtime_base_secs
@@ -6117,7 +6210,7 @@ class GridBrainV1Core(IStrategy):
             stop_rule = False
             min_runtime_blocked_stop = True
 
-        if gate_start_min_pass_ratio >= 0.999:
+        if gate_start_min_pass_ratio_effective >= 0.999:
             start_gate_ok = bool(rule_range_ok)
         else:
             start_gate_ok = bool(core_gates_ok and gate_ratio_ok and phase2_gate_ok)
@@ -6135,6 +6228,7 @@ class GridBrainV1Core(IStrategy):
             and mrvd_proximity_ok
             and bool(step_cost_block_reason is None)
             and bool(capacity_hint_ok)
+            and bool(volatility_strictness_ok)
             and (not box_block_active)
             and bool(poc_acceptance_satisfied)
         )
@@ -6146,13 +6240,15 @@ class GridBrainV1Core(IStrategy):
         if breakout_block_active:
             start_block_reasons.append(str(BlockReason.BLOCK_FRESH_BREAKOUT))
         if not start_gate_ok:
-            if gate_start_min_pass_ratio >= 0.999:
+            if gate_start_min_pass_ratio_effective >= 0.999:
                 start_block_reasons.extend([f"gate_fail:{name}" for name in failed_all_gates])
             else:
                 if not core_gates_ok:
                     start_block_reasons.extend([f"core_gate_fail:{name}" for name in failed_core_gates])
                 if not gate_ratio_ok:
                     start_block_reasons.append("gate_ratio_below_required")
+        if volatility_strictness_blocked:
+            start_block_reasons.append(str(BlockReason.BLOCK_VOL_BUCKET_UNSTABLE))
         if not start_stability_ok:
             start_block_reasons.append(str(BlockReason.BLOCK_START_STABILITY_LOW))
         if step_cost_block_reason is not None:
@@ -6263,6 +6359,7 @@ class GridBrainV1Core(IStrategy):
             "reclaim_ok": bool(not reclaim_active),
             "capacity_hint_ok": bool(capacity_hint_ok),
             "cost_step_ok": bool(step_cost_block_reason is None),
+            "volatility_policy_ok": bool(volatility_strictness_ok),
         }
 
         plan = {
@@ -6464,7 +6561,9 @@ class GridBrainV1Core(IStrategy):
                 "cost_floor": {
                     "source": str(cost_floor.get("source", "static")),
                     "static_floor_pct": float(static_gross_min),
+                    "chosen_floor_base_pct": float(min_step_pct_required_base),
                     "chosen_floor_pct": float(min_step_pct_required),
+                    "min_step_buffer_bps": float(min_step_buffer_bps_effective),
                     "empirical": cost_floor.get("empirical_snapshot", {}),
                     "empirical_sample": cost_floor.get("empirical_sample", {}),
                 },
@@ -6570,6 +6669,16 @@ class GridBrainV1Core(IStrategy):
                 "atr_mode_pct": atr_mode_pct,
                 "atr_mode_max": float(gate_atr_pct_max),
                 "atr_ok": bool(atr_ok),
+                "vol_bucket": str(vol_bucket),
+                "volatility_adapter_enabled": bool(self.n_volatility_adapter_enabled),
+                "volatility_n_min": int(n_low),
+                "volatility_n_max": int(n_high),
+                "volatility_box_width_min_pct": float(box_width_min_effective),
+                "volatility_box_width_max_pct": float(box_width_max_effective),
+                "volatility_min_step_buffer_bps": float(min_step_buffer_bps_effective),
+                "volatility_cooldown_minutes": float(cooldown_minutes_effective),
+                "volatility_min_runtime_minutes": float(min_runtime_minutes_effective),
+                "volatility_strictness_ok": bool(volatility_strictness_ok),
                 "vol_ratio_1h": vol_ratio,
                 "vol_ratio_ok_1h": bool(vol_1h_ok),
                 "rvol_15m": rvol_15m,
@@ -6693,8 +6802,13 @@ class GridBrainV1Core(IStrategy):
                 "gate_pass_count": int(gate_pass_count),
                 "gate_total_count": int(gate_total_count),
                 "gate_pass_ratio": float(gate_pass_ratio),
-                "gate_required_ratio": float(gate_start_min_pass_ratio),
+                "gate_required_ratio": float(gate_start_min_pass_ratio_effective),
+                "gate_required_ratio_base": float(gate_start_min_pass_ratio),
+                "volatility_policy_gate_ratio_delta": float(volatility_gate_ratio_delta),
                 "gate_ratio_ok": bool(gate_ratio_ok),
+                "vol_bucket": str(vol_bucket),
+                "volatility_policy": dict(volatility_policy),
+                "volatility_strictness_ok": bool(volatility_strictness_ok),
                 "start_stability_score": float(start_stability.get("score", 0.0)),
                 "start_stability_passed": int(start_stability.get("passed", 0)),
                 "start_stability_total": int(start_stability.get("total", 0)),
@@ -6808,7 +6922,12 @@ class GridBrainV1Core(IStrategy):
                     "profile": gate_profile,
                     "regime_threshold_profile": str(self._active_threshold_profile()),
                     "active_mode": str(active_mode),
-                    "start_min_gate_pass_ratio": float(gate_start_min_pass_ratio),
+                    "start_min_gate_pass_ratio": float(gate_start_min_pass_ratio_effective),
+                    "start_min_gate_pass_ratio_base": float(gate_start_min_pass_ratio),
+                    "vol_bucket": str(vol_bucket),
+                    "volatility_policy_gate_ratio_delta": float(volatility_gate_ratio_delta),
+                    "volatility_strictness_ok": bool(volatility_strictness_ok),
+                    "volatility_strictness": dict(volatility_strictness),
                     "adx_4h_max": float(gate_adx_4h_max),
                     "adx_4h_exit_min": float(gate_adx_4h_exit_min),
                     "adx_4h_exit_max": float(gate_adx_4h_exit_max),
@@ -6874,6 +6993,14 @@ class GridBrainV1Core(IStrategy):
                     "start_box_position_max_frac": float(self.start_box_position_max_frac),
                     "basis_cross_confirm_enabled": bool(self.basis_cross_confirm_enabled),
                     "capacity_hint_hard_block": bool(self.capacity_hint_hard_block),
+                },
+                "volatility_policy": {
+                    "enabled": bool(self.n_volatility_adapter_enabled),
+                    "strength": float(self.n_volatility_adapter_strength),
+                    "vol_bucket": str(vol_bucket),
+                    "inputs": dict(volatility_policy.get("inputs", {})),
+                    "base": dict(volatility_policy_base),
+                    "adapted": dict(volatility_policy_adapted),
                 },
                 "regime_router": {
                     "enabled": bool(self.regime_router_enabled),
@@ -6963,15 +7090,20 @@ class GridBrainV1Core(IStrategy):
                 },
                 "runtime_controls": {
                     "reclaim_hours": float(self.reclaim_hours),
-                    "cooldown_minutes": int(self.cooldown_minutes),
-                    "min_runtime_hours": float(self.min_runtime_hours),
+                    "cooldown_minutes": float(cooldown_minutes_effective),
+                    "cooldown_minutes_base": float(self.cooldown_minutes),
+                    "min_runtime_hours": float(min_runtime_minutes_effective / 60.0),
+                    "min_runtime_hours_base": float(self.min_runtime_hours),
+                    "min_runtime_minutes": float(min_runtime_minutes_effective),
                     "min_runtime_secs": int(min_runtime_secs),
                     "breakout_idle_reclaim_on_fresh": bool(self.breakout_idle_reclaim_on_fresh),
                 },
                 "cost_model": {
                     "target_net_step_pct": float(cost_floor.get("target_net_step_pct", self.target_net_step_pct)),
                     "static_floor_pct": float(static_gross_min),
+                    "chosen_floor_base_pct": float(min_step_pct_required_base),
                     "chosen_floor_pct": float(min_step_pct_required),
+                    "min_step_buffer_bps": float(min_step_buffer_bps_effective),
                     "source": str(cost_floor.get("source", "static")),
                     "empirical_enabled": bool(self.empirical_cost_enabled),
                     "empirical_window": int(self.empirical_cost_window),
@@ -7027,6 +7159,8 @@ class GridBrainV1Core(IStrategy):
                 "meta_drift_hard_stop": bool(meta_drift_hard_stop),
                 "meta_drift_cooldown_extended": bool(meta_drift_cooldown_extended),
                 "warning_codes": warning_codes,
+                "vol_bucket": str(vol_bucket),
+                "volatility_policy": dict(volatility_policy),
                 "stop_reason_flags_raw_active": [str(x) for x in stop_reason_flags_raw_active],
                 "stop_reason_flags_applied_active": [str(x) for x in stop_reason_flags_applied_active],
                 "neutral_runtime": {
@@ -7034,9 +7168,11 @@ class GridBrainV1Core(IStrategy):
                     "exit_persist_bars": int(neutral_exit_persist),
                     "cooldown_multiplier": float(neutral_cooldown_multiplier),
                     "min_runtime_offset_secs": int(neutral_min_runtime_offset_secs),
-                    "cooldown_secs_base": int(cooldown_base_secs),
+                    "cooldown_secs_base": int(cooldown_base_secs_raw),
+                    "cooldown_secs_adapted": int(cooldown_base_secs),
                     "cooldown_secs_effective": int(cooldown_secs),
-                    "min_runtime_secs_base": int(min_runtime_base_secs),
+                    "min_runtime_secs_base": int(min_runtime_base_secs_raw),
+                    "min_runtime_secs_adapted": int(min_runtime_base_secs),
                     "min_runtime_secs_effective": int(min_runtime_secs),
                 },
             },
@@ -7183,6 +7319,11 @@ class GridBrainV1Core(IStrategy):
             "router_target_mode": router_state.get("target_mode"),
             "router_desired_mode": router_state.get("desired_mode"),
             "capacity_hint": dict(capacity_hint),
+            "vol_bucket": str(vol_bucket),
+            "volatility_policy": {
+                "base": dict(volatility_policy_base),
+                "adapted": dict(volatility_policy_adapted),
+            },
         }
         plan["start_stability_score"] = float(start_stability.get("score", 0.0))
         plan["meta_drift_state"] = {
@@ -7197,7 +7338,9 @@ class GridBrainV1Core(IStrategy):
             "source": str(cost_floor.get("source", "static")),
             "target_net_step_pct": float(cost_floor.get("target_net_step_pct", self.target_net_step_pct)),
             "static_floor_pct": float(static_gross_min),
+            "chosen_floor_base_pct": float(min_step_pct_required_base),
             "chosen_floor_pct": float(min_step_pct_required),
+            "min_step_buffer_bps": float(min_step_buffer_bps_effective),
             "step_pct_actual": float(step_pct_actual),
             "empirical_snapshot": cost_floor.get("empirical_snapshot", {}),
             "empirical_sample": cost_floor.get("empirical_sample", {}),
@@ -7207,6 +7350,12 @@ class GridBrainV1Core(IStrategy):
             "start_stability": {"ok": bool(start_stability_ok)},
             "planner_health": {"state": str(planner_health_state)},
             "meta_drift_guard": {"enabled": bool(self.meta_drift_guard_enabled)},
+            "volatility_policy_adapter": {
+                "enabled": bool(self.n_volatility_adapter_enabled),
+                "vol_bucket": str(vol_bucket),
+                "base": dict(volatility_policy_base),
+                "adapted": dict(volatility_policy_adapted),
+            },
             "poc_acceptance_gate": {"enabled": bool(self.poc_acceptance_enabled)},
             "fill_detection": {
                 "mode": str(self.fill_confirmation_mode),

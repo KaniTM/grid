@@ -2210,7 +2210,7 @@ Status values used:
 - `Section 6) Planner Decision Loop` -> `DONE`
 - `Section 7) Replan Policy + Materiality` -> `DONE`
 - `Section 8) Global Start Stability Score` -> `DONE`
-- `Section 9) Volatility Policy Adapter` -> `PARTIAL`
+- `Section 9) Volatility Policy Adapter` -> `DONE`
 - `Section 10) Meta Drift Guard` -> `DONE`
 - `Section 11) Phase-2 Regime Filters and Build Gates` -> `PARTIAL` (core set done; boom/doom still missing)
 - `Section 12) Phase-3 Box Builder` -> `PARTIAL` (core done; specific sub-policies still missing)
@@ -2247,7 +2247,7 @@ Status values used:
 
 ### 26.1.3 Module registry items that are DONE (complete list)
 
-- `M001`, `M002`, `M003`, `M004`, `M005`, `M009`, `M010`
+- `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
 - `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
 - `M301`, `M302`, `M303`, `M304`, `M305`
@@ -2353,12 +2353,16 @@ Status values used:
     - Added `run_stress_replay_validation(...)` to `freqtrade/user_data/scripts/user_regression_suite.py` and wired it into default regression checks.
     - Standard behavior validation now requires chaos replay summaries, chaos counters, and deterministic-vs-chaos delta metrics.
     - Added dedicated coverage in `freqtrade/user_data/tests/test_stress_replay_standard_validation.py`.
+12. [DONE 2026-02-26] Complete M006 volatility policy adapter deterministic runtime adaptation.
+    - Added deterministic volatility bucketing (`calm|normal|elevated|unstable`) and bounded runtime adaptation in `planner/volatility_policy_adapter.py`.
+    - Adapter now drives runtime-view adjustments for box width band, `n_min/n_max`, min-step buffer bps, cooldown minutes, min-runtime minutes, and strictness flags.
+    - Planner now logs base vs adapted thresholds and `vol_bucket` under plan diagnostics/update policy/module state, and enforces strictness via `BLOCK_VOL_BUCKET_UNSTABLE` when required.
+    - Added coverage in `freqtrade/tests/scripts/test_section21_modules.py` and validated integration in `freqtrade/user_data/tests/test_phase3_validation.py`.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M006` Volatility policy adapter
 - `M007` Empirical execution cost calibration loop
 - `M008` Stress/chaos replay harness
 - `M205` Minimum range length + breakout confirm bars
@@ -2406,7 +2410,7 @@ Status values used:
 - `M003` DONE
 - `M004` DONE
 - `M005` DONE
-- `M006` PARTIAL
+- `M006` DONE
 - `M007` PARTIAL
 - `M008` PARTIAL
 - `M009` DONE
