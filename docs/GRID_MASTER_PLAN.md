@@ -2302,7 +2302,7 @@ Status values used:
 
 ### P1 (high) - missing/partial architecture modules from lines 1-2185
 
-4. Create missing target module files listed in Section 21.3:
+4. [DONE 2026-02-26] Create missing target module files listed in Section 21.3:
    - `planner/replan_policy.py`
    - `planner/start_stability.py`
    - `planner/volatility_policy_adapter.py`

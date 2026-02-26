@@ -25,6 +25,15 @@ from technical import qtpylib
 from core.enums import BlockReason, MaterialityClass, StopReason, WarningCode
 from core.plan_signature import PLAN_SCHEMA_VERSION, PLANNER_VERSION_DEFAULT, compute_plan_hash
 from core.schema_validation import validate_schema
+from analytics.execution_cost_calibrator import (
+    EmpiricalCostCalibrator as ExternalEmpiricalCostCalibrator,
+)
+from data.data_quality_assessor import assess_data_quality
+from execution.capacity_guard import load_capacity_hint_state
+from planner.replan_policy import ReplanThresholds, evaluate_replan_materiality
+from planner.start_stability import evaluate_start_stability
+from planner.volatility_policy_adapter import compute_n_level_bounds
+from risk.meta_drift_guard import MetaDriftGuard as ExternalMetaDriftGuard
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
 REQUIRED_OHLC_COLUMNS = ("date", "open", "high", "low", "close", "volume")
@@ -465,8 +474,10 @@ class GridBrainV1Core(IStrategy):
         self._runtime_snapshot = GridBrainRuntimeSnapshot.from_strategy(
             self, self._lookback_summary
         )
-        self._empirical_cost_calibrator = EmpiricalCostCalibrator(self.empirical_cost_window)
-        self._meta_drift_guard = MetaDriftGuard(
+        self._empirical_cost_calibrator = ExternalEmpiricalCostCalibrator(
+            self.empirical_cost_window
+        )
+        self._meta_drift_guard = ExternalMetaDriftGuard(
             self.meta_drift_guard_window,
             self.meta_drift_guard_smoothing_alpha,
         )
@@ -1185,51 +1196,14 @@ class GridBrainV1Core(IStrategy):
             reasons.append(reason)
 
     def _run_data_quality_checks(self, dataframe: DataFrame, pair: str) -> Dict[str, object]:
-        reasons: List[BlockReason] = []
-        details: Dict[str, object] = {}
-        ok = True
-        ts = pd.to_datetime(dataframe["date"], utc=True, errors="coerce")
-        details["last_timestamp"] = ts.iloc[-1].isoformat() if len(ts) and pd.notna(ts.iloc[-1]) else None
-        if ts.isnull().any():
-            ok = False
-            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
-        if ts.duplicated().any():
-            ok = False
-            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
-        if not ts.is_monotonic_increasing:
-            ok = False
-            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
-        if len(ts) >= 2:
-            diffs = ts.diff().dt.total_seconds().iloc[1:]
-            threshold = float(self.data_quality_expected_candle_seconds) * float(self.data_quality_gap_multiplier)
-            if (diffs > threshold).any():
-                ok = False
-                self._append_reason(reasons, BlockReason.BLOCK_DATA_GAP)
-                details["gap_detected_secs"] = float(max(diffs))
-        if len(ts) >= 1 and pd.notna(ts.iloc[-1]):
-            now_ts = datetime.now(timezone.utc)
-            stale_secs = (now_ts - ts.iloc[-1]).total_seconds()
-            details["stale_secs"] = float(stale_secs)
-            if stale_secs >= float(self.data_quality_max_stale_minutes) * 60.0:
-                ok = False
-                self._append_reason(reasons, BlockReason.BLOCK_DATA_GAP)
-        zero_check = int(max(0, self.data_quality_zero_volume_streak_bars))
-        if zero_check > 0 and len(dataframe) >= zero_check:
-            tail_vol = pd.to_numeric(dataframe["volume"].iloc[-zero_check:], errors="coerce").fillna(0.0)
-            if tail_vol.eq(0.0).all():
-                ok = False
-                self._append_reason(reasons, BlockReason.BLOCK_ZERO_VOL_ANOMALY)
-        last = dataframe.iloc[-1]
-        bb_mid_1h = self._safe_float(last.get("bb_mid_1h"))
-        bb_mid_4h = self._safe_float(last.get("bb_mid_4h"))
-        if bb_mid_1h is None or bb_mid_4h is None:
-            ok = False
-            self._append_reason(reasons, BlockReason.BLOCK_DATA_MISALIGN)
-        data_quality_entry = {
-            "ok": bool(ok),
-            "reasons": reasons,
-            "details": details,
-        }
+        data_quality_entry = assess_data_quality(
+            dataframe,
+            expected_candle_seconds=float(self.data_quality_expected_candle_seconds),
+            gap_multiplier=float(self.data_quality_gap_multiplier),
+            max_stale_minutes=float(self.data_quality_max_stale_minutes),
+            zero_volume_streak_bars=int(self.data_quality_zero_volume_streak_bars),
+            required_columns=("bb_mid_1h", "bb_mid_4h"),
+        )
         self._data_quality_issues_by_pair[pair] = data_quality_entry
         return data_quality_entry
 
@@ -1397,21 +1371,7 @@ class GridBrainV1Core(IStrategy):
         min_score: float,
         k_fraction: float,
     ) -> Dict[str, float]:
-        total = max(int(len(gate_checks)), 1)
-        passed = int(sum(1 for _, ok in gate_checks if ok))
-        score = float(passed / total)
-        frac = float(np.clip(k_fraction, 0.0, 1.0))
-        k_required = int(math.ceil(total * frac))
-        min_required = float(np.clip(min_score, 0.0, 1.0))
-        ok = bool(score >= min_required and passed >= k_required)
-        return {
-            "score": score,
-            "passed": passed,
-            "total": total,
-            "k_required": k_required,
-            "min_score": min_required,
-            "ok": ok,
-        }
+        return evaluate_start_stability(gate_checks, min_score, k_fraction)
 
     def _atomic_write_json(self, path: str, payload: Dict[str, object]) -> None:
         write_json_atomic(path, payload)
@@ -1427,63 +1387,33 @@ class GridBrainV1Core(IStrategy):
         hard_stop: bool,
         action: str,
     ) -> Dict[str, object]:
-        entry: Dict[str, object] = {}
         prev_mid = self._last_mid_by_pair.get(pair)
         prev_width = self._last_width_pct_by_pair.get(pair)
-        prev_step = self._last_box_step_by_pair.get(pair)
         prev_tp = self._last_tp_price_by_pair.get(pair)
         prev_sl = self._last_sl_price_by_pair.get(pair)
         epoch_count = int(self._materiality_epoch_bar_count_by_pair.get(pair, 0) + 1)
-        entry["epoch_counter"] = epoch_count
-        allow_epoch = epoch_count >= max(1, int(self.materiality_epoch_bars))
-        delta_mid_steps = 0.0
-        delta_width_pct = 0.0
-        delta_tp_steps = 0.0
-        delta_sl_steps = 0.0
-        if prev_mid is not None and step_price > 0:
-            delta_mid_steps = abs(mid - prev_mid) / step_price
-        if prev_width is not None:
-            delta_width_pct = abs(width_pct - prev_width)
-        if prev_tp is not None and step_price > 0:
-            delta_tp_steps = abs(tp_price - prev_tp) / step_price
-        if prev_sl is not None and step_price > 0:
-            delta_sl_steps = abs(sl_price - prev_sl) / step_price
-        entry["delta_mid_steps"] = float(delta_mid_steps)
-        entry["delta_width_pct"] = float(delta_width_pct)
-        entry["delta_tp_steps"] = float(delta_tp_steps)
-        entry["delta_sl_steps"] = float(delta_sl_steps)
-        material_delta = bool(
-            delta_mid_steps >= float(self.materiality_box_mid_shift_max_step_frac)
-            or delta_width_pct >= float(self.materiality_box_width_change_pct)
-            or delta_tp_steps >= float(self.materiality_tp_shift_max_step_frac)
-            or delta_sl_steps >= float(self.materiality_sl_shift_max_step_frac)
+        entry = evaluate_replan_materiality(
+            prev_mid=prev_mid,
+            prev_width_pct=prev_width,
+            prev_tp=prev_tp,
+            prev_sl=prev_sl,
+            epoch_counter=epoch_count,
+            thresholds=ReplanThresholds(
+                epoch_bars=int(self.materiality_epoch_bars),
+                box_mid_shift_max_step_frac=float(self.materiality_box_mid_shift_max_step_frac),
+                box_width_change_pct=float(self.materiality_box_width_change_pct),
+                tp_shift_max_step_frac=float(self.materiality_tp_shift_max_step_frac),
+                sl_shift_max_step_frac=float(self.materiality_sl_shift_max_step_frac),
+            ),
+            mid=float(mid),
+            width_pct=float(width_pct),
+            step_price=float(step_price),
+            tp_price=float(tp_price),
+            sl_price=float(sl_price),
+            hard_stop=bool(hard_stop),
+            action=str(action),
         )
-        reasons: List[str] = []
-        mat_class = MaterialityClass.NOOP
-        publish = False
-        if hard_stop or action == "STOP":
-            mat_class = MaterialityClass.HARDSTOP
-            reasons.append("REPLAN_HARD_STOP_OVERRIDE")
-            publish = True
-        elif material_delta:
-            mat_class = MaterialityClass.MATERIAL
-            reasons.append("REPLAN_MATERIAL_BOX_CHANGE")
-            publish = True
-        elif allow_epoch or prev_mid is None:
-            mat_class = MaterialityClass.SOFT
-            reasons.append("REPLAN_NOOP_MINOR_DELTA")
-            publish = True
-        else:
-            mat_class = MaterialityClass.NOOP
-            reasons.append("REPLAN_NOOP_MINOR_DELTA")
-            publish = False
-        entry["class"] = mat_class
-        entry["reasons"] = reasons
-        entry["publish"] = publish
-        if publish:
-            self._materiality_epoch_bar_count_by_pair[pair] = 0
-        else:
-            self._materiality_epoch_bar_count_by_pair[pair] = epoch_count
+        self._materiality_epoch_bar_count_by_pair[pair] = int(entry.pop("next_epoch_counter"))
         return entry
     def _validate_feature_contract(self, dataframe: DataFrame, pair: str) -> bool:
         if len(dataframe) < self.startup_candle_count:
@@ -3859,35 +3789,11 @@ class GridBrainV1Core(IStrategy):
         return out
 
     def _capacity_hint_state(self, pair: str) -> Dict[str, object]:
-        out = {
-            "available": False,
-            "allow_start": True,
-            "reason": None,
-            "preferred_rung_cap": None,
-            "max_concurrent_rebuilds": None,
-            "advisory_only": bool(not self.capacity_hint_hard_block),
-        }
-        path = str(self.capacity_hint_path or "").strip()
-        if not path:
-            return out
-        p = Path(path).expanduser()
-        if not p.is_file():
-            return out
-        try:
-            with p.open("r", encoding="utf-8") as f:
-                payload = json.load(f)
-            raw = payload.get(pair) if isinstance(payload, dict) and pair in payload else payload
-            if not isinstance(raw, dict):
-                return out
-            out["available"] = True
-            out["allow_start"] = bool(raw.get("allow_start", True))
-            out["reason"] = raw.get("reason")
-            out["preferred_rung_cap"] = raw.get("preferred_rung_cap")
-            out["max_concurrent_rebuilds"] = raw.get("max_concurrent_rebuilds")
-            out["advisory_only"] = bool(raw.get("advisory_only", not self.capacity_hint_hard_block))
-            return out
-        except Exception:
-            return out
+        return load_capacity_hint_state(
+            pair,
+            capacity_hint_path=str(self.capacity_hint_path or ""),
+            capacity_hint_hard_block=bool(self.capacity_hint_hard_block),
+        )
 
     def _empirical_cost_sample(
         self,
@@ -3997,7 +3903,7 @@ class GridBrainV1Core(IStrategy):
             or int(getattr(self._meta_drift_guard, "_window", 0)) != max(int(self.meta_drift_guard_window), 8)
             or abs(float(getattr(self._meta_drift_guard, "_alpha", 0.0)) - float(np.clip(self.meta_drift_guard_smoothing_alpha, 0.01, 1.0))) > 1e-12
         ):
-            self._meta_drift_guard = MetaDriftGuard(
+            self._meta_drift_guard = ExternalMetaDriftGuard(
                 self.meta_drift_guard_window,
                 self.meta_drift_guard_smoothing_alpha,
             )
@@ -4072,7 +3978,9 @@ class GridBrainV1Core(IStrategy):
 
         if self.empirical_cost_enabled:
             if not hasattr(self, "_empirical_cost_calibrator") or self._empirical_cost_calibrator is None:
-                self._empirical_cost_calibrator = EmpiricalCostCalibrator(self.empirical_cost_window)
+                self._empirical_cost_calibrator = ExternalEmpiricalCostCalibrator(
+                    self.empirical_cost_window
+                )
             empirical_sample = self._empirical_cost_sample(pair, last_row, close)
             observed = self._empirical_cost_calibrator.observe(
                 pair,
@@ -4128,26 +4036,15 @@ class GridBrainV1Core(IStrategy):
         atr_mode_pct: Optional[float],
         atr_mode_max: float,
     ) -> Tuple[int, int, Dict[str, object]]:
-        n_low = max(int(self.n_min), 1)
-        n_high = max(int(self.n_max), n_low)
-        diag = {
-            "mode": str(active_mode),
-            "adapter_enabled": bool(self.n_volatility_adapter_enabled),
-            "volatility_ratio": None,
-            "adjustment": 0,
-        }
-        if not self.n_volatility_adapter_enabled:
-            return n_low, n_high, diag
-        if atr_mode_pct is None or atr_mode_max <= 0:
-            return n_low, n_high, diag
-
-        ratio = float(max(atr_mode_pct, 0.0) / atr_mode_max)
-        adjustment = int(np.floor(max(ratio - 1.0, 0.0) * float(self.n_volatility_adapter_strength) * 2.0))
-        if adjustment > 0:
-            n_high = max(n_low, n_high - adjustment)
-        diag["volatility_ratio"] = float(ratio)
-        diag["adjustment"] = int(adjustment)
-        return n_low, n_high, diag
+        return compute_n_level_bounds(
+            n_min=int(self.n_min),
+            n_max=int(self.n_max),
+            active_mode=str(active_mode),
+            adapter_enabled=bool(self.n_volatility_adapter_enabled),
+            atr_mode_pct=atr_mode_pct,
+            atr_mode_max=float(atr_mode_max),
+            adapter_strength=float(self.n_volatility_adapter_strength),
+        )
 
     def _grid_sizing(
         self,
