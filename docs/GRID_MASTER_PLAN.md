@@ -2184,593 +2184,175 @@ This is the intended path to a system that is not only feature-rich, but **stabl
 
 ---
 
-# 26) Implementation Status
+# 26) Comprehensive DONE / TODO Audit (code-verified)
+
+Audit date: **2026-02-26**  
+Scope: this section reconciles `docs/GRID_MASTER_PLAN.md` against actual repository code/tests/scripts.
+
+---
 
 ## 26.1 DONE
 
-## 2.1 Brain / Planner (`GridBrainV1`)
+### 26.1.1 End-to-end milestones completed
 
-### Responsibility
-Compute and publish the **current desired grid plan** for a pair.
+- Deterministic planner core, simulator, and paper executor are implemented and wired.
+- Step 12 (live execution hardening) is implemented (maker-first retries/backoff, reject-burst handling, confirm hooks, reconcile controls, recovery rails).
+- Step 13 (formal tuning protocol) is implemented (manifest/champion registry/walk-forward+ablation automation/OOS+chaos gates).
+- Step 14 (ML confidence overlay, non-primary) is implemented (leakage-safe labels, ML walk-forward eval, confidence-only integration, det-vs-ML OOS compare).
+- Step 6 Meta Drift Guard is implemented including dedicated synthetic replay validation.
+- Test stack is active; `freqtrade/user_data/tests` passes both standard and xdist mode.
 
-### Inputs
-- OHLCV data (15m + informative TFs)
-- Deterministic features
-- Optional structure/volume modules (VP/FVG/OB/etc.)
-- Runtime state (cooldown, reclaim, health)
-- Optional empirical cost calibration snapshot
-- Optional ML confidence (later)
+### 26.1.2 Module registry items implemented (complete list)
 
-### Output
-`grid_plan.latest.json` (atomic write, idempotent plan signature fields included)
+- **18.A Core/ Governance:** `M001`, `M003`, `M004`, `M005`, `M007`
+- **18.B Regime / Build gates:** `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
+- **18.C Box builder:** `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
+- **18.D Grid / targets / risk:** `M301`, `M302`, `M303`, `M304`, `M305`
+- **18.E Monitoring/runtime:** `M401`, `M402`, `M403`, `M405`
+- **18.F VP / VAP family:** `M501`, `M503`, `M504`
+- **18.G FVG stack:** `M602`, `M603`, `M604`, `M605`, `M607`
+- **18.H Channels:** `M701`
+- **18.I MRVD / basis / VWAP:** `M802`, `M803`, `M804`, `M806`
+- **18.J CVD family:** `M901`, `M902`
+- **18.K Execution/Ops:** `M1001`, `M1002`, `M1007`, `M1008`
 
-### Non-responsibilities
-- No live order placement
-- No exchange-side reconciliation
-- No direct position/order management (executor owns that)
+### 26.1.3 Section-21 file checklist implemented
 
-## 2.2 Simulator / Replay Harness
-
-### Responsibility
-Replay historical candles and simulate:
-- Brain decisions
-- fills
-- STOP/REBUILD logic
-- cost assumptions
-- replan/materiality behavior
-- stress/chaos perturbations (later)
-
-### Output Artifacts
-- summary JSON
-- fills CSV/parquet
-- equity curve
-- decision logs
-- event logs
-- reason-code distributions
-- churn/false-start stats
-- deterministic vs chaos comparison
-
-## 2.3 Executor (Paper first, Live later)
-
-### Responsibility
-Read Brain plan and maintain a ladder consistent with the **latest accepted plan**.
-
-### Features (planned)
-- maker-first placement
-- post-only retry/backoff
-- tick-aware rounding
-- diff-based reconcile (later)
-- plan idempotency / stale plan rejection
-- execution safety hooks (spread/depth/jump)
-
-### Modes
-- `paper`
-- `live` (later, after safety hardening)
-- `replay-paper` (paper engine consuming historical replay + chaos profile)
-
-## 2.4 ML / FreqAI Overlay (Later)
-
-### Responsibility
-Provide soft signals / confidence scores (not primary action decisions):
-- `p_range_continuation`
-- `p_breakout_risk`
-- START/REBUILD confidence modifier
-- advisory mode scoring
-
-### Guardrail
-Planner must remain valid and deterministic without ML.
-
-## 2.5 Canonical Reason/Event Codes
-
-Use only canonical reason/event codes from `docs/DECISION_REASON_CODES.md` (and `core/enums.py`). If new logic adds a code, update both.
-- # 3) Global Invariants (Must Never Be Violated)
-
-## 3.1 Determinism / No-Repaint
-
-- No feature used in decisions may depend on future candles.
-- Cached levels (breakout/FVG/OB/POC/etc.) must be **bar-confirmed** and stable.
-- Range/box + VP outputs must be reproducible for same inputs.
-
-## 3.2 Brain / Simulator Consistency
-
-The following must behave the same in Brain and Simulator:
-- START gating
-- STOP triggers
-- REBUILD/reclaim conditions
-- cost-aware step checks
-- TP/SL selection (or at least plan-level outputs)
-- replan/materiality classification
-- cooldown/min-runtime logic
-
-## 3.3 Conservative Priority Rule
-
-When modules disagree, **most conservative action wins**:
-1. `STOP` / hard veto
-2. `PAUSE` / block START
-3. `HOLD`
-4. `SOFT_ADJUST`
-5. `START` / `REBUILD`
-
-Also:
-- data quarantine > normal gates
-- meta drift hard > all non-emergency runtime rails
-- unsafe execution conditions > order placement
-
-## 3.4 Configuration-Driven Thresholds
-
-Thresholds/toggles live in config (JSON/YAML), not hidden in code.
-
-## 3.5 Atomic + Idempotent Brain→Executor Handoff
-
-- Brain writes atomically (tmp + fsync + rename)
-- Executor ignores:
-  - duplicate `plan_id`
-  - stale `decision_seq`
-  - invalid `plan_hash`
-  - schema-invalid plans
-
-## 3.6 Materiality Before Churn
-
-New plan candidate must not imply executor action unless:
-- epoch boundary reached, **or**
-- material delta exceeded, **or**
-- hard safety event present
-
-## 3.7 Observability First
-
-Every decision must be explainable using:
-- reason codes
-- feature snapshot
-- plan diff snapshot
-- source module / event
-
----
-- # 4) Core Data Model
-
-## 4.1 Timeframes
-
-### Required
-- 15m (base build/execution planner timeframe)
-- 1h (range/quietness/regime helpers)
-- 4h (trend/ADX/regime)
-
-### Optional / Later
-- 1D / 1W / 1M (MRVD, higher-TF POCs, basis/pivot modules)
-
-## 4.2 Data Quality Requirements
-
-Checks required before decisions:
-- missing candles
-- duplicate timestamps
-- non-monotonic timestamps
-- stale data age
-- suspicious zero-volume streaks
-- informative TF misalignment
-
----
-- # 6) Planner Decision Loop (High-Level Flow)
-
-At each 15m decision tick:
-
-1. Load/merge data (15m + informative TFs)
-2. Run data quality assessor → `planner_health_state`
-3. Compute core features
-4. Compute optional structure/volume features (enabled modules only)
-5. Build/adapt config view (volatility policy adapter)
-6. Evaluate Phase-2 gates (regime/build eligibility)
-7. Build/validate range box (Phase-3)
-8. Compute grid sizing + cost floor + targets (Phase-4)
-9. Evaluate Phase-5 runtime controls (STOP/REBUILD/cooldown/reclaim)
-10. Compute start stability score
-11. Meta drift guard update/action
-12. Build new plan candidate
-13. Run replan/materiality policy vs previous plan
-14. Publish atomic plan JSON (or no-op/soft adjust)
-15. Log decision + plan diff + events
-
----
-1. # 12) Phase-3: Box Builder (Range Definition & Validation)
-
-This is the core of the grid planner and must remain deterministic and explainable.
+- Implemented from must-have/strongly-recommended lists:
+  - `docs/GRID_MASTER_PLAN.md`
+  - `docs/DECISION_REASON_CODES.md`
+  - `core/enums.py`
+  - `experiments/manifest.yaml`
+  - `experiments/champions.json`
+  - `experiments/metrics_schema.json`
 
 ---
 
-## 12.1 Core Box Builder (Baseline)
-
-### Definition
-- 24h rolling H/L from 15m candles
-- ATR padding:
-  - `pad = 0.35 × ATR(15m,20)`
-- Proposed box:
-  - `box_low = low_24h - pad`
-  - `box_high = high_24h + pad`
-
-### Width Targets (baseline)
-- practical target width around `3.5%–6%`
-- if too narrow → fallback/expand source window
-- if too wide → reduce `N`, widen step, or skip (configurable)
-
-### Required Diagnostics
-- width (abs, %)
-- box mid
-- price position in box
-- pad size
-- source window metadata
-
----
-
-## 12.2 Box Width Adjustment & Veto Policy
-
-### Included controls (preserved)
-- target width band
-- hard/soft width limits
-- channel-width veto (selectable source: BB/ATR/SMA/HL)
-- percent-of-average width veto (e.g. width > 120% rolling avg of accepted widths)
-- minimum range length before eligibility
-- breakout confirmation bars before invalidating candidate
-
-### Optional
-- range-inside-range veto (default OFF due to overlap pruning already present)
-
----
-
-## 12.3 VRVP / Volume Profile (Deterministic, 24h baseline)
-
-### Required outputs
-- `vrvp_poc`
-- `vrvp_vah`
-- `vrvp_val`
-
-### Rules
-- fixed-bin profile
-- fixed window
-- non-repainting
-- deterministic binning
-
-### Box Interaction
-- if POC > 0.5% outside box:
-  - shift box toward POC (bounded, e.g. ≤0.5%), or
-  - reject build
-
-### Additional preserved features
-- MTF POC confluence later (D/W/M)
-- POC-cross acceptance gate before first START
-
----
-
-## 12.4 POC Acceptance Gate (Before First START on New Box)
-
-### Preserved behavior
-Before first `START` on a new box:
-- require one POC cross (open<POC and close>POC OR inverse)
-
-### Variants
-- use VRVP POC
-- or micro-POC (if module enabled)
-- optional alignment rule if both exist and disagree
-
-Reason code:
-- `BLOCK_NO_POC_ACCEPTANCE`
-
----
-
-## 12.5 Generic Straddle Veto Framework (High reuse utility)
-
-### Purpose
-Centralize box-level veto logic against structural levels.
-
-### Utility concept
-`box_straddles_level(box_low, box_high, level, min_distance)`
-
-### Apply to (preserved ideas)
-- cached breakout levels
-- OB edges
-- FVG edges/avgs
-- session FVG avg
-- higher-TF POCs
-- VWAP / Donchian mid (when configured)
-- FVG positioning averages (optional)
-- opposite-side structural levels within `< 1 step`
-
-### Behavior
-- detect violation
-- optionally shift box ≤0.5% toward POC
-- else skip build
-- log exact veto source and level
-
----
-
-## 12.6 Box Quality Enhancements (Preserved)
-
-### Included
-- Log-space quartiles `Q1/Q2/Q3`
-- 1.386 extensions (per side)
-- overlap pruning of mitigated/active ranges (e.g. ≥60% overlap keep newest)
-- box-vs-bands overlap requirements (e.g. ≥60%)
-- envelope overlap soft check with ADX/rVol allowance
-- fallback POC estimator if VRVP unavailable
-- midline bias fallback if VP/POC neutral
-- channel envelope width ratio veto
-
-### Purpose
-Improve range quality, bias, and target placement without changing cost invariants.
-
----
-
-## 12.7 Session/Range Context Integrations (Preserved)
-
-### Included
-- Session high/low events and sweeps
-- Session VWAP / optional daily VWAP as TP candidates
-- Session FVG interactions (separate FVG section)
-- Box inside same-side session FVG → optional pad shrink
-
----
-3. # 13) Phase-4: Grid Sizing, START Filters, Targets, Risk
-
----
-
-## 13.1 Cost-Aware Step Sizing (Core Invariant)
-
-### Preserved baseline
-- net per-step target `T >= 0.40%`
-- gross step floor `G = T + fees + spread (+ penalties later)`
-- majors baseline often around `~0.65%` gross minimum
-
-### Rule
-`actual_step_pct >= min_step_pct_required`
-
-### If violated
-- reduce N (within bounds), or
-- block START/REBUILD
-
-Reason code:
-- `BLOCK_STEP_BELOW_COST`
-
----
-
-## 13.2 Empirical Cost & Fill Calibration Loop (New, High ROI)
-
-### Purpose
-Replace static spread assumptions over time using paper/live execution logs.
-
-### Inputs
-- fills log
-- order lifecycle log (placed/cancelled/repriced)
-- candle/ticker context at fill time
-- optional market state buckets (volatility/time of day)
-
-### Compute
-- realized spread percentiles
-- adverse selection penalty
-- post-only retry/reject rate
-- missed-fill opportunity rate
-- recommended cost floor bps
-
-### Planner integration
-- `cost_model_source = static | empirical`
-- conservative mode uses max(static, empirical p75/p90 or recommended)
-
-Reason codes:
-- `BLOCK_STEP_BELOW_EMPIRICAL_COST`
-- `WARN_COST_MODEL_STALE`
-
----
-
-## 13.3 N Levels Selection Policy
-
-### Core policy
-1. derive candidate `N` from box width and target step
-2. clamp by mode bounds
-3. validate against cost floor
-4. optionally adjust by volatility policy adapter
-5. record diagnostics
-
-### Preserved bounds
-- typical working range: `N in [6..12]` (mode-dependent)
-
----
-
-## 13.4 START Entry Filters (Mode-aware, Aggregated)
-
-### Preserved + integrated filters
-- box position (e.g. middle 35–65%)
-- optional RSI neutral/micro guard
-- POC acceptance/cross
-- MRVD/VAH/VAL/POC proximity gate
-- basis-cross confirm
-- start stability score
-- meta drift soft block
-- planner health state
-- cooldown/reclaim status
-- optional capacity hint (advisory from executor data later)
-
-### Output
-Planner should log **all blockers**, not just first blocker.
-
----
-
-## 13.5 Inventory / Capital Policy (Current default + future-ready schema)
-
-### Current default
-- `inventory_mode = quote_only`
-- one grid per pair
-
-### Preserve future fields now (schema)
-- `inventory_target_bands` (for mixed mode later)
-- `reserve_pct`
-- `topup_policy`
-- `grid_budget_pct`
-- `max_concurrent_rebuilds` (if multi-pair later)
-- `preferred_rung_cap` (planner hint to executor)
-
----
-
-## 13.6 TP/SL Computation at START (Deterministic, Logged)
-
-### Baseline defaults (preserved)
-- TP ≈ `box_top + 0.75–1.0 × step`
-- SL ≈ `box_bottom - 1.0 × step`
-- plus reclaim/time-stop / STOP logic path
-
-### TP candidate set (preserved and expanded)
-- box default TP
-- quartiles `Q1/Q3`
-- VRVP POC
-- MRVD `D/W/M` POCs
-- Donchian mid
-- session VWAP / daily VWAP
-- basis bands / basis mid
-- IMFVG avg
-- session FVG avg
-- FVG positioning averages (`up_avg/down_avg`)
-- HVNs
-- FVG-POC (if FVG-VP enabled)
-- channel midline/bounds (if closer and conservative)
-
-### Selection rule
-**Nearest conservative wins** (faster exit favored if it reduces time-in-trade and remains sensible).
-
-### SL constraints / nudges (preserved)
-- avoid placing inside LVN void if possible
-- never tighten SL inside FVG gap if unsafe
-- use conservative rule among structural constraints
-
----
-
-## 13.7 Fill Detection / Rung Crossing Logic (Preserved from reviewed scripts)
-
-### Required shared logic
-- deterministic rung touch/cross detection
-- sorted levels + binary search lookup
-- fill confirmation mode:
-  - `Touch`
-  - `Reverse` (cross + reclaim)
-- no-repeat / LSI guard
-- cooldown/no-repeat after fill/action
-- tick-aware rounding using `syminfo.mintick` equivalent precision helpers
-
-### Executor and simulator should share logic or exact semantics.
-
-### Status update (2026-02-26)
-- `fill_detection.no_repeat_lsi_guard` is now enforced (not metadata-only) in both simulator and executor.
-- Guard semantics are aligned as side+level scoped cooldown control:
-  - key = `(side, level_index)`
-  - if enabled, repeated action on the same key is blocked until cooldown bars elapse
-  - if disabled, repeated action is allowed
-- Simulator and replay paths now both read/apply:
-  - `fill_detection.fill_confirmation_mode`
-  - `fill_detection.no_repeat_lsi_guard`
-  - `fill_detection.cooldown_bars`
-- Executor now uses plan clock (`runtime_state.clock_ts`, fallback `candle_ts`) to derive deterministic bar-index progression for the same cooldown semantics.
-
----
-
-4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch) [DONE 2026-02-26; synthetic replay validation DONE 2026-02-26]
-
-## 10.1 Purpose
-
-Catch sudden or gradual distribution changes not fully captured by standard gates.
-
-## 10.2 Candidate Streams (normalized)
-- `atr_pct_15m`
-- `rvol_15m`
-- `spread_pct` (executor/live or simulated approximation)
-- `box_pos_abs_delta`
-- `orderbook_imbalance`
-- `depth_thinning_score`
-
-## 10.3 Detection Approach
-- Page-Hinkley / CUSUM-style online drift detection (lightweight)
-- smoothed channels + min sample requirement
-
-## 10.4 Output
-- `drift_detected`
-- `drift_channels`
-- `severity = soft|hard`
-- `recommended_action = PAUSE_STARTS|HARD_STOP|COOLDOWN_EXTEND`
-
-## 10.5 Planner Integration
-- soft drift → block `START/REBUILD`
-- hard drift (while running) → `STOP_META_DRIFT_HARD`
-
-## 10.6 Reason Codes
-- `BLOCK_META_DRIFT_SOFT`
-- `STOP_META_DRIFT_HARD`
-
-Status: implemented (see Section 10 status update above and plan output `meta_drift` block).
-
----
-5. ## Step 12 — Live Execution Hardening
-1. maker-first retry/backoff refinement
-2. post-only reject burst handling
-3. confirm-entry/exit strict enforcement
-4. diff-based reconcile optimization
-5. reconnect/error recovery hardening
-
----
-
-6. ## Step 13 — Formal Tuning Protocol Enforcement
-1. experiment manifests
-2. champion/challenger registry
-3. walk-forward + ablation automation
-4. OOS promotion gates
-5. chaos-profile validation gate
-
----
-7. ## Step 14 — ML/FreqAI Confidence Overlay (last)
-1. leakage-safe labels
-2. walk-forward ML eval
-3. confidence-only integration
-4. compare deterministic-only vs deterministic+ML OOS
-Status: implemented (see Step 14 status update above).
-
-## 26.2 TODO (ordered by priority)
-
-   # 23) Complexity Control Rule (Strategic Guardrail)
-
-The best gains from this point forward come from:
-
-- making the system harder to trick,
-- making execution behavior more realistic,
-- reducing churn and race-condition failures,
-- making tuning harder to overfit,
-- and making logs/explanations bulletproof.
-
-**Do not add more signal modules before stabilizing the deterministic core + replan/handoff/testing pipeline.**
-
----
-8. # 21) Repo Files to Create (for Codex to target immediately)
-
-## 21.1 Must-have docs/schemas
-- `docs/GRID_MASTER_PLAN.md`  ← this file
-- `docs/DECISION_REASON_CODES.md`
-- `docs/REPLAN_POLICY_AND_MATERIALITY.md`
-- `docs/ATOMIC_PLAN_HANDOFF.md`
-- `docs/STRESS_REPLAY_PROFILES.md`
-- `docs/TUNING_PROTOCOL_WALKFORWARD_PBO.md`
-- `schemas/grid_plan.schema.json`
-- `schemas/execution_cost_calibration.schema.json`
-- `schemas/chaos_profile.schema.json`
-
-## 21.2 Strongly recommended
-- `core/enums.py`
-- `schemas/decision_log.schema.json`
-- `schemas/event_log.schema.json`
-- `experiments/manifest.yaml`
-- `experiments/champions.json`
-- `experiments/metrics_schema.json`
-
-## 21.3 Core modules (target filenames; exact paths flexible)
-- `planner/replan_policy.py`
-- `planner/start_stability.py`
-- `planner/volatility_policy_adapter.py`
-- `risk/meta_drift_guard.py`
-- `analytics/execution_cost_calibrator.py`
-- `execution/capacity_guard.py`
-- `io/atomic_json.py`
-- `schemas/plan_signature.py`
-- `sim/chaos_profiles.py`
-- `data/data_quality_assessor.py`
+## 26.2 TODO (ordered by importance)
+
+### 26.2.1 Critical contract/schema gaps (highest priority)
+
+1. **Section 14 + Section 19 contract completion**
+   - Implement full plan-signature contract fields in live plan output:
+     - `schema_version`, `planner_version`, `pair`, `plan_id`, `decision_seq`, `plan_hash`, `generated_at`, `valid_for_candle_ts`, `materiality_class`, `replan_decision`, `replan_reasons`
+   - Add executor-side idempotent apply logic using `plan_id`/`decision_seq` (reject duplicate/stale plans deterministically).
+   - Current state: atomic write exists, but full signature/idempotency contract is incomplete.
+
+2. **Section 21 must-have docs/schemas missing**
+   - Missing docs:
+     - `docs/REPLAN_POLICY_AND_MATERIALITY.md`
+     - `docs/ATOMIC_PLAN_HANDOFF.md`
+     - `docs/STRESS_REPLAY_PROFILES.md`
+     - `docs/TUNING_PROTOCOL_WALKFORWARD_PBO.md`
+   - Missing schemas:
+     - `schemas/grid_plan.schema.json`
+     - `schemas/execution_cost_calibration.schema.json`
+     - `schemas/chaos_profile.schema.json`
+     - `schemas/decision_log.schema.json`
+     - `schemas/event_log.schema.json`
+
+3. **Section 21 core module file targets missing (currently inlined in strategy/scripts)**
+   - `planner/replan_policy.py`
+   - `planner/start_stability.py`
+   - `planner/volatility_policy_adapter.py`
+   - `risk/meta_drift_guard.py`
+   - `analytics/execution_cost_calibrator.py`
+   - `execution/capacity_guard.py`
+   - `io/atomic_json.py`
+   - `schemas/plan_signature.py`
+   - `sim/chaos_profiles.py`
+   - `data/data_quality_assessor.py`
+
+### 26.2.2 Robustness/validation pipeline gaps
+
+4. **Stress/chaos perturbation harness is still partial**
+   - Tuning protocol can score “chaos” run outputs, but dedicated perturbation injection profiles (latency/spread/partial-fill/reject/data-gap engine) are not a first-class simulator harness yet.
+
+5. **Golden replay + strict brain/simulator consistency matrix needs expansion**
+   - Existing tests cover many behaviors, but a fixed “golden replay snapshots + strict action-sequence parity” suite remains incomplete.
+
+### 26.2.3 Execution realism and liquidity controls gaps
+
+6. **Depth-aware capacity cap is partial**
+   - Capacity hint ingestion exists; full dynamic orderbook depth-based rung/notional cap enforcement remains incomplete.
+
+7. **Order-flow metrics and execution-cost feedback are partial**
+   - Confirm metrics and empirical proxies exist, but full live orderbook/order-lifecycle sourced calibration loops are not complete.
+
+### 26.2.4 Module registry items remaining (complete list; includes PARTIAL + NOT STARTED)
+
+- **18.A Core/ Governance remaining**
+  - `M002` (partial): atomic write is done; full signature + stale/duplicate reject contract incomplete.
+  - `M006` (partial): threshold adaptation exists; explicit standalone volatility-adapter contract/reporting still incomplete.
+  - `M008` (partial): no dedicated perturbation harness engine yet.
+  - `M009` (partial): dynamic depth-aware cap not complete.
+  - `M010` (partial): enum registry done; full plan-diff/`changed_fields` contract not complete.
+
+- **18.B Regime / Build gates remaining**
+  - `M113` (not started): boom/doom impulse guard.
+
+- **18.C Box builder remaining**
+  - `M204` (not started): percent-of-average width veto.
+  - `M205` (partial): breakout/freshness pieces exist; full minimum-range-length policy still incomplete.
+  - `M209` (partial): quartiles/extensions implemented, but explicit log-space quartile formulation remains incomplete.
+  - `M212` (not started): explicit fallback POC estimator contract.
+  - `M213` (partial): full midline-bias fallback policy not complete.
+
+- **18.D Grid / targets / risk remaining**
+  - `M306` (not started): directional skip-one rule.
+  - `M307` (not started): next-rung ghost lines (UI).
+
+- **18.E Monitoring/runtime remaining**
+  - `M404` (partial): cooldown/min-runtime implemented; full protections/drawdown extension layer incomplete.
+  - `M406` (partial): event logging exists, but formal structured event-bus taxonomy contract incomplete.
+
+- **18.F VP / VAP family remaining**
+  - `M502` (partial): diagnostics exist; strict micro-POC vs VRVP alignment gate behavior incomplete.
+  - `M505` (partial): several nudges implemented; full re-entry discipline from module spec incomplete.
+
+- **18.G FVG stack remaining**
+  - `M601` (not started): lightweight OB module.
+  - `M606` (partial): FVG-VP toggle/path exists; full event-driven side-capped FVG-VP behavior incomplete.
+
+- **18.H Channels/sweeps remaining**
+  - `M702` (partial): channel logic exists; full smart-breakout module behaviors incomplete.
+  - `M703` (partial): some envelope/slope/asymmetry checks exist; full zig-zag enhancement set incomplete.
+  - `M704` (not started): liquidity sweeps module.
+  - `M705` (not started): sweep-mode validation toggle (`Wick/Open`) module.
+
+- **18.I MRVD / basis / VWAP remaining**
+  - `M801` (partial): strong confluence exists; full documented D/W/M + start-cross policy formalization still incomplete.
+  - `M805` (partial): session high/low values exist; sweep + break-retest event module incomplete.
+  - `M807` (not started): VAH/VAL quantile approximation fallback.
+  - `M808` (not started): average-of-basis with session H/L band candidates.
+  - `M809` (partial): buy/sell metrics collected; explicit mid-band micro-bias policy incomplete.
+
+- **18.J CVD family remaining**
+  - `M903` (partial): BOS/divergence paths exist; spike + passive-absorption behaviors incomplete.
+  - `M904` (not started): CVD divergence oscillator strong-score module.
+  - `M905` (not started): SMA200/EMA trend filter add-on for directional variants.
+  - `M906` (not started): CVD extension-line touch counter (UI).
+
+- **18.K Execution/Ops remaining**
+  - `M1003` (partial): soft metrics exist; full minimal order-flow module behavior incomplete.
+  - `M1004` (partial): atomic handoff exists; full duplicate-safe signature contract incomplete.
+  - `M1005` (partial): empirical cost path exists; full execution feedback loop standardization incomplete.
+  - `M1006` (partial): tuning/validation uses stress concepts; full standard chaos replay harness incomplete.
+
+### 26.2.5 Section-24 audit template status (filled)
+
+- Deterministic core planner exists: **DONE**
+- Simulator exists and matches planner decisions: **PARTIAL** (exists, but full strict parity matrix still pending)
+- Executor (paper) exists: **DONE**
+- Atomic plan write exists: **DONE**
+- Idempotent plan apply exists: **PARTIAL**
+- Replan/materiality exists: **DONE**
+- Start stability score exists: **DONE**
+- Data quality health state exists: **DONE**
+- Chaos replay exists: **PARTIAL**
+- Empirical cost calibration exists: **DONE (planner-level), PARTIAL (full lifecycle loop)**
+- Meta drift guard exists: **DONE**
+- Capacity guard exists: **PARTIAL**
+- Formal tuning workflow exists: **DONE**
 
 ---
