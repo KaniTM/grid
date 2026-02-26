@@ -330,6 +330,66 @@ def test_box_quality_levels_linear_fallback_when_nonpositive_bounds() -> None:
     assert levels["extension_hi"] == pytest.approx(31.58, rel=1e-4)
 
 
+def test_midline_bias_fallback_activates_when_vrvp_poc_is_neutral() -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.midline_bias_fallback_enabled = True
+    strategy.midline_bias_tp_candidate_enabled = True
+    strategy.midline_bias_poc_neutral_step_frac = 0.5
+    strategy.midline_bias_poc_neutral_width_frac = 0.01
+    strategy.midline_bias_source_buffer_steps = 0.5
+    strategy.midline_bias_source_buffer_width_frac = 0.02
+    strategy.midline_bias_deadband_steps = 0.25
+    strategy.midline_bias_deadband_width_frac = 0.005
+
+    state = strategy._midline_bias_fallback_state(
+        close=100.0,
+        box_low=90.0,
+        box_high=110.0,
+        step_price=2.0,
+        vrvp_poc=100.2,
+        channel_midline=104.0,
+        basis_mid=103.0,
+        donchian_mid=102.0,
+        session_vwap=None,
+        daily_vwap=None,
+    )
+
+    assert state["active"] is True
+    assert state["poc_neutral"] is True
+    assert state["source"] == "channel_midline"
+    assert state["direction"] == "bullish"
+    assert state["tp_candidate"] == pytest.approx(104.0)
+
+
+def test_midline_bias_fallback_stays_inactive_when_vrvp_poc_not_neutral() -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.midline_bias_fallback_enabled = True
+    strategy.midline_bias_tp_candidate_enabled = True
+    strategy.midline_bias_poc_neutral_step_frac = 0.5
+    strategy.midline_bias_poc_neutral_width_frac = 0.01
+    strategy.midline_bias_source_buffer_steps = 0.5
+    strategy.midline_bias_source_buffer_width_frac = 0.02
+    strategy.midline_bias_deadband_steps = 0.25
+    strategy.midline_bias_deadband_width_frac = 0.005
+
+    state = strategy._midline_bias_fallback_state(
+        close=100.0,
+        box_low=90.0,
+        box_high=110.0,
+        step_price=2.0,
+        vrvp_poc=106.0,
+        channel_midline=104.0,
+        basis_mid=103.0,
+        donchian_mid=102.0,
+        session_vwap=None,
+        daily_vwap=None,
+    )
+
+    assert state["active"] is False
+    assert state["poc_neutral"] is False
+    assert state["tp_candidate"] is None
+
+
 def test_poc_acceptance_handles_multiple_candidates() -> None:
     strategy = object.__new__(GridBrainV1Core)
     strategy.poc_acceptance_enabled = True

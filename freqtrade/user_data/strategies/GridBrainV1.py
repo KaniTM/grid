@@ -934,6 +934,14 @@ class GridBrainV1Core(IStrategy):
     sl_fvg_buffer_steps = 0.10
     box_quality_log_space = True
     box_quality_extension_factor = 1.386
+    midline_bias_fallback_enabled = True
+    midline_bias_tp_candidate_enabled = True
+    midline_bias_poc_neutral_step_frac = 0.35
+    midline_bias_poc_neutral_width_frac = 0.01
+    midline_bias_source_buffer_steps = 0.50
+    midline_bias_source_buffer_width_frac = 0.02
+    midline_bias_deadband_steps = 0.25
+    midline_bias_deadband_width_frac = 0.005
 
     # Shared fill semantics metadata (Section 13.7).
     fill_confirmation_mode = "Touch"  # Touch | Reverse
@@ -2916,6 +2924,99 @@ class GridBrainV1Core(IStrategy):
             "extension_hi": float(ext_hi),
             "space": "linear_fallback",
             "extension_factor": float(ext_factor),
+        }
+
+    def _midline_bias_fallback_state(
+        self,
+        *,
+        close: float,
+        box_low: float,
+        box_high: float,
+        step_price: float,
+        vrvp_poc: Optional[float],
+        channel_midline: Optional[float],
+        basis_mid: Optional[float],
+        donchian_mid: Optional[float],
+        session_vwap: Optional[float],
+        daily_vwap: Optional[float],
+    ) -> Dict[str, object]:
+        lo = float(min(box_low, box_high))
+        hi = float(max(box_low, box_high))
+        box_mid = float((lo + hi) / 2.0) if (lo + hi) else 0.0
+        box_width = float(max(hi - lo, 0.0))
+        step_ref = float(max(step_price, 0.0))
+
+        neutral_thresh = float(
+            max(
+                float(self.midline_bias_poc_neutral_step_frac) * step_ref,
+                float(self.midline_bias_poc_neutral_width_frac) * box_width,
+            )
+        )
+        poc = self._safe_float(vrvp_poc)
+        poc_dist_from_mid = abs(float(poc) - box_mid) if poc is not None else None
+        poc_neutral = bool(poc is None or (poc_dist_from_mid is not None and poc_dist_from_mid <= neutral_thresh))
+        enabled = bool(self.midline_bias_fallback_enabled)
+        active = bool(enabled and poc_neutral)
+
+        source_buffer = float(
+            max(
+                float(self.midline_bias_source_buffer_steps) * step_ref,
+                float(self.midline_bias_source_buffer_width_frac) * box_width,
+            )
+        )
+
+        source_candidates = [
+            ("channel_midline", channel_midline),
+            ("basis_mid", basis_mid),
+            ("donchian_mid", donchian_mid),
+            ("session_vwap", session_vwap),
+            ("daily_vwap", daily_vwap),
+            ("box_mid", box_mid),
+        ]
+        source_used = "box_mid"
+        anchor = float(box_mid)
+        for source_name, source_value in source_candidates:
+            value = self._safe_float(source_value)
+            if value is None:
+                continue
+            if source_name != "box_mid":
+                if value < (lo - source_buffer) or value > (hi + source_buffer):
+                    continue
+            source_used = str(source_name)
+            anchor = float(value)
+            break
+
+        deadband = float(
+            max(
+                float(self.midline_bias_deadband_steps) * step_ref,
+                float(self.midline_bias_deadband_width_frac) * box_width,
+            )
+        )
+        delta_from_box_mid = float(anchor - box_mid)
+        direction = "neutral"
+        if delta_from_box_mid > deadband:
+            direction = "bullish"
+        elif delta_from_box_mid < (-deadband):
+            direction = "bearish"
+
+        tp_candidate = None
+        if bool(self.midline_bias_tp_candidate_enabled) and active and anchor > float(close):
+            tp_candidate = float(anchor)
+
+        return {
+            "enabled": bool(enabled),
+            "active": bool(active),
+            "poc_neutral": bool(poc_neutral),
+            "poc_dist_from_mid": float(poc_dist_from_mid) if poc_dist_from_mid is not None else None,
+            "poc_neutral_threshold": float(neutral_thresh),
+            "box_mid": float(box_mid),
+            "source": str(source_used),
+            "anchor": float(anchor),
+            "delta_from_box_mid": float(delta_from_box_mid),
+            "direction": str(direction),
+            "deadband": float(deadband),
+            "tp_candidate": float(tp_candidate) if tp_candidate is not None else None,
+            "source_buffer": float(source_buffer),
         }
 
     def _update_box_quality(
@@ -5993,12 +6094,26 @@ class GridBrainV1Core(IStrategy):
         channel_midline = self._safe_float(last.get("bb_mid_15m"))
         channel_upper = bb_upper_15m
         channel_lower = bb_lower_15m
+        midline_bias = self._midline_bias_fallback_state(
+            close=close,
+            box_low=lo_p,
+            box_high=hi_p,
+            step_price=step_price,
+            vrvp_poc=vrvp_poc,
+            channel_midline=channel_midline,
+            basis_mid=basis_mid,
+            donchian_mid=donchian_mid,
+            session_vwap=session_vwap,
+            daily_vwap=daily_vwap,
+        )
+        midline_bias_tp_candidate = self._safe_float(midline_bias.get("tp_candidate"))
 
         tp_candidate_prices = {
             "box_default_tp": float(tp_price),
             "quartile_q1": float(q1),
             "quartile_q3": float(q3),
             "extension_1386_hi": float(ext_hi),
+            "midline_bias_tp": midline_bias_tp_candidate,
             "vrvp_poc": self._safe_float(vrvp_poc),
             "mrvd_day_poc": mrvd_day_poc,
             "mrvd_week_poc": mrvd_week_poc,
@@ -6045,12 +6160,14 @@ class GridBrainV1Core(IStrategy):
             "quartile_q1": float(q1),
             "quartile_q3": float(q3),
             "extension_1386_hi": float(ext_hi),
+            "midline_bias_tp": midline_bias_tp_candidate,
             "vrvp_poc": self._safe_float(vrvp_poc),
             "imfvg_avg_bull": self._safe_float(fvg_state.get("imfvg_avg_bull")),
             "imfvg_avg_bear": self._safe_float(fvg_state.get("imfvg_avg_bear")),
             "session_fvg_avg": self._safe_float(fvg_state.get("session_fvg_avg")),
             "fvg_position_up_avg": self._safe_float(fvg_state.get("positioning_up_avg")),
             "fvg_position_down_avg": self._safe_float(fvg_state.get("positioning_down_avg")),
+            "midline_bias_state": dict(midline_bias),
             "mrvd_day_poc": mrvd_day_poc,
             "mrvd_week_poc": mrvd_week_poc,
             "mrvd_month_poc": mrvd_month_poc,
@@ -6867,6 +6984,7 @@ class GridBrainV1Core(IStrategy):
                         "block_reason": breakout_confirm_reason_state.get("block_reason"),
                         "stop_reason": breakout_confirm_reason_state.get("stop_reason"),
                     },
+                    "midline_bias_fallback": dict(midline_bias),
                 },
                 "micro_vap": {
                     "enabled": bool(self.micro_vap_enabled),
@@ -7026,6 +7144,7 @@ class GridBrainV1Core(IStrategy):
                 "sl_step_multiple": float(self.sl_step_multiple),
                 "source": "nearest_conservative",
                 "tp_candidates": tp_candidates,
+                "midline_bias": dict(midline_bias),
                 "sl_selection": sl_selection,
             },
             "signals": {
@@ -7118,6 +7237,13 @@ class GridBrainV1Core(IStrategy):
                 "basis_lower_15m": basis_lower,
                 "basis_cross_confirm": bool(basis_cross_confirm),
                 "basis_cross_ok": bool(basis_cross_ok),
+                "midline_bias_enabled": bool(midline_bias.get("enabled", False)),
+                "midline_bias_active": bool(midline_bias.get("active", False)),
+                "midline_bias_poc_neutral": bool(midline_bias.get("poc_neutral", False)),
+                "midline_bias_source": midline_bias.get("source"),
+                "midline_bias_anchor": self._safe_float(midline_bias.get("anchor")),
+                "midline_bias_direction": midline_bias.get("direction"),
+                "midline_bias_tp_candidate": self._safe_float(midline_bias.get("tp_candidate")),
                 "squeeze_on_1h": bool(squeeze_on_1h) if squeeze_on_1h is not None else None,
                 "squeeze_released_1h": bool(squeeze_released_1h),
                 "squeeze_val_1h": squeeze_val_1h,
@@ -7533,6 +7659,16 @@ class GridBrainV1Core(IStrategy):
                     "breakout_quick_tp_thresh": float(self.freqai_overlay_breakout_quick_tp_thresh),
                     "rung_edge_cut_max": float(self.freqai_overlay_rung_edge_cut_max),
                 },
+                "midline_bias": {
+                    "enabled": bool(self.midline_bias_fallback_enabled),
+                    "tp_candidate_enabled": bool(self.midline_bias_tp_candidate_enabled),
+                    "poc_neutral_step_frac": float(self.midline_bias_poc_neutral_step_frac),
+                    "poc_neutral_width_frac": float(self.midline_bias_poc_neutral_width_frac),
+                    "source_buffer_steps": float(self.midline_bias_source_buffer_steps),
+                    "source_buffer_width_frac": float(self.midline_bias_source_buffer_width_frac),
+                    "deadband_steps": float(self.midline_bias_deadband_steps),
+                    "deadband_width_frac": float(self.midline_bias_deadband_width_frac),
+                },
                 "rung_bias": {
                     "hvn_boost": float(self.rung_weight_hvn_boost),
                     "lvn_penalty": float(self.rung_weight_lvn_penalty),
@@ -7609,6 +7745,7 @@ class GridBrainV1Core(IStrategy):
                 "start_stability_ok": bool(start_stability_ok),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
                 "start_filters": dict(start_filter_states),
+                "midline_bias": dict(midline_bias),
                 "meta_drift_detected": bool(meta_drift_state.get("drift_detected", False)),
                 "meta_drift_severity": str(meta_drift_state.get("severity", "none")),
                 "meta_drift_recommended_action": str(meta_drift_recommended_action),
@@ -7647,6 +7784,7 @@ class GridBrainV1Core(IStrategy):
                 "start_blocked": bool(start_blocked),
                 "start_block_reasons": [str(x) for x in start_block_reasons],
                 "start_filters": dict(start_filter_states),
+                "midline_bias": dict(midline_bias),
                 "meta_drift_detected": bool(meta_drift_state.get("drift_detected", False)),
                 "meta_drift_severity": str(meta_drift_state.get("severity", "none")),
                 "meta_drift_recommended_action": str(meta_drift_recommended_action),
@@ -7752,6 +7890,7 @@ class GridBrainV1Core(IStrategy):
                 "lo": float(ext_lo),
                 "hi": float(ext_hi),
             },
+            "midline_bias": dict(midline_bias),
             "breakout_fresh_block_active": bool(breakout_fresh_block_active),
             "breakout_levels": {
                 "up": float(breakout_up_level),

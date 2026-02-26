@@ -2249,7 +2249,7 @@ Status values used:
 
 - `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M007`, `M008`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
-- `M201`, `M202`, `M203`, `M205`, `M206`, `M207`, `M208`, `M209`, `M210`, `M211`
+- `M201`, `M202`, `M203`, `M205`, `M206`, `M207`, `M208`, `M209`, `M210`, `M211`, `M213`
 - `M301`, `M302`, `M303`, `M304`, `M305`
 - `M401`, `M402`, `M403`, `M405`
 - `M501`, `M503`, `M504`
@@ -2377,12 +2377,16 @@ Status values used:
     - Upgraded 1.386 extension math to per-side extensions and wired levels consistently into diagnostics, range/box plan payloads, and TP candidate snapshots (`extension_1386_hi`).
     - Added explicit diagnostics metadata (`quartile_space`, `extension_factor`) so replay/plan introspection can verify level-space provenance.
     - Extended focused coverage in `freqtrade/user_data/tests/test_phase3_validation.py` for log-space values and fallback behavior.
+17. [DONE 2026-02-26] Complete M213 midline bias fallback (POC-neutral fallback policy).
+    - Added deterministic midline-bias fallback policy in `GridBrainV1` with explicit POC-neutral detection thresholds (step/width based), ordered source selection (`channel_midline` -> `basis_mid` -> `donchian_mid` -> `session_vwap` -> `daily_vwap` -> `box_mid`), and stable deadband classification (`bullish|bearish|neutral`).
+    - Added optional fallback TP candidate emission (`midline_bias_tp`) used by nearest-conservative TP selection only when fallback is active and sensible.
+    - Wired full fallback diagnostics into plan payloads (`range.validation.midline_bias_fallback`, `exit.midline_bias`, `runtime_state.midline_bias`, `diagnostics.midline_bias`, and signal fields).
+    - Added focused tests in `freqtrade/user_data/tests/test_phase3_validation.py` covering both active (POC-neutral) and inactive (directional POC) fallback paths.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M213` Midline bias fallback (full policy incomplete)
 - `M404` Protections layer (drawdown/protection extensions incomplete)
 - `M406` Structured event taxonomy/bus contract
 - `M502` POC alignment check strict behavior
@@ -2457,7 +2461,7 @@ Status values used:
 - `M210` DONE
 - `M211` DONE
 - `M212` NOT_IMPLEMENTED
-- `M213` PARTIAL
+- `M213` DONE
 
 - `M301` DONE
 - `M302` DONE
