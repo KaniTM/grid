@@ -463,6 +463,7 @@ Catch sudden or gradual distribution changes not fully captured by standard gate
   - soft drift -> `BLOCK_META_DRIFT_SOFT` (blocks START/REBUILD)
   - hard drift while running -> stop path with `STOP_META_DRIFT_HARD`
   - hard drift while idle -> cooldown extension recommendation path
+- Dedicated replay validation now exists in `freqtrade/user_data/tests/test_meta_drift_replay.py`, covering synthetic regime-shift sequences end-to-end in `simulate_grid_replay` (soft drift blocker accounting + hard-stop reason/event propagation).
 
 ---
 
@@ -1981,6 +1982,8 @@ This order minimizes wasted work and improves quality of all later modules.
 2. soft pause + hard stop integration
 3. synthetic regime-shift replay validation
 
+**Status (2026-02-26):** Complete, including dedicated synthetic replay coverage in `freqtrade/user_data/tests/test_meta_drift_replay.py`.
+
 ---
 
 ## Step 7 — VP / POC Quality Core
@@ -2178,6 +2181,7 @@ This is the intended path to a system that is not only feature-rich, but **stabl
 - # 13) Phase-4: Grid Sizing, START Filters, Targets, Risk
 - 2026-02-26 sync: `13.7` no-repeat/LSI guard moved from metadata-only to enforced behavior across simulator + executor, with regression tests.
 - 2026-02-26 sync: `#10 Meta Drift Guard` implemented (soft pause + hard-stop integration, drift outputs logged).
+- 2026-02-26 sync: Step 6 synthetic regime-shift replay validation implemented via dedicated replay suite (`freqtrade/user_data/tests/test_meta_drift_replay.py`).
 
 ## 2.1 Brain / Planner (`GridBrainV1`)
 
@@ -2659,7 +2663,7 @@ Planner should log **all blockers**, not just first blocker.
 
 ## 26.2 TODO (ordered by priority)
 
-4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch) [DONE 2026-02-26]
+4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch) [DONE 2026-02-26; synthetic replay validation DONE 2026-02-26]
 
 ## 10.1 Purpose
 
