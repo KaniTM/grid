@@ -766,6 +766,20 @@ def _normalize_router_mode(value: object, default: str = "unknown") -> str:
     return str(default or "unknown")
 
 
+def _normalize_replan_decision(value: object, default: str = "unknown") -> str:
+    out = str(value or "").strip().lower()
+    if not out:
+        return str(default or "unknown")
+    return out
+
+
+def _normalize_materiality_class(value: object, default: str = "unknown") -> str:
+    out = str(value or "").strip().lower()
+    if not out:
+        return str(default or "unknown")
+    return out
+
+
 def extract_start_block_reasons(plan: Dict) -> List[str]:
     diag = plan.get("diagnostics", {}) or {}
     runtime = plan.get("runtime_state", {}) or {}
@@ -1272,12 +1286,17 @@ def simulate_grid_replay(
     hold_reason_counts: Dict[str, int] = {}
     stop_reason_counts: Dict[str, int] = {}
     stop_event_reason_counts: Dict[str, int] = {}
+    replan_decision_counts: Dict[str, int] = {}
+    materiality_class_counts: Dict[str, int] = {}
     mode_plan_counts: Dict[str, int] = {}
     mode_desired_counts: Dict[str, int] = {}
     raw_action_mode_counts: Dict[str, int] = {}
     effective_action_mode_counts: Dict[str, int] = {}
     fill_mode_counts: Dict[str, int] = {}
     fill_mode_side_counts: Dict[str, int] = {}
+    selected_plan_snapshots: List[Dict[str, object]] = []
+    false_start_count = 0
+    start_cycle_fill_count_at_start: Optional[int] = None
     last_effective_action_signature: Optional[Tuple] = None
     fill_guard = FillCooldownGuard(fill_cooldown_bars, fill_no_repeat_lsi_guard)
     active_fill_mode = _normalize_fill_mode(touch_fill, fill_confirmation_mode)
@@ -1392,6 +1411,45 @@ def simulate_grid_replay(
 
         if switched and active_plan is not None:
             plan_switch_count += 1
+            switched_replan_decision = _normalize_replan_decision(active_plan.get("replan_decision"))
+            switched_materiality_class = _normalize_materiality_class(active_plan.get("materiality_class"))
+            _increment_reason(replan_decision_counts, switched_replan_decision, 1)
+            _increment_reason(materiality_class_counts, switched_materiality_class, 1)
+            try:
+                switched_grid = active_plan.get("grid", {}) or {}
+                switched_range = active_plan.get("range", {}) or {}
+                switched_n_levels = int(switched_grid.get("n_levels", 0) or 0)
+                switched_box_low = _safe_float(switched_range.get("low"), default=None)
+                switched_box_high = _safe_float(switched_range.get("high"), default=None)
+                switched_step_price = _safe_float(switched_grid.get("step_price"), default=None)
+                if (
+                    switched_step_price is None
+                    and switched_n_levels > 0
+                    and switched_box_low is not None
+                    and switched_box_high is not None
+                ):
+                    switched_step_price = float((switched_box_high - switched_box_low) / switched_n_levels)
+            except Exception:
+                switched_n_levels = 0
+                switched_box_low = None
+                switched_box_high = None
+                switched_step_price = None
+            selected_plan_snapshots.append(
+                {
+                    "plan_index": int(plan_idx),
+                    "plan_time_utc": str(active_plan.get("_plan_time")),
+                    "plan_path": active_plan.get("_plan_path"),
+                    "plan_id": active_plan.get("plan_id"),
+                    "decision_seq": _safe_int(active_plan.get("decision_seq"), default=None),
+                    "action": str(active_plan.get("action", "HOLD")).upper(),
+                    "replan_decision": switched_replan_decision,
+                    "materiality_class": switched_materiality_class,
+                    "box_low": switched_box_low,
+                    "box_high": switched_box_high,
+                    "n_levels": int(switched_n_levels),
+                    "step_price": switched_step_price,
+                }
+            )
             events.append(
                 {
                     "ts": ts,
@@ -1440,8 +1498,15 @@ def simulate_grid_replay(
                     "raw_action": "NO_PLAN",
                     "effective_action": "NO_PLAN",
                     "action_suppression_reason": None,
+                    "plan_action": None,
+                    "plan_replan_decision": None,
+                    "plan_materiality_class": None,
                     "plan_index": None,
                     "plan_time_utc": None,
+                    "plan_box_low": None,
+                    "plan_box_high": None,
+                    "plan_n_levels": None,
+                    "plan_step_price": None,
                     "start_counterfactual_required_count": 0,
                     "start_counterfactual_single": None,
                     "start_counterfactual_combo": None,
@@ -1498,7 +1563,10 @@ def simulate_grid_replay(
             ref_price = c
 
         tp_price, sl_price = extract_exit_levels(active_plan)
-        raw_action = str(active_plan.get("action", "HOLD")).upper()
+        plan_action = str(active_plan.get("action", "HOLD")).upper()
+        plan_replan_decision = _normalize_replan_decision(active_plan.get("replan_decision"))
+        plan_materiality_class = _normalize_materiality_class(active_plan.get("materiality_class"))
+        raw_action = str(plan_action).upper()
         if raw_action not in ("START", "HOLD", "STOP"):
             raw_action = "HOLD"
 
@@ -1590,7 +1658,16 @@ def simulate_grid_replay(
                 plan_stop_reason_flags = extract_stop_reason_flags(active_plan, applied_only=False)
             _increment_reasons(stop_reason_counts, plan_stop_reason_flags)
 
+        if effective_action == "START":
+            start_cycle_fill_count_at_start = int(len(fills))
+
         if effective_action == "STOP":
+            fills_since_start = None
+            if start_cycle_fill_count_at_start is not None:
+                fills_since_start = int(len(fills) - start_cycle_fill_count_at_start)
+                if fills_since_start <= 0:
+                    false_start_count += 1
+            start_cycle_fill_count_at_start = None
             stop_count += 1
             if stop_reason is None:
                 stop_reason = "PLAN_STOP"
@@ -1623,6 +1700,7 @@ def simulate_grid_replay(
                     "plan_time_utc": str(active_plan.get("_plan_time")),
                     "mode_at_entry": mode_at_entry,
                     "mode_at_exit": mode_at_exit,
+                    "fills_since_last_start": fills_since_start,
                 }
             )
 
@@ -1639,8 +1717,15 @@ def simulate_grid_replay(
                     "raw_action": raw_action,
                     "effective_action": effective_action,
                     "action_suppression_reason": suppression_reason,
+                    "plan_action": plan_action,
+                    "plan_replan_decision": plan_replan_decision,
+                    "plan_materiality_class": plan_materiality_class,
                     "plan_index": int(plan_idx),
                     "plan_time_utc": str(active_plan.get("_plan_time")),
+                    "plan_box_low": float(box_low),
+                    "plan_box_high": float(box_high),
+                    "plan_n_levels": int(n_levels),
+                    "plan_step_price": float(step),
                     "start_counterfactual_required_count": cf_required_count,
                     "start_counterfactual_single": cf_single,
                     "start_counterfactual_combo": cf_combo,
@@ -1932,8 +2017,15 @@ def simulate_grid_replay(
                 "raw_action": raw_action,
                 "effective_action": effective_action,
                 "action_suppression_reason": suppression_reason,
+                "plan_action": plan_action,
+                "plan_replan_decision": plan_replan_decision,
+                "plan_materiality_class": plan_materiality_class,
                 "plan_index": int(plan_idx),
                 "plan_time_utc": str(active_plan.get("_plan_time")),
+                "plan_box_low": float(box_low),
+                "plan_box_high": float(box_high),
+                "plan_n_levels": int(n_levels),
+                "plan_step_price": float(step),
                 "start_counterfactual_required_count": cf_required_count,
                 "start_counterfactual_single": cf_single,
                 "start_counterfactual_combo": cf_combo,
@@ -2013,6 +2105,11 @@ def simulate_grid_replay(
         "stop_reason_counts": stop_reason_counts_sorted,
         "stop_event_reason_counts": stop_event_reason_counts_sorted,
         "stop_reason_counts_combined": combined_stop_reason_counts,
+        "replan_decision_counts": _sorted_reason_counts(replan_decision_counts),
+        "materiality_class_counts": _sorted_reason_counts(materiality_class_counts),
+        "selected_plan_snapshots": selected_plan_snapshots,
+        "false_start_count": int(false_start_count),
+        "false_start_rate": float(false_start_count / seed_count) if seed_count > 0 else 0.0,
         "chaos_profile_enabled": bool(chaos_cfg is not None),
         "chaos_profile_id": chaos_cfg.profile_id if chaos_cfg is not None else None,
         "chaos_profile_name": chaos_cfg.name if chaos_cfg is not None else None,
@@ -2046,6 +2143,8 @@ def simulate_grid_replay(
                 "fills_total": int(len(baseline_res.get("fills", []) or [])),
                 "stop_events": int(baseline_summary.get("stop_events", 0)),
                 "action_suppressed_total": int(baseline_summary.get("action_suppressed_total", 0)),
+                "false_start_count": int(baseline_summary.get("false_start_count", 0)),
+                "false_start_rate": float(baseline_summary.get("false_start_rate", 0.0)),
             }
             summary["deterministic_vs_chaos_delta"] = {
                 "pnl_pct_delta": float(summary["pnl_pct"]) - float(baseline_summary.get("pnl_pct", 0.0)),
@@ -2054,6 +2153,10 @@ def simulate_grid_replay(
                 "stop_events_delta": int(summary["stop_events"]) - int(baseline_summary.get("stop_events", 0)),
                 "action_suppressed_total_delta": int(summary["action_suppressed_total"])
                 - int(baseline_summary.get("action_suppressed_total", 0)),
+                "false_start_count_delta": int(summary["false_start_count"])
+                - int(baseline_summary.get("false_start_count", 0)),
+                "false_start_rate_delta": float(summary["false_start_rate"])
+                - float(baseline_summary.get("false_start_rate", 0.0)),
             }
         except Exception as exc:
             summary["deterministic_baseline_error"] = str(exc)

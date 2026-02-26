@@ -2318,7 +2318,18 @@ Status values used:
    - Replay summary now includes `chaos_profile_*` fields, perturbation counters, and deterministic-vs-chaos delta metrics.
    - Replay CLI now supports `--chaos-profile` and schema-validated profile loading.
    - Added dedicated replay harness coverage in `freqtrade/user_data/tests/test_chaos_replay_harness.py`.
-6. Complete strict golden replay and formal brain/simulator consistency suite coverage from Section 17.
+6. [DONE 2026-02-26] Complete strict golden replay and formal brain/simulator consistency suite coverage from Section 17.
+   - Added strict golden replay coverage in `freqtrade/user_data/tests/test_replay_golden_consistency.py` for fixed timerange expectations:
+     - START/STOP counts
+     - reason distributions
+     - selected plan snapshots
+     - replan decision distribution
+     - false-start rate
+   - Added formal brain/simulator consistency assertions in the same suite:
+     - per-bar active plan action sequence parity
+     - per-bar box/grid parameter parity (`box_low/high`, `n_levels`, `step_price`)
+     - replan/materiality classification parity
+   - Replay summary/curve now expose explicit consistency fields (`replan_decision_counts`, `materiality_class_counts`, `selected_plan_snapshots`, `false_start_*`, and per-row `plan_*` mirror fields) for stable regression checks.
 7. Complete depth-aware dynamic capacity cap enforcement (not only hint ingestion) from Sections 16/18.
 8. Complete full execution-cost lifecycle feedback loop (fill/order lifecycle standardization + calibration artifact discipline) from Sections 13/18.
 
