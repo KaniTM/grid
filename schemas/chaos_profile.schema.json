@@ -36,20 +36,42 @@
     },
     "latency_ms": {
       "type": "object",
-      "required": [
-        "mean",
-        "jitter"
-      ],
       "properties": {
         "mean": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p95": {
           "type": "number",
           "minimum": 0
         },
         "jitter": {
           "type": "number",
           "minimum": 0
+        },
+        "fill_window_ms": {
+          "type": "number",
+          "minimum": 0
         }
       },
+      "anyOf": [
+        {
+          "required": [
+            "mean",
+            "jitter"
+          ]
+        },
+        {
+          "required": [
+            "p50",
+            "p95"
+          ]
+        }
+      ],
       "additionalProperties": true
     },
     "spread_shock_bps": {
@@ -66,6 +88,19 @@
         "burst": {
           "type": "number",
           "minimum": 0
+        },
+        "base_p50": {
+          "type": "number",
+          "minimum": 0
+        },
+        "burst_p95": {
+          "type": "number",
+          "minimum": 0
+        },
+        "burst_probability": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
         }
       },
       "additionalProperties": true
@@ -76,6 +111,44 @@
       "maximum": 1
     },
     "reject_burst_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "partial_fill_min_ratio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "partial_fill_max_ratio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reject_burst_bars": {
+      "type": "object",
+      "required": [
+        "min",
+        "max"
+      ],
+      "properties": {
+        "min": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "delayed_candle_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "missing_candle_probability": {
       "type": "number",
       "minimum": 0,
       "maximum": 1

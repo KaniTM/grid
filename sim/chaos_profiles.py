@@ -14,10 +14,15 @@ def default_chaos_profile() -> Dict[str, object]:
         "name": "baseline",
         "enabled": True,
         "seed": 42,
-        "latency_ms": {"mean": 120, "jitter": 40},
-        "spread_shock_bps": {"base": 3, "burst": 12},
+        "latency_ms": {"mean": 120, "jitter": 40, "fill_window_ms": 500},
+        "spread_shock_bps": {"base": 3, "burst": 12, "burst_probability": 0.2},
         "partial_fill_probability": 0.2,
+        "partial_fill_min_ratio": 0.3,
+        "partial_fill_max_ratio": 0.8,
         "reject_burst_probability": 0.1,
+        "reject_burst_bars": {"min": 1, "max": 3},
+        "delayed_candle_probability": 0.05,
+        "missing_candle_probability": 0.01,
         "data_gap_probability": 0.03,
     }
 
@@ -34,4 +39,3 @@ def load_chaos_profile(path: str) -> Dict[str, object]:
     if errors:
         raise ValueError("; ".join(errors[:3]))
     return payload
-

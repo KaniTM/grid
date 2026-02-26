@@ -28,6 +28,15 @@ Core fields:
 - `reject_burst_probability`
 - `data_gap_probability`
 
+Additional supported knobs:
+
+- `latency_ms.fill_window_ms`
+- `spread_shock_bps.burst_probability`
+- `partial_fill_min_ratio` / `partial_fill_max_ratio`
+- `reject_burst_bars.min` / `reject_burst_bars.max`
+- `delayed_candle_probability`
+- `missing_candle_probability`
+
 ## Validation expectations
 
 - Profile JSON must validate before replay starts.

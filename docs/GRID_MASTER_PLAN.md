@@ -2313,7 +2313,11 @@ Status values used:
    - `schemas/plan_signature.py`
    - `sim/chaos_profiles.py`
    - `data/data_quality_assessor.py`
-5. Complete chaos/stress perturbation harness contract from Sections 16/17 (`latency/spread shocks/partial fills/reject bursts/data gaps` as first-class profiles in replay path).
+5. [DONE 2026-02-26] Complete chaos/stress perturbation harness contract from Sections 16/17 (`latency/spread shocks/partial fills/reject bursts/data gaps` as first-class profiles in replay path).
+   - `simulate_grid_replay` now accepts validated chaos profiles with deterministic seeded perturbations for latency blocks, spread shocks, partial fills, reject bursts, delayed/missing candles, and data-gap drops.
+   - Replay summary now includes `chaos_profile_*` fields, perturbation counters, and deterministic-vs-chaos delta metrics.
+   - Replay CLI now supports `--chaos-profile` and schema-validated profile loading.
+   - Added dedicated replay harness coverage in `freqtrade/user_data/tests/test_chaos_replay_harness.py`.
 6. Complete strict golden replay and formal brain/simulator consistency suite coverage from Section 17.
 7. Complete depth-aware dynamic capacity cap enforcement (not only hint ingestion) from Sections 16/18.
 8. Complete full execution-cost lifecycle feedback loop (fill/order lifecycle standardization + calibration artifact discipline) from Sections 13/18.

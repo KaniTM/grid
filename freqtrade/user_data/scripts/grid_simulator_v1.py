@@ -1,13 +1,15 @@
 import argparse
 import json
 import os
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Deque, List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sim.chaos_profiles import load_chaos_profile, validate_chaos_profile
 
 SOURCE_PATH = Path(__file__).resolve()
 MODULE_NAME = "grid_simulator_v1"
@@ -372,6 +374,129 @@ def _safe_float(x, default=None):
         return float(x)
     except Exception:
         return default
+
+
+def _safe_int(x, default=None):
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def _clamp_probability(x: object, default: float = 0.0) -> float:
+    value = _safe_float(x, default=default)
+    if value is None:
+        return float(default)
+    return float(min(max(value, 0.0), 1.0))
+
+
+@dataclass
+class ChaosRuntimeConfig:
+    profile_id: str
+    name: str
+    enabled: bool
+    seed: int
+    latency_mean_ms: float
+    latency_jitter_ms: float
+    latency_fill_window_ms: float
+    spread_base_bps: float
+    spread_burst_bps: float
+    spread_burst_probability: float
+    partial_fill_probability: float
+    partial_fill_min_ratio: float
+    partial_fill_max_ratio: float
+    reject_burst_probability: float
+    reject_burst_min_bars: int
+    reject_burst_max_bars: int
+    delayed_candle_probability: float
+    missing_candle_probability: float
+    data_gap_probability: float
+
+
+def _build_chaos_runtime_config(profile: Optional[Dict]) -> Optional[ChaosRuntimeConfig]:
+    if not profile:
+        return None
+    payload = dict(profile)
+    errors = validate_chaos_profile(payload)
+    if errors:
+        raise ValueError(f"Invalid chaos profile: {errors[0]}")
+
+    enabled = bool(payload.get("enabled", True))
+    if not enabled:
+        return None
+
+    latency_cfg = payload.get("latency_ms", {}) or {}
+    latency_mean = _safe_float(latency_cfg.get("mean"), default=None)
+    if latency_mean is None:
+        latency_mean = _safe_float(latency_cfg.get("p50"), default=0.0)
+    latency_p95 = _safe_float(latency_cfg.get("p95"), default=None)
+    latency_jitter = _safe_float(latency_cfg.get("jitter"), default=None)
+    if latency_jitter is None:
+        if latency_p95 is None or latency_mean is None:
+            latency_jitter = 0.0
+        else:
+            latency_jitter = max(float(latency_p95) - float(latency_mean), 0.0)
+    latency_fill_window_ms = _safe_float(latency_cfg.get("fill_window_ms"), default=500.0)
+    if latency_fill_window_ms is None or latency_fill_window_ms <= 0:
+        latency_fill_window_ms = 500.0
+
+    spread_cfg = payload.get("spread_shock_bps", {}) or {}
+    spread_base_bps = _safe_float(
+        spread_cfg.get("base"),
+        default=_safe_float(spread_cfg.get("base_p50"), default=0.0),
+    )
+    spread_burst_bps = _safe_float(
+        spread_cfg.get("burst"),
+        default=_safe_float(spread_cfg.get("burst_p95"), default=0.0),
+    )
+    spread_burst_probability = _clamp_probability(spread_cfg.get("burst_probability"), default=0.0)
+
+    partial_fill_min_ratio = _safe_float(payload.get("partial_fill_min_ratio"), default=0.3)
+    partial_fill_max_ratio = _safe_float(payload.get("partial_fill_max_ratio"), default=0.8)
+    if partial_fill_min_ratio is None:
+        partial_fill_min_ratio = 0.3
+    if partial_fill_max_ratio is None:
+        partial_fill_max_ratio = 0.8
+    partial_fill_min_ratio = float(min(max(partial_fill_min_ratio, 0.0), 1.0))
+    partial_fill_max_ratio = float(min(max(partial_fill_max_ratio, 0.0), 1.0))
+    if partial_fill_max_ratio < partial_fill_min_ratio:
+        partial_fill_max_ratio = partial_fill_min_ratio
+
+    reject_burst_cfg = payload.get("reject_burst_bars", {}) or {}
+    reject_burst_min_bars = _safe_int(reject_burst_cfg.get("min"), default=1) or 1
+    reject_burst_max_bars = _safe_int(reject_burst_cfg.get("max"), default=3) or 3
+    reject_burst_min_bars = max(int(reject_burst_min_bars), 1)
+    reject_burst_max_bars = max(int(reject_burst_max_bars), reject_burst_min_bars)
+
+    return ChaosRuntimeConfig(
+        profile_id=str(payload.get("profile_id") or "chaos-profile"),
+        name=str(payload.get("name") or "chaos"),
+        enabled=True,
+        seed=_safe_int(payload.get("seed"), default=42) or 42,
+        latency_mean_ms=float(max(latency_mean or 0.0, 0.0)),
+        latency_jitter_ms=float(max(latency_jitter or 0.0, 0.0)),
+        latency_fill_window_ms=float(latency_fill_window_ms),
+        spread_base_bps=float(max(spread_base_bps or 0.0, 0.0)),
+        spread_burst_bps=float(max(spread_burst_bps or 0.0, 0.0)),
+        spread_burst_probability=spread_burst_probability,
+        partial_fill_probability=_clamp_probability(payload.get("partial_fill_probability"), default=0.0),
+        partial_fill_min_ratio=partial_fill_min_ratio,
+        partial_fill_max_ratio=partial_fill_max_ratio,
+        reject_burst_probability=_clamp_probability(payload.get("reject_burst_probability"), default=0.0),
+        reject_burst_min_bars=reject_burst_min_bars,
+        reject_burst_max_bars=reject_burst_max_bars,
+        delayed_candle_probability=_clamp_probability(payload.get("delayed_candle_probability"), default=0.0),
+        missing_candle_probability=_clamp_probability(payload.get("missing_candle_probability"), default=0.0),
+        data_gap_probability=_clamp_probability(payload.get("data_gap_probability"), default=0.0),
+    )
+
+
+def _uniform_int_inclusive(rng: np.random.Generator, low: int, high: int) -> int:
+    if high <= low:
+        return int(low)
+    return int(rng.integers(low, high + 1))
 
 
 def extract_rung_weights(plan: Dict, n_levels: int) -> Optional[List[float]]:
@@ -1101,6 +1226,8 @@ def simulate_grid_replay(
     tick_size: Optional[float] = None,
     max_orders_per_side: int = 40,
     close_on_stop: bool = False,
+    chaos_profile: Optional[Dict] = None,
+    include_deterministic_delta: bool = True,
 ) -> Dict:
     """
     Replay simulation across time-varying plan snapshots.
@@ -1154,6 +1281,32 @@ def simulate_grid_replay(
     last_effective_action_signature: Optional[Tuple] = None
     fill_guard = FillCooldownGuard(fill_cooldown_bars, fill_no_repeat_lsi_guard)
     active_fill_mode = _normalize_fill_mode(touch_fill, fill_confirmation_mode)
+    chaos_cfg = _build_chaos_runtime_config(chaos_profile)
+    chaos_rng = np.random.default_rng(chaos_cfg.seed) if chaos_cfg is not None else None
+    chaos_counters: Dict[str, int] = {
+        "bars_total": int(len(df)),
+        "bars_with_latency_block": 0,
+        "bars_with_spread_shock": 0,
+        "partial_fill_events": 0,
+        "bars_with_reject_burst": 0,
+        "rejected_fill_attempts": 0,
+        "delayed_candles": 0,
+        "missing_candles": 0,
+        "data_gap_candles": 0,
+        "dropped_candles_total": 0,
+    }
+    reject_burst_remaining = 0
+    fill_candle_queue: Deque[Tuple[int, Dict[str, float]]] = deque()
+    if chaos_cfg is not None:
+        events.append(
+            {
+                "ts": str(pd.Timestamp(df.iloc[0]["date"]).isoformat()),
+                "type": "CHAOS_PROFILE_APPLIED",
+                "profile_id": chaos_cfg.profile_id,
+                "profile_name": chaos_cfg.name,
+                "seed": int(chaos_cfg.seed),
+            }
+        )
 
     for bar_index, (_, row) in enumerate(df.iterrows()):
         dt = pd.Timestamp(row["date"])
@@ -1162,6 +1315,70 @@ def simulate_grid_replay(
         h = float(row["high"])
         l = float(row["low"])
         c = float(row["close"])
+        chaos_spread_shock_bps = 0.0
+        chaos_latency_ms = 0.0
+        chaos_latency_block = False
+        chaos_reject_active = False
+        chaos_data_gap = False
+        chaos_missing_candle = False
+        chaos_delayed_candle = False
+
+        if chaos_cfg is not None and chaos_rng is not None:
+            if reject_burst_remaining <= 0 and chaos_rng.random() < chaos_cfg.reject_burst_probability:
+                reject_burst_remaining = _uniform_int_inclusive(
+                    chaos_rng,
+                    chaos_cfg.reject_burst_min_bars,
+                    chaos_cfg.reject_burst_max_bars,
+                )
+            chaos_reject_active = reject_burst_remaining > 0
+            if chaos_reject_active:
+                chaos_counters["bars_with_reject_burst"] += 1
+
+            chaos_data_gap = bool(chaos_rng.random() < chaos_cfg.data_gap_probability)
+            if chaos_data_gap:
+                chaos_counters["data_gap_candles"] += 1
+                chaos_counters["dropped_candles_total"] += 1
+            else:
+                chaos_missing_candle = bool(chaos_rng.random() < chaos_cfg.missing_candle_probability)
+                if chaos_missing_candle:
+                    chaos_counters["missing_candles"] += 1
+                    chaos_counters["dropped_candles_total"] += 1
+                else:
+                    chaos_delayed_candle = bool(chaos_rng.random() < chaos_cfg.delayed_candle_probability)
+                    if chaos_delayed_candle:
+                        chaos_counters["delayed_candles"] += 1
+
+                    release_index = bar_index + (1 if chaos_delayed_candle else 0)
+                    fill_candle_queue.append(
+                        (
+                            int(release_index),
+                            {
+                                "open": o,
+                                "high": h,
+                                "low": l,
+                                "close": c,
+                            },
+                        )
+                    )
+
+            spread_burst = bool(chaos_rng.random() < chaos_cfg.spread_burst_probability)
+            chaos_spread_shock_bps = float(chaos_cfg.spread_base_bps)
+            if spread_burst:
+                chaos_spread_shock_bps += float(chaos_cfg.spread_burst_bps)
+            if chaos_spread_shock_bps > 0.0:
+                chaos_counters["bars_with_spread_shock"] += 1
+
+            chaos_latency_ms = max(
+                0.0,
+                float(chaos_rng.normal(chaos_cfg.latency_mean_ms, chaos_cfg.latency_jitter_ms)),
+            )
+            latency_probability = min(
+                max(chaos_latency_ms / max(chaos_cfg.latency_fill_window_ms, 1.0), 0.0),
+                1.0,
+            )
+            chaos_latency_block = bool(chaos_rng.random() < latency_probability)
+            if chaos_latency_block:
+                chaos_counters["bars_with_latency_block"] += 1
 
         switched = False
         while (plan_idx + 1) < len(plans):
@@ -1185,6 +1402,25 @@ def simulate_grid_replay(
                     "action": str(active_plan.get("action", "HOLD")).upper(),
                 }
             )
+
+        if chaos_cfg is not None:
+            if chaos_data_gap:
+                events.append({"ts": ts, "type": "CHAOS_DATA_GAP", "profile_id": chaos_cfg.profile_id})
+            elif chaos_missing_candle:
+                events.append({"ts": ts, "type": "CHAOS_MISSING_CANDLE", "profile_id": chaos_cfg.profile_id})
+            elif chaos_delayed_candle:
+                events.append({"ts": ts, "type": "CHAOS_DELAYED_CANDLE", "profile_id": chaos_cfg.profile_id})
+            if chaos_latency_block:
+                events.append(
+                    {
+                        "ts": ts,
+                        "type": "CHAOS_LATENCY_BLOCK",
+                        "profile_id": chaos_cfg.profile_id,
+                        "latency_ms": float(chaos_latency_ms),
+                    }
+                )
+            if chaos_reject_active:
+                events.append({"ts": ts, "type": "CHAOS_REJECT_BURST", "profile_id": chaos_cfg.profile_id})
 
         if active_plan is None:
             raw_action_counts["NO_PLAN"] += 1
@@ -1210,8 +1446,18 @@ def simulate_grid_replay(
                     "start_counterfactual_single": None,
                     "start_counterfactual_combo": None,
                     "start_counterfactual_required": "",
+                    "chaos_profile_id": chaos_cfg.profile_id if chaos_cfg is not None else None,
+                    "chaos_latency_block": bool(chaos_latency_block),
+                    "chaos_spread_shock_bps": float(chaos_spread_shock_bps),
+                    "chaos_reject_burst_active": bool(chaos_reject_active),
+                    "chaos_delayed_candle": bool(chaos_delayed_candle),
+                    "chaos_missing_candle": bool(chaos_missing_candle),
+                    "chaos_data_gap": bool(chaos_data_gap),
+                    "chaos_fill_queue_len": int(len(fill_candle_queue)),
                 }
             )
+            if chaos_reject_active and reject_burst_remaining > 0:
+                reject_burst_remaining -= 1
             continue
 
         active_mode = _normalize_router_mode(active_plan.get("mode"), default="unknown")
@@ -1402,6 +1648,14 @@ def simulate_grid_replay(
                     "mode_at_entry": mode_at_entry,
                     "mode_at_exit": mode_at_exit,
                     "stop_reason": stop_reason,
+                    "chaos_profile_id": chaos_cfg.profile_id if chaos_cfg is not None else None,
+                    "chaos_latency_block": bool(chaos_latency_block),
+                    "chaos_spread_shock_bps": float(chaos_spread_shock_bps),
+                    "chaos_reject_burst_active": bool(chaos_reject_active),
+                    "chaos_delayed_candle": bool(chaos_delayed_candle),
+                    "chaos_missing_candle": bool(chaos_missing_candle),
+                    "chaos_data_gap": bool(chaos_data_gap),
+                    "chaos_fill_queue_len": int(len(fill_candle_queue)),
                 }
             )
 
@@ -1409,6 +1663,8 @@ def simulate_grid_replay(
             last_effective_action_signature = action_signature(
                 "STOP", plan_sig, stop_reason or "PLAN_STOP"
             )
+            if chaos_reject_active and reject_burst_remaining > 0:
+                reject_burst_remaining -= 1
             continue
 
         if effective_action == "HOLD":
@@ -1484,96 +1740,184 @@ def simulate_grid_replay(
                     }
                 )
 
-        newly_filled: List[OrderSim] = []
+        fill_candle: Optional[Dict[str, float]]
+        if chaos_cfg is None:
+            fill_candle = {
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+            }
+        else:
+            fill_candle = None
+            if (not chaos_latency_block) and fill_candle_queue and fill_candle_queue[0][0] <= bar_index:
+                _, fill_candle = fill_candle_queue.popleft()
+
+        newly_filled: List[Tuple[str, int, float]] = []
         remaining: List[OrderSim] = []
-        buy_bounds = _touched_index_bounds(
-            levels,
-            side="buy",
-            o=o,
-            h=h,
-            l=l,
-            c=c,
-            mode=active_fill_mode,
-        )
-        sell_bounds = _touched_index_bounds(
-            levels,
-            side="sell",
-            o=o,
-            h=h,
-            l=l,
-            c=c,
-            mode=active_fill_mode,
-        )
+        if fill_candle is not None:
+            fo = float(fill_candle["open"])
+            fh = float(fill_candle["high"])
+            fl = float(fill_candle["low"])
+            fc = float(fill_candle["close"])
+            buy_bounds = _touched_index_bounds(
+                levels,
+                side="buy",
+                o=fo,
+                h=fh,
+                l=fl,
+                c=fc,
+                mode=active_fill_mode,
+            )
+            sell_bounds = _touched_index_bounds(
+                levels,
+                side="sell",
+                o=fo,
+                h=fh,
+                l=fl,
+                c=fc,
+                mode=active_fill_mode,
+            )
+            spread_shock_pct = float(max(chaos_spread_shock_bps, 0.0)) * 1e-4
 
-        for od in open_orders:
-            if od.status != "open":
-                continue
-            if od.level_index < 0 or od.level_index > n_levels:
-                remaining.append(od)
-                continue
-
-            if od.side == "buy":
-                if buy_bounds is None or not (buy_bounds[0] <= od.level_index <= buy_bounds[1]):
+            for od in open_orders:
+                if od.status not in ("open", "partial"):
+                    continue
+                if od.level_index < 0 or od.level_index > n_levels:
                     remaining.append(od)
                     continue
-                fill = _fill_trigger("buy", o, h, l, c, od.price, active_fill_mode)
-                if fill:
-                    if not fill_guard.allow("buy", od.level_index, bar_index):
-                        remaining.append(od)
-                        continue
-                    cost = od.qty_base * od.price
-                    fee_quote = cost * fee
-                    if quote >= cost + fee_quote:
-                        quote -= (cost + fee_quote)
-                        base += od.qty_base
-                        od.status = "filled"
-                        fills.append(FillSim(ts, "buy", od.price, od.qty_base, fee_quote, "FILL"))
-                        fill_guard.mark("buy", od.level_index, bar_index)
-                        _increment_reason(fill_mode_counts, active_mode, 1)
-                        _increment_reason(fill_mode_side_counts, f"buy|{active_mode}", 1)
-                        newly_filled.append(od)
-                    else:
-                        remaining.append(od)
-                else:
-                    remaining.append(od)
 
-            else:
-                if sell_bounds is None or not (sell_bounds[0] <= od.level_index <= sell_bounds[1]):
-                    remaining.append(od)
-                    continue
-                fill = _fill_trigger("sell", o, h, l, c, od.price, active_fill_mode)
-                if fill:
-                    if not fill_guard.allow("sell", od.level_index, bar_index):
+                if od.side == "buy":
+                    if buy_bounds is None or not (buy_bounds[0] <= od.level_index <= buy_bounds[1]):
                         remaining.append(od)
                         continue
-                    proceeds = od.qty_base * od.price
-                    fee_quote = proceeds * fee
-                    if base >= od.qty_base:
-                        base -= od.qty_base
-                        quote += (proceeds - fee_quote)
-                        od.status = "filled"
-                        fills.append(FillSim(ts, "sell", od.price, od.qty_base, fee_quote, "FILL"))
-                        fill_guard.mark("sell", od.level_index, bar_index)
-                        _increment_reason(fill_mode_counts, active_mode, 1)
-                        _increment_reason(fill_mode_side_counts, f"sell|{active_mode}", 1)
-                        newly_filled.append(od)
+                    trigger_price = float(od.price * (1.0 - spread_shock_pct))
+                    fill = _fill_trigger("buy", fo, fh, fl, fc, trigger_price, active_fill_mode)
+                    if fill:
+                        if chaos_reject_active:
+                            chaos_counters["rejected_fill_attempts"] += 1
+                            remaining.append(od)
+                            continue
+                        if not fill_guard.allow("buy", od.level_index, bar_index):
+                            remaining.append(od)
+                            continue
+                        fill_ratio = 1.0
+                        if chaos_cfg is not None and chaos_rng is not None:
+                            if chaos_rng.random() < chaos_cfg.partial_fill_probability:
+                                fill_ratio = float(
+                                    chaos_rng.uniform(
+                                        chaos_cfg.partial_fill_min_ratio,
+                                        chaos_cfg.partial_fill_max_ratio,
+                                    )
+                                )
+                        fill_qty = float(min(max(od.qty_base * fill_ratio, 0.0), od.qty_base))
+                        if fill_qty <= 0.0:
+                            remaining.append(od)
+                            continue
+                        cost = fill_qty * od.price
+                        fee_quote = cost * fee
+                        if quote >= cost + fee_quote:
+                            quote -= (cost + fee_quote)
+                            base += fill_qty
+                            is_partial = fill_qty < od.qty_base
+                            if is_partial:
+                                od.qty_base = float(max(od.qty_base - fill_qty, 0.0))
+                                od.status = "partial"
+                                remaining.append(od)
+                                chaos_counters["partial_fill_events"] += 1
+                            else:
+                                od.status = "filled"
+                            fills.append(
+                                FillSim(
+                                    ts,
+                                    "buy",
+                                    od.price,
+                                    fill_qty,
+                                    fee_quote,
+                                    "PARTIAL_FILL" if is_partial else "FILL",
+                                )
+                            )
+                            fill_guard.mark("buy", od.level_index, bar_index)
+                            _increment_reason(fill_mode_counts, active_mode, 1)
+                            _increment_reason(fill_mode_side_counts, f"buy|{active_mode}", 1)
+                            newly_filled.append(("buy", od.level_index, fill_qty))
+                        else:
+                            remaining.append(od)
                     else:
                         remaining.append(od)
+
                 else:
-                    remaining.append(od)
+                    if sell_bounds is None or not (sell_bounds[0] <= od.level_index <= sell_bounds[1]):
+                        remaining.append(od)
+                        continue
+                    trigger_price = float(od.price * (1.0 + spread_shock_pct))
+                    fill = _fill_trigger("sell", fo, fh, fl, fc, trigger_price, active_fill_mode)
+                    if fill:
+                        if chaos_reject_active:
+                            chaos_counters["rejected_fill_attempts"] += 1
+                            remaining.append(od)
+                            continue
+                        if not fill_guard.allow("sell", od.level_index, bar_index):
+                            remaining.append(od)
+                            continue
+                        fill_ratio = 1.0
+                        if chaos_cfg is not None and chaos_rng is not None:
+                            if chaos_rng.random() < chaos_cfg.partial_fill_probability:
+                                fill_ratio = float(
+                                    chaos_rng.uniform(
+                                        chaos_cfg.partial_fill_min_ratio,
+                                        chaos_cfg.partial_fill_max_ratio,
+                                    )
+                                )
+                        fill_qty = float(min(max(od.qty_base * fill_ratio, 0.0), od.qty_base))
+                        if fill_qty <= 0.0:
+                            remaining.append(od)
+                            continue
+                        proceeds = fill_qty * od.price
+                        fee_quote = proceeds * fee
+                        if base >= fill_qty:
+                            base -= fill_qty
+                            quote += (proceeds - fee_quote)
+                            is_partial = fill_qty < od.qty_base
+                            if is_partial:
+                                od.qty_base = float(max(od.qty_base - fill_qty, 0.0))
+                                od.status = "partial"
+                                remaining.append(od)
+                                chaos_counters["partial_fill_events"] += 1
+                            else:
+                                od.status = "filled"
+                            fills.append(
+                                FillSim(
+                                    ts,
+                                    "sell",
+                                    od.price,
+                                    fill_qty,
+                                    fee_quote,
+                                    "PARTIAL_FILL" if is_partial else "FILL",
+                                )
+                            )
+                            fill_guard.mark("sell", od.level_index, bar_index)
+                            _increment_reason(fill_mode_counts, active_mode, 1)
+                            _increment_reason(fill_mode_side_counts, f"sell|{active_mode}", 1)
+                            newly_filled.append(("sell", od.level_index, fill_qty))
+                        else:
+                            remaining.append(od)
+                    else:
+                        remaining.append(od)
+        else:
+            remaining.extend(open_orders)
 
         open_orders = remaining
 
-        for od in newly_filled:
-            i = od.level_index
-            if od.side == "buy":
-                if i + 1 <= n_levels:
-                    sell_px = float(levels[i + 1])
-                    open_orders.append(OrderSim("sell", sell_px, od.qty_base, i + 1))
+        for side, level_index, fill_qty in newly_filled:
+            if side == "buy":
+                if level_index + 1 <= n_levels:
+                    sell_px = float(levels[level_index + 1])
+                    open_orders.append(OrderSim("sell", sell_px, fill_qty, level_index + 1))
             else:
-                if i - 1 >= 0 and i - 1 <= n_levels:
-                    buy_px = float(levels[i - 1])
-                    open_orders.append(OrderSim("buy", buy_px, od.qty_base, i - 1))
+                if level_index - 1 >= 0 and level_index - 1 <= n_levels:
+                    buy_px = float(levels[level_index - 1])
+                    open_orders.append(OrderSim("buy", buy_px, fill_qty, level_index - 1))
 
         curve.append(
             {
@@ -1594,11 +1938,21 @@ def simulate_grid_replay(
                 "start_counterfactual_single": cf_single,
                 "start_counterfactual_combo": cf_combo,
                 "start_counterfactual_required": cf_required_text,
+                "chaos_profile_id": chaos_cfg.profile_id if chaos_cfg is not None else None,
+                "chaos_latency_block": bool(chaos_latency_block),
+                "chaos_spread_shock_bps": float(chaos_spread_shock_bps),
+                "chaos_reject_burst_active": bool(chaos_reject_active),
+                "chaos_delayed_candle": bool(chaos_delayed_candle),
+                "chaos_missing_candle": bool(chaos_missing_candle),
+                "chaos_data_gap": bool(chaos_data_gap),
+                "chaos_fill_queue_len": int(len(fill_candle_queue)),
             }
         )
 
         prev_plan = active_plan
         last_effective_action_signature = action_signature(effective_action, plan_sig)
+        if chaos_reject_active and reject_burst_remaining > 0:
+            reject_burst_remaining -= 1
 
     last_close = float(df.iloc[-1]["close"])
     equity = quote + base * last_close
@@ -1613,52 +1967,99 @@ def simulate_grid_replay(
         combined_stop_reason_counts[ek] = int(combined_stop_reason_counts.get(ek, 0)) + int(v)
     combined_stop_reason_counts = _sorted_reason_counts(combined_stop_reason_counts)
 
+    chaos_counters_out = {k: int(v) for k, v in sorted(chaos_counters.items())}
+    chaos_counters_out["pending_fill_candles"] = int(len(fill_candle_queue))
+    summary = {
+        "mode": "replay",
+        "start_quote": start_quote,
+        "start_base": start_base,
+        "end_quote": quote,
+        "end_base": base,
+        "first_close": float(first_close),
+        "last_close": last_close,
+        "equity": equity,
+        "initial_equity": float(initial_equity),
+        "pnl_quote": float(equity - initial_equity),
+        "pnl_pct": float((equity / initial_equity - 1.0) * 100.0) if initial_equity > 0 else 0.0,
+        "maker_fee_pct": maker_fee_pct,
+        "stop_out_steps": stop_out_steps,
+        "touch_fill": touch_fill,
+        "fill_confirmation_mode": active_fill_mode,
+        "fill_cooldown_bars": int(fill_guard.cooldown_bars),
+        "fill_no_repeat_lsi_guard": bool(fill_guard.no_repeat_lsi_guard),
+        "close_on_stop": bool(close_on_stop),
+        "plans_total": int(len(plans)),
+        "plans_switched": int(plan_switch_count),
+        "actions": effective_action_counts,
+        "raw_actions": raw_action_counts,
+        "effective_actions": effective_action_counts,
+        "mode_plan_counts": _sorted_reason_counts(mode_plan_counts),
+        "mode_desired_counts": _sorted_reason_counts(mode_desired_counts),
+        "raw_action_mode_counts": _sorted_reason_counts(raw_action_mode_counts),
+        "effective_action_mode_counts": _sorted_reason_counts(effective_action_mode_counts),
+        "fill_mode_counts": _sorted_reason_counts(fill_mode_counts),
+        "fill_mode_side_counts": _sorted_reason_counts(fill_mode_side_counts),
+        "action_suppression_counts": _sorted_reason_counts(action_suppression_counts),
+        "action_suppressed_total": int(sum(action_suppression_counts.values())),
+        "stop_events": int(stop_count),
+        "seed_events": int(seed_count),
+        "rebuild_events": int(rebuild_count),
+        "soft_adjust_events": int(soft_adjust_count),
+        "close_on_stop_events": int(close_on_stop_count),
+        "start_blocker_counts": _sorted_reason_counts(start_blocker_counts),
+        "start_counterfactual_single_counts": _sorted_reason_counts(start_counterfactual_single_counts),
+        "start_counterfactual_combo_counts": _sorted_reason_counts(start_counterfactual_combo_counts),
+        "hold_reason_counts": _sorted_reason_counts(hold_reason_counts),
+        "stop_reason_counts": stop_reason_counts_sorted,
+        "stop_event_reason_counts": stop_event_reason_counts_sorted,
+        "stop_reason_counts_combined": combined_stop_reason_counts,
+        "chaos_profile_enabled": bool(chaos_cfg is not None),
+        "chaos_profile_id": chaos_cfg.profile_id if chaos_cfg is not None else None,
+        "chaos_profile_name": chaos_cfg.name if chaos_cfg is not None else None,
+        "chaos_seed": int(chaos_cfg.seed) if chaos_cfg is not None else None,
+        "chaos_counters": chaos_counters_out if chaos_cfg is not None else {},
+    }
+
+    if chaos_cfg is not None and include_deterministic_delta:
+        try:
+            baseline_res = simulate_grid_replay(
+                df=df,
+                plans=plans,
+                start_quote=start_quote,
+                start_base=start_base,
+                maker_fee_pct=maker_fee_pct,
+                stop_out_steps=stop_out_steps,
+                touch_fill=touch_fill,
+                fill_confirmation_mode=fill_confirmation_mode,
+                fill_cooldown_bars=fill_cooldown_bars,
+                fill_no_repeat_lsi_guard=fill_no_repeat_lsi_guard,
+                tick_size=tick_size,
+                max_orders_per_side=max_orders_per_side,
+                close_on_stop=close_on_stop,
+                chaos_profile=None,
+                include_deterministic_delta=False,
+            )
+            baseline_summary = baseline_res.get("summary", {}) or {}
+            summary["deterministic_baseline"] = {
+                "pnl_pct": float(baseline_summary.get("pnl_pct", 0.0)),
+                "pnl_quote": float(baseline_summary.get("pnl_quote", 0.0)),
+                "fills_total": int(len(baseline_res.get("fills", []) or [])),
+                "stop_events": int(baseline_summary.get("stop_events", 0)),
+                "action_suppressed_total": int(baseline_summary.get("action_suppressed_total", 0)),
+            }
+            summary["deterministic_vs_chaos_delta"] = {
+                "pnl_pct_delta": float(summary["pnl_pct"]) - float(baseline_summary.get("pnl_pct", 0.0)),
+                "pnl_quote_delta": float(summary["pnl_quote"]) - float(baseline_summary.get("pnl_quote", 0.0)),
+                "fills_total_delta": int(len(fills)) - int(len(baseline_res.get("fills", []) or [])),
+                "stop_events_delta": int(summary["stop_events"]) - int(baseline_summary.get("stop_events", 0)),
+                "action_suppressed_total_delta": int(summary["action_suppressed_total"])
+                - int(baseline_summary.get("action_suppressed_total", 0)),
+            }
+        except Exception as exc:
+            summary["deterministic_baseline_error"] = str(exc)
+
     return {
-        "summary": {
-            "mode": "replay",
-            "start_quote": start_quote,
-            "start_base": start_base,
-            "end_quote": quote,
-            "end_base": base,
-            "first_close": float(first_close),
-            "last_close": last_close,
-            "equity": equity,
-            "initial_equity": float(initial_equity),
-            "pnl_quote": float(equity - initial_equity),
-            "pnl_pct": float((equity / initial_equity - 1.0) * 100.0) if initial_equity > 0 else 0.0,
-            "maker_fee_pct": maker_fee_pct,
-            "stop_out_steps": stop_out_steps,
-            "touch_fill": touch_fill,
-            "fill_confirmation_mode": active_fill_mode,
-            "fill_cooldown_bars": int(fill_guard.cooldown_bars),
-            "fill_no_repeat_lsi_guard": bool(fill_guard.no_repeat_lsi_guard),
-            "close_on_stop": bool(close_on_stop),
-            "plans_total": int(len(plans)),
-            "plans_switched": int(plan_switch_count),
-            "actions": effective_action_counts,
-            "raw_actions": raw_action_counts,
-            "effective_actions": effective_action_counts,
-            "mode_plan_counts": _sorted_reason_counts(mode_plan_counts),
-            "mode_desired_counts": _sorted_reason_counts(mode_desired_counts),
-            "raw_action_mode_counts": _sorted_reason_counts(raw_action_mode_counts),
-            "effective_action_mode_counts": _sorted_reason_counts(effective_action_mode_counts),
-            "fill_mode_counts": _sorted_reason_counts(fill_mode_counts),
-            "fill_mode_side_counts": _sorted_reason_counts(fill_mode_side_counts),
-            "action_suppression_counts": _sorted_reason_counts(action_suppression_counts),
-            "action_suppressed_total": int(sum(action_suppression_counts.values())),
-            "stop_events": int(stop_count),
-            "seed_events": int(seed_count),
-            "rebuild_events": int(rebuild_count),
-            "soft_adjust_events": int(soft_adjust_count),
-            "close_on_stop_events": int(close_on_stop_count),
-            "start_blocker_counts": _sorted_reason_counts(start_blocker_counts),
-            "start_counterfactual_single_counts": _sorted_reason_counts(start_counterfactual_single_counts),
-            "start_counterfactual_combo_counts": _sorted_reason_counts(start_counterfactual_combo_counts),
-            "hold_reason_counts": _sorted_reason_counts(hold_reason_counts),
-            "stop_reason_counts": stop_reason_counts_sorted,
-            "stop_event_reason_counts": stop_event_reason_counts_sorted,
-            "stop_reason_counts_combined": combined_stop_reason_counts,
-        },
+        "summary": summary,
         "fills": [asdict(x) for x in fills],
         "open_orders": [asdict(x) for x in open_orders],
         "curve": curve,
@@ -1681,6 +2082,11 @@ def main():
     ap.add_argument("--plan", required=True, help="plan json path (grid_plan.latest.json)")
     ap.add_argument("--replay-plans", action="store_true", help="Replay archived plan snapshots over candle time")
     ap.add_argument("--plans-dir", default=None, help="Directory with archived grid_plan.*.json files (optional)")
+    ap.add_argument(
+        "--chaos-profile",
+        default=None,
+        help="Optional chaos profile JSON for replay perturbations (validated against schemas/chaos_profile.schema.json)",
+    )
     ap.add_argument("--timerange", default=None, help="YYYYMMDD-YYYYMMDD (optional)")
     ap.add_argument("--start-at", default=None, help="Start time: 'plan' or YYYYMMDD or YYYYMMDDHHMM or ISO timestamp")
     ap.add_argument("--start-quote", type=float, default=1000.0)
@@ -1702,6 +2108,7 @@ def main():
 
     plan = load_plan(args.plan)
     plan_sequence: Optional[List[Dict]] = None
+    chaos_profile: Optional[Dict] = None
 
     if "range" not in plan or "grid" not in plan:
         raise KeyError(
@@ -1722,6 +2129,9 @@ def main():
         plan_sequence = load_plan_sequence(args.plan, args.plans_dir)
         if not plan_sequence:
             raise ValueError("Replay mode requested but no valid plan snapshots were loaded.")
+
+    if args.chaos_profile:
+        chaos_profile = load_chaos_profile(args.chaos_profile)
 
     box_low = float(plan["range"]["low"])
     box_high = float(plan["range"]["high"])
@@ -1789,8 +2199,11 @@ def main():
             tick_size=tick_size,
             max_orders_per_side=args.max_orders_per_side,
             close_on_stop=args.close_on_stop,
+            chaos_profile=chaos_profile,
         )
     else:
+        if chaos_profile is not None:
+            print("[WARN] --chaos-profile is ignored unless --replay-plans is enabled.", flush=True)
         res = simulate_grid(
             df=df,
             box_low=box_low,
