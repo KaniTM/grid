@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/decision_log.schema.json",
+  "title": "Planner Decision Log Row",
+  "type": "object",
+  "required": [
+    "timestamp",
+    "pair",
+    "mode_candidate",
+    "mode_final",
+    "action",
+    "blockers",
+    "key_features_snapshot",
+    "box_grid_params",
+    "start_stability",
+    "meta_drift",
+    "planner_health",
+    "replan_decision",
+    "replan_reasons",
+    "prev_plan_hash",
+    "new_plan_hash",
+    "changed_fields",
+    "event_ids_emitted"
+  ],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "pair": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode_candidate": {
+      "type": "string"
+    },
+    "mode_final": {
+      "type": "string"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "START",
+        "HOLD",
+        "STOP",
+        "REBUILD"
+      ]
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "key_features_snapshot": {
+      "type": "object"
+    },
+    "box_grid_params": {
+      "type": "object"
+    },
+    "start_stability": {
+      "type": "object"
+    },
+    "meta_drift": {
+      "type": "object"
+    },
+    "planner_health": {
+      "type": "object"
+    },
+    "replan_decision": {
+      "type": "string"
+    },
+    "replan_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "prev_plan_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "new_plan_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "changed_fields": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "event_ids_emitted": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

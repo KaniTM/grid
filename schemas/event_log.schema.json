@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/event_log.schema.json",
+  "title": "Event Log Row",
+  "type": "object",
+  "required": [
+    "event_id",
+    "ts",
+    "pair",
+    "event_type",
+    "severity",
+    "source_module",
+    "price",
+    "side",
+    "metadata"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "pair": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "advisory",
+        "soft",
+        "hard"
+      ]
+    },
+    "source_module": {
+      "type": "string",
+      "minLength": 1
+    },
+    "price": {
+      "type": "number"
+    },
+    "side": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

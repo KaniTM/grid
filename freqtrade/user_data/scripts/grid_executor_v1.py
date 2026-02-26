@@ -10,6 +10,7 @@ from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from core.plan_signature import compute_plan_hash, plan_is_expired, plan_pair, validate_signature_fields
+from core.schema_validation import validate_schema
 
 try:
     import ccxt  # optional, only needed for --mode ccxt
@@ -727,6 +728,11 @@ class GridExecutorV1:
     def _validate_plan_intake(self, plan: Dict) -> Tuple[bool, Optional[str]]:
         if not isinstance(plan, dict):
             self._reject_plan_intake({}, "EXEC_PLAN_SCHEMA_INVALID", "plan_not_object")
+            return False, "EXEC_PLAN_SCHEMA_INVALID"
+
+        schema_errors = validate_schema(plan, "grid_plan.schema.json")
+        if schema_errors:
+            self._reject_plan_intake(plan, "EXEC_PLAN_SCHEMA_INVALID", ",".join(schema_errors[:3]))
             return False, "EXEC_PLAN_SCHEMA_INVALID"
 
         schema_errors = validate_signature_fields(plan)

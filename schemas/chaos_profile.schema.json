@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/chaos_profile.schema.json",
+  "title": "Chaos Replay Profile",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile_id",
+    "name",
+    "enabled",
+    "seed",
+    "latency_ms",
+    "spread_shock_bps",
+    "partial_fill_probability",
+    "reject_burst_probability",
+    "data_gap_probability"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "profile_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "seed": {
+      "type": "integer"
+    },
+    "latency_ms": {
+      "type": "object",
+      "required": [
+        "mean",
+        "jitter"
+      ],
+      "properties": {
+        "mean": {
+          "type": "number",
+          "minimum": 0
+        },
+        "jitter": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "spread_shock_bps": {
+      "type": "object",
+      "required": [
+        "base",
+        "burst"
+      ],
+      "properties": {
+        "base": {
+          "type": "number",
+          "minimum": 0
+        },
+        "burst": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "partial_fill_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reject_burst_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "data_gap_probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "notes": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

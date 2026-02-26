@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/grid_plan.schema.json",
+  "title": "Grid Plan",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "planner_version",
+    "pair",
+    "exchange",
+    "plan_id",
+    "decision_seq",
+    "plan_hash",
+    "generated_at",
+    "valid_for_candle_ts",
+    "materiality_class",
+    "replan_decision",
+    "replan_reasons",
+    "action",
+    "mode",
+    "action_reason",
+    "blockers",
+    "planner_health_state",
+    "range_diagnostics",
+    "box",
+    "grid",
+    "risk",
+    "signals_snapshot",
+    "runtime_hints",
+    "start_stability_score",
+    "meta_drift_state",
+    "cost_model_snapshot",
+    "module_states",
+    "capital_policy",
+    "update_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "planner_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "pair": {
+      "type": "string",
+      "minLength": 1
+    },
+    "exchange": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "decision_seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "plan_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "valid_for_candle_ts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "supersedes_plan_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "materiality_class": {
+      "type": "string",
+      "enum": [
+        "noop",
+        "soft",
+        "material",
+        "hardstop"
+      ]
+    },
+    "replan_decision": {
+      "type": "string",
+      "enum": [
+        "publish",
+        "defer"
+      ]
+    },
+    "replan_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "START",
+        "HOLD",
+        "STOP",
+        "REBUILD"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "planner_health_state": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "degraded",
+        "quarantine"
+      ]
+    },
+    "range_diagnostics": {
+      "type": "object"
+    },
+    "box": {
+      "type": "object",
+      "required": [
+        "low",
+        "high",
+        "mid",
+        "width_pct"
+      ],
+      "properties": {
+        "low": {
+          "type": "number"
+        },
+        "high": {
+          "type": "number"
+        },
+        "mid": {
+          "type": "number"
+        },
+        "width_pct": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "grid": {
+      "type": "object",
+      "required": [
+        "n_levels",
+        "step_price"
+      ],
+      "properties": {
+        "n_levels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "step_price": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "risk": {
+      "type": "object",
+      "required": [
+        "tp_price",
+        "sl_price"
+      ],
+      "properties": {
+        "tp_price": {
+          "type": "number"
+        },
+        "sl_price": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "signals_snapshot": {
+      "type": "object"
+    },
+    "runtime_hints": {
+      "type": "object"
+    },
+    "start_stability_score": {
+      "type": "number"
+    },
+    "meta_drift_state": {
+      "type": "object"
+    },
+    "cost_model_snapshot": {
+      "type": "object"
+    },
+    "module_states": {
+      "type": "object"
+    },
+    "capital_policy": {
+      "type": "object"
+    },
+    "update_policy": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

@@ -24,6 +24,7 @@ from core.atomic_json import write_json_atomic
 from technical import qtpylib
 from core.enums import BlockReason, MaterialityClass, StopReason, WarningCode
 from core.plan_signature import PLAN_SCHEMA_VERSION, PLANNER_VERSION_DEFAULT, compute_plan_hash
+from core.schema_validation import validate_schema
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
 REQUIRED_OHLC_COLUMNS = ("date", "open", "high", "low", "close", "volume")
@@ -2490,6 +2491,11 @@ class GridBrainV1Core(IStrategy):
 
         latest_path = os.path.join(out_dir, "grid_plan.latest.json")
         archive_path = os.path.join(out_dir, f"grid_plan.{ts_safe}.json")
+
+        schema_errors = validate_schema(plan, "grid_plan.schema.json")
+        if schema_errors:
+            summary = "; ".join(schema_errors[:3])
+            raise ValueError(f"grid_plan schema validation failed: {summary}")
 
         payload_hash = str(plan.get("plan_hash") or "").strip()
         if not payload_hash:

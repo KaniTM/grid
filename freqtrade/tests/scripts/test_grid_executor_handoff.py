@@ -111,3 +111,15 @@ def test_executor_rejects_duplicate_stale_and_hash_mismatch(tmp_path: Path) -> N
     payload = _state_payload(state_path)
     assert payload["last_applied_seq"] == 2
     assert "EXEC_PLAN_HASH_MISMATCH" in payload["runtime"]["exec_events"]
+
+
+def test_executor_rejects_schema_invalid_plan(tmp_path: Path) -> None:
+    state_path = tmp_path / "executor.state.json"
+    ex = _build_executor(state_path)
+    invalid = _base_plan(seq=1)
+    invalid.pop("box")
+
+    ex.step(invalid)
+    payload = _state_payload(state_path)
+    assert payload["last_applied_seq"] == 0
+    assert "EXEC_PLAN_SCHEMA_INVALID" in payload["runtime"]["exec_events"]

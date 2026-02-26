@@ -2274,8 +2274,8 @@ Status values used:
 
 ### P0 (highest) - correctness contract and schema completion
 
-1. Complete full Section 14/19 handoff contract:
-   - missing required plan signature fields in published plan payloads:
+1. [DONE 2026-02-26] Complete full Section 14/19 handoff contract:
+   - required plan signature fields are now published:
      - `schema_version`
      - `planner_version`
      - `pair`
@@ -2287,8 +2287,8 @@ Status values used:
      - `materiality_class`
      - `replan_decision`
      - `replan_reasons`
-   - complete executor stale/duplicate rejection using signature (`plan_id`/`decision_seq`)
-2. Create missing Section 21 must-have docs/schemas:
+   - executor stale/duplicate rejection now enforced via signature (`plan_id`/`decision_seq`) plus hash and expiry checks
+2. [DONE 2026-02-26] Create missing Section 21 must-have docs/schemas:
    - `docs/REPLAN_POLICY_AND_MATERIALITY.md`
    - `docs/ATOMIC_PLAN_HANDOFF.md`
    - `docs/STRESS_REPLAY_PROFILES.md`
@@ -2296,7 +2296,7 @@ Status values used:
    - `schemas/grid_plan.schema.json`
    - `schemas/execution_cost_calibration.schema.json`
    - `schemas/chaos_profile.schema.json`
-3. Create missing Section 21 strongly recommended schemas:
+3. [DONE 2026-02-26] Create missing Section 21 strongly recommended schemas:
    - `schemas/decision_log.schema.json`
    - `schemas/event_log.schema.json`
 

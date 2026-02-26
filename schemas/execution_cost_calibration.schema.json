@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schemas/execution_cost_calibration.schema.json",
+  "title": "Execution Cost Calibration Artifact",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "pair",
+    "window",
+    "sample_count",
+    "cost_model_source",
+    "percentile",
+    "realized_spread_pct",
+    "adverse_selection_pct",
+    "post_only_retry_reject_rate",
+    "missed_fill_opportunity_rate",
+    "recommended_cost_floor_bps"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "pair": {
+      "type": "string",
+      "minLength": 1
+    },
+    "window": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sample_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cost_model_source": {
+      "type": "string",
+      "enum": [
+        "static",
+        "empirical"
+      ]
+    },
+    "percentile": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "realized_spread_pct": {
+      "type": "number",
+      "minimum": 0
+    },
+    "adverse_selection_pct": {
+      "type": "number",
+      "minimum": 0
+    },
+    "post_only_retry_reject_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "missed_fill_opportunity_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "recommended_cost_floor_bps": {
+      "type": "number",
+      "minimum": 0
+    },
+    "market_state_bucket": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}
