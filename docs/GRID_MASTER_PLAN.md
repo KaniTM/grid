@@ -2184,74 +2184,125 @@ This is the intended path to a system that is not only feature-rich, but **stabl
 
 ---
 
-# 26) Comprehensive DONE / TODO Audit (code-verified)
+# 26) DONE / TODO Audit (Scope: lines 1-2185)
 
 Audit date: **2026-02-26**  
-Scope: this section reconciles `docs/GRID_MASTER_PLAN.md` against actual repository code/tests/scripts.
+Audit scope: **only** the original master plan body (`docs/GRID_MASTER_PLAN.md` lines 1-2185), matched against actual code/tests/scripts in this repo.
+
+Status values used:
+- `DONE`: implemented and wired in runnable code
+- `PARTIAL`: implemented in part, but missing part of the documented contract
+- `NOT_IMPLEMENTED`: not present yet
+- `DOC_ONLY`: planning/governance text section (no direct code implementation target)
 
 ---
 
 ## 26.1 DONE
 
-### 26.1.1 End-to-end milestones completed
+### 26.1.1 Section-by-section status for lines 1-2185
 
-- Deterministic planner core, simulator, and paper executor are implemented and wired.
-- Step 12 (live execution hardening) is implemented (maker-first retries/backoff, reject-burst handling, confirm hooks, reconcile controls, recovery rails).
-- Step 13 (formal tuning protocol) is implemented (manifest/champion registry/walk-forward+ablation automation/OOS+chaos gates).
-- Step 14 (ML confidence overlay, non-primary) is implemented (leakage-safe labels, ML walk-forward eval, confidence-only integration, det-vs-ML OOS compare).
-- Step 6 Meta Drift Guard is implemented including dedicated synthetic replay validation.
-- Test stack is active; `freqtrade/user_data/tests` passes both standard and xdist mode.
+- `Section 0) How to Use This File` -> `DOC_ONLY`
+- `Section 1) Purpose and Scope` -> `DOC_ONLY`
+- `Section 2) System Architecture` -> `DONE` (Brain/Simulator/Executor present; ML overlay present as confidence-only)
+- `Section 3) Global Invariants` -> `PARTIAL` (determinism + brain/sim parity largely implemented; full handoff/idempotency signature contract still incomplete)
+- `Section 4) Core Data Model` -> `PARTIAL` (core plan payload exists; full Section 19 signature/schema completeness not finished)
+- `Section 5) Planner Health State` -> `DONE`
+- `Section 6) Planner Decision Loop` -> `DONE`
+- `Section 7) Replan Policy + Materiality` -> `DONE`
+- `Section 8) Global Start Stability Score` -> `DONE`
+- `Section 9) Volatility Policy Adapter` -> `PARTIAL`
+- `Section 10) Meta Drift Guard` -> `DONE`
+- `Section 11) Phase-2 Regime Filters and Build Gates` -> `PARTIAL` (core set done; boom/doom still missing)
+- `Section 12) Phase-3 Box Builder` -> `PARTIAL` (core done; specific sub-policies still missing)
+- `Section 13) Phase-4 Grid Sizing/START/Targets/Risk` -> `DONE`
+- `Section 14) Brain->Executor Handoff Contract` -> `PARTIAL` (atomic write done; full plan signature + idempotent consume contract incomplete)
+- `Section 15) Monitoring/STOP/REBUILD Runtime Rails` -> `PARTIAL`
+- `Section 16) Executor Design` -> `PARTIAL`
+- `Section 17) Testing/Replay/Tuning/Anti-overfit` -> `PARTIAL`
+- `Section 18) Module Registry` -> `PARTIAL` overall (mixed DONE/PARTIAL/NOT_IMPLEMENTED by module)
+- `Section 19) Plan/State/Log Schemas` -> `PARTIAL` (schemas and key fields not fully complete)
+- `Section 20) Implementation Sequence` -> `PARTIAL` (Steps 12/13/14 done; several earlier sequence expectations still partial)
+- `Section 21) Repo Files to Create` -> `PARTIAL` (several files still missing)
+- `Section 22) Codex Working Rules` -> `DOC_ONLY`
+- `Section 23) Complexity Control Rule` -> `DOC_ONLY`
+- `Section 24) Audit Template` -> `DOC_ONLY` (template remains as template)
+- `Section 25) Final Notes` -> `DOC_ONLY`
 
-### 26.1.2 Module registry items implemented (complete list)
+### 26.1.2 Implementation sequence status (Section 20)
 
-- **18.A Core/ Governance:** `M001`, `M003`, `M004`, `M005`, `M007`
-- **18.B Regime / Build gates:** `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
-- **18.C Box builder:** `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
-- **18.D Grid / targets / risk:** `M301`, `M302`, `M303`, `M304`, `M305`
-- **18.E Monitoring/runtime:** `M401`, `M402`, `M403`, `M405`
-- **18.F VP / VAP family:** `M501`, `M503`, `M504`
-- **18.G FVG stack:** `M602`, `M603`, `M604`, `M605`, `M607`
-- **18.H Channels:** `M701`
-- **18.I MRVD / basis / VWAP:** `M802`, `M803`, `M804`, `M806`
-- **18.J CVD family:** `M901`, `M902`
-- **18.K Execution/Ops:** `M1001`, `M1002`, `M1007`, `M1008`
+- `Step 1` -> `PARTIAL`
+- `Step 2` -> `PARTIAL`
+- `Step 3` -> `PARTIAL`
+- `Step 4` -> `PARTIAL`
+- `Step 5` -> `PARTIAL`
+- `Step 6` -> `DONE`
+- `Step 7` -> `DONE`
+- `Step 8` -> `DONE`
+- `Step 9` -> `PARTIAL`
+- `Step 10` -> `PARTIAL`
+- `Step 11` -> `PARTIAL`
+- `Step 12` -> `DONE`
+- `Step 13` -> `DONE`
+- `Step 14` -> `DONE`
 
-### 26.1.3 Section-21 file checklist implemented
+### 26.1.3 Module registry items that are DONE (complete list)
 
-- Implemented from must-have/strongly-recommended lists:
-  - `docs/GRID_MASTER_PLAN.md`
-  - `docs/DECISION_REASON_CODES.md`
-  - `core/enums.py`
-  - `experiments/manifest.yaml`
-  - `experiments/champions.json`
-  - `experiments/metrics_schema.json`
+- `M001`, `M003`, `M004`, `M005`
+- `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
+- `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
+- `M301`, `M302`, `M303`, `M304`, `M305`
+- `M401`, `M402`, `M403`, `M405`
+- `M501`, `M503`, `M504`
+- `M602`, `M603`, `M604`, `M605`, `M607`
+- `M701`
+- `M801`, `M802`, `M803`, `M804`, `M806`
+- `M901`, `M902`
+- `M1001`, `M1002`, `M1007`, `M1008`
+
+### 26.1.4 Section 21 file checklist that is DONE
+
+- `docs/GRID_MASTER_PLAN.md`
+- `docs/DECISION_REASON_CODES.md`
+- `core/enums.py`
+- `experiments/manifest.yaml`
+- `experiments/champions.json`
+- `experiments/metrics_schema.json`
 
 ---
 
 ## 26.2 TODO (ordered by importance)
 
-### 26.2.1 Critical contract/schema gaps (highest priority)
+### P0 (highest) - correctness contract and schema completion
 
-1. **Section 14 + Section 19 contract completion**
-   - Implement full plan-signature contract fields in live plan output:
-     - `schema_version`, `planner_version`, `pair`, `plan_id`, `decision_seq`, `plan_hash`, `generated_at`, `valid_for_candle_ts`, `materiality_class`, `replan_decision`, `replan_reasons`
-   - Add executor-side idempotent apply logic using `plan_id`/`decision_seq` (reject duplicate/stale plans deterministically).
-   - Current state: atomic write exists, but full signature/idempotency contract is incomplete.
+1. Complete full Section 14/19 handoff contract:
+   - missing required plan signature fields in published plan payloads:
+     - `schema_version`
+     - `planner_version`
+     - `pair`
+     - `plan_id`
+     - `decision_seq`
+     - `plan_hash`
+     - `generated_at`
+     - `valid_for_candle_ts`
+     - `materiality_class`
+     - `replan_decision`
+     - `replan_reasons`
+   - complete executor stale/duplicate rejection using signature (`plan_id`/`decision_seq`)
+2. Create missing Section 21 must-have docs/schemas:
+   - `docs/REPLAN_POLICY_AND_MATERIALITY.md`
+   - `docs/ATOMIC_PLAN_HANDOFF.md`
+   - `docs/STRESS_REPLAY_PROFILES.md`
+   - `docs/TUNING_PROTOCOL_WALKFORWARD_PBO.md`
+   - `schemas/grid_plan.schema.json`
+   - `schemas/execution_cost_calibration.schema.json`
+   - `schemas/chaos_profile.schema.json`
+3. Create missing Section 21 strongly recommended schemas:
+   - `schemas/decision_log.schema.json`
+   - `schemas/event_log.schema.json`
 
-2. **Section 21 must-have docs/schemas missing**
-   - Missing docs:
-     - `docs/REPLAN_POLICY_AND_MATERIALITY.md`
-     - `docs/ATOMIC_PLAN_HANDOFF.md`
-     - `docs/STRESS_REPLAY_PROFILES.md`
-     - `docs/TUNING_PROTOCOL_WALKFORWARD_PBO.md`
-   - Missing schemas:
-     - `schemas/grid_plan.schema.json`
-     - `schemas/execution_cost_calibration.schema.json`
-     - `schemas/chaos_profile.schema.json`
-     - `schemas/decision_log.schema.json`
-     - `schemas/event_log.schema.json`
+### P1 (high) - missing/partial architecture modules from lines 1-2185
 
-3. **Section 21 core module file targets missing (currently inlined in strategy/scripts)**
+4. Create missing target module files listed in Section 21.3:
    - `planner/replan_policy.py`
    - `planner/start_stability.py`
    - `planner/volatility_policy_adapter.py`
@@ -2262,97 +2313,162 @@ Scope: this section reconciles `docs/GRID_MASTER_PLAN.md` against actual reposit
    - `schemas/plan_signature.py`
    - `sim/chaos_profiles.py`
    - `data/data_quality_assessor.py`
+5. Complete chaos/stress perturbation harness contract from Sections 16/17 (`latency/spread shocks/partial fills/reject bursts/data gaps` as first-class profiles in replay path).
+6. Complete strict golden replay and formal brain/simulator consistency suite coverage from Section 17.
+7. Complete depth-aware dynamic capacity cap enforcement (not only hint ingestion) from Sections 16/18.
+8. Complete full execution-cost lifecycle feedback loop (fill/order lifecycle standardization + calibration artifact discipline) from Sections 13/18.
 
-### 26.2.2 Robustness/validation pipeline gaps
+### P2 (medium) - module registry remaining items (all non-DONE modules)
 
-4. **Stress/chaos perturbation harness is still partial**
-   - Tuning protocol can score “chaos” run outputs, but dedicated perturbation injection profiles (latency/spread/partial-fill/reject/data-gap engine) are not a first-class simulator harness yet.
+#### 26.2.1 Modules currently PARTIAL
 
-5. **Golden replay + strict brain/simulator consistency matrix needs expansion**
-   - Existing tests cover many behaviors, but a fixed “golden replay snapshots + strict action-sequence parity” suite remains incomplete.
+- `M002` Atomic handoff + idempotency contract
+- `M006` Volatility policy adapter
+- `M007` Empirical execution cost calibration loop
+- `M008` Stress/chaos replay harness
+- `M009` Depth-aware capacity cap
+- `M010` Enum registry + plan diff snapshots
+- `M205` Minimum range length + breakout confirm bars
+- `M209` Log-space quartiles + 1.386 extensions (log-space detail incomplete)
+- `M213` Midline bias fallback (full policy incomplete)
+- `M404` Protections layer (drawdown/protection extensions incomplete)
+- `M406` Structured event taxonomy/bus contract
+- `M502` POC alignment check strict behavior
+- `M505` Micro-VAP bias/re-entry discipline completeness
+- `M606` FVG-VP full module behavior
+- `M702` Smart breakout channels full behavior
+- `M703` Zig-zag channel enhancement full behavior
+- `M805` Session high/low sweep + break-retest event behavior
+- `M809` Buy-ratio micro-bias policy usage
+- `M1003` Minimal order-flow metrics full module behavior
+- `M1004` Atomic handoff duplicate-safe contract completeness
+- `M1005` Empirical execution feedback loop completeness
+- `M1006` Stress replay as standard validation completeness
 
-### 26.2.3 Execution realism and liquidity controls gaps
+#### 26.2.2 Modules currently NOT_IMPLEMENTED
 
-6. **Depth-aware capacity cap is partial**
-   - Capacity hint ingestion exists; full dynamic orderbook depth-based rung/notional cap enforcement remains incomplete.
+- `M113` Boom & Doom impulse guard
+- `M204` Percent-of-average width veto
+- `M212` Fallback POC estimator contract
+- `M306` Directional skip-one rule
+- `M307` Next-rung ghost lines (UI)
+- `M601` Lightweight OB module
+- `M704` Liquidity sweeps module
+- `M705` Sweep mode toggle (`Wick/Open`) module
+- `M807` VAH/VAL quantile approximation fallback
+- `M808` Average-of-basis with session H/L band candidates
+- `M903` CVD spike + passive absorption module
+- `M904` CVD divergence oscillator strong-score module
+- `M905` SMA200/EMA directional variant trend filters
+- `M906` CVD extension-line touch counter (UI)
 
-7. **Order-flow metrics and execution-cost feedback are partial**
-   - Confirm metrics and empirical proxies exist, but full live orderbook/order-lifecycle sourced calibration loops are not complete.
+### P3 (lower, but still in-scope from lines 1-2185)
 
-### 26.2.4 Module registry items remaining (complete list; includes PARTIAL + NOT STARTED)
+9. Keep Section 24 audit template synchronized with Section 26 statuses after each implementation wave.
+10. Keep Step sequencing notes in Section 20 updated as PARTIAL -> DONE transitions happen.
 
-- **18.A Core/ Governance remaining**
-  - `M002` (partial): atomic write is done; full signature + stale/duplicate reject contract incomplete.
-  - `M006` (partial): threshold adaptation exists; explicit standalone volatility-adapter contract/reporting still incomplete.
-  - `M008` (partial): no dedicated perturbation harness engine yet.
-  - `M009` (partial): dynamic depth-aware cap not complete.
-  - `M010` (partial): enum registry done; full plan-diff/`changed_fields` contract not complete.
+---
 
-- **18.B Regime / Build gates remaining**
-  - `M113` (not started): boom/doom impulse guard.
+## 26.3 Full module registry status map (no exclusions)
 
-- **18.C Box builder remaining**
-  - `M204` (not started): percent-of-average width veto.
-  - `M205` (partial): breakout/freshness pieces exist; full minimum-range-length policy still incomplete.
-  - `M209` (partial): quartiles/extensions implemented, but explicit log-space quartile formulation remains incomplete.
-  - `M212` (not started): explicit fallback POC estimator contract.
-  - `M213` (partial): full midline-bias fallback policy not complete.
+- `M001` DONE
+- `M002` PARTIAL
+- `M003` DONE
+- `M004` DONE
+- `M005` DONE
+- `M006` PARTIAL
+- `M007` PARTIAL
+- `M008` PARTIAL
+- `M009` PARTIAL
+- `M010` PARTIAL
 
-- **18.D Grid / targets / risk remaining**
-  - `M306` (not started): directional skip-one rule.
-  - `M307` (not started): next-rung ghost lines (UI).
+- `M101` DONE
+- `M102` DONE
+- `M103` DONE
+- `M104` DONE
+- `M105` DONE
+- `M106` DONE
+- `M107` DONE
+- `M108` DONE
+- `M109` DONE
+- `M110` DONE
+- `M111` DONE
+- `M112` DONE
+- `M113` NOT_IMPLEMENTED
 
-- **18.E Monitoring/runtime remaining**
-  - `M404` (partial): cooldown/min-runtime implemented; full protections/drawdown extension layer incomplete.
-  - `M406` (partial): event logging exists, but formal structured event-bus taxonomy contract incomplete.
+- `M201` DONE
+- `M202` DONE
+- `M203` DONE
+- `M204` NOT_IMPLEMENTED
+- `M205` PARTIAL
+- `M206` DONE
+- `M207` DONE
+- `M208` DONE
+- `M209` PARTIAL
+- `M210` DONE
+- `M211` DONE
+- `M212` NOT_IMPLEMENTED
+- `M213` PARTIAL
 
-- **18.F VP / VAP family remaining**
-  - `M502` (partial): diagnostics exist; strict micro-POC vs VRVP alignment gate behavior incomplete.
-  - `M505` (partial): several nudges implemented; full re-entry discipline from module spec incomplete.
+- `M301` DONE
+- `M302` DONE
+- `M303` DONE
+- `M304` DONE
+- `M305` DONE
+- `M306` NOT_IMPLEMENTED
+- `M307` NOT_IMPLEMENTED
 
-- **18.G FVG stack remaining**
-  - `M601` (not started): lightweight OB module.
-  - `M606` (partial): FVG-VP toggle/path exists; full event-driven side-capped FVG-VP behavior incomplete.
+- `M401` DONE
+- `M402` DONE
+- `M403` DONE
+- `M404` PARTIAL
+- `M405` DONE
+- `M406` PARTIAL
 
-- **18.H Channels/sweeps remaining**
-  - `M702` (partial): channel logic exists; full smart-breakout module behaviors incomplete.
-  - `M703` (partial): some envelope/slope/asymmetry checks exist; full zig-zag enhancement set incomplete.
-  - `M704` (not started): liquidity sweeps module.
-  - `M705` (not started): sweep-mode validation toggle (`Wick/Open`) module.
+- `M501` DONE
+- `M502` PARTIAL
+- `M503` DONE
+- `M504` DONE
+- `M505` PARTIAL
 
-- **18.I MRVD / basis / VWAP remaining**
-  - `M801` (partial): strong confluence exists; full documented D/W/M + start-cross policy formalization still incomplete.
-  - `M805` (partial): session high/low values exist; sweep + break-retest event module incomplete.
-  - `M807` (not started): VAH/VAL quantile approximation fallback.
-  - `M808` (not started): average-of-basis with session H/L band candidates.
-  - `M809` (partial): buy/sell metrics collected; explicit mid-band micro-bias policy incomplete.
+- `M601` NOT_IMPLEMENTED
+- `M602` DONE
+- `M603` DONE
+- `M604` DONE
+- `M605` DONE
+- `M606` PARTIAL
+- `M607` DONE
 
-- **18.J CVD family remaining**
-  - `M903` (partial): BOS/divergence paths exist; spike + passive-absorption behaviors incomplete.
-  - `M904` (not started): CVD divergence oscillator strong-score module.
-  - `M905` (not started): SMA200/EMA trend filter add-on for directional variants.
-  - `M906` (not started): CVD extension-line touch counter (UI).
+- `M701` DONE
+- `M702` PARTIAL
+- `M703` PARTIAL
+- `M704` NOT_IMPLEMENTED
+- `M705` NOT_IMPLEMENTED
 
-- **18.K Execution/Ops remaining**
-  - `M1003` (partial): soft metrics exist; full minimal order-flow module behavior incomplete.
-  - `M1004` (partial): atomic handoff exists; full duplicate-safe signature contract incomplete.
-  - `M1005` (partial): empirical cost path exists; full execution feedback loop standardization incomplete.
-  - `M1006` (partial): tuning/validation uses stress concepts; full standard chaos replay harness incomplete.
+- `M801` DONE
+- `M802` DONE
+- `M803` DONE
+- `M804` DONE
+- `M805` PARTIAL
+- `M806` DONE
+- `M807` NOT_IMPLEMENTED
+- `M808` NOT_IMPLEMENTED
+- `M809` PARTIAL
 
-### 26.2.5 Section-24 audit template status (filled)
+- `M901` DONE
+- `M902` DONE
+- `M903` NOT_IMPLEMENTED
+- `M904` NOT_IMPLEMENTED
+- `M905` NOT_IMPLEMENTED
+- `M906` NOT_IMPLEMENTED
 
-- Deterministic core planner exists: **DONE**
-- Simulator exists and matches planner decisions: **PARTIAL** (exists, but full strict parity matrix still pending)
-- Executor (paper) exists: **DONE**
-- Atomic plan write exists: **DONE**
-- Idempotent plan apply exists: **PARTIAL**
-- Replan/materiality exists: **DONE**
-- Start stability score exists: **DONE**
-- Data quality health state exists: **DONE**
-- Chaos replay exists: **PARTIAL**
-- Empirical cost calibration exists: **DONE (planner-level), PARTIAL (full lifecycle loop)**
-- Meta drift guard exists: **DONE**
-- Capacity guard exists: **PARTIAL**
-- Formal tuning workflow exists: **DONE**
+- `M1001` DONE
+- `M1002` DONE
+- `M1003` PARTIAL
+- `M1004` PARTIAL
+- `M1005` PARTIAL
+- `M1006` PARTIAL
+- `M1007` DONE
+- `M1008` DONE
 
 ---
