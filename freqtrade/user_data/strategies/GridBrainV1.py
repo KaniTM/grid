@@ -477,6 +477,8 @@ class GridBrainV1Core(IStrategy):
         self._empirical_cost_calibrator = ExternalEmpiricalCostCalibrator(
             self.empirical_cost_window
         )
+        self._execution_cost_artifact_cache_by_pair: Dict[str, Dict[str, object]] = {}
+        self._execution_cost_artifact_mtime_by_pair: Dict[str, float] = {}
         self._meta_drift_guard = ExternalMetaDriftGuard(
             self.meta_drift_guard_window,
             self.meta_drift_guard_smoothing_alpha,
@@ -723,6 +725,10 @@ class GridBrainV1Core(IStrategy):
     empirical_retry_penalty_pct = 0.0010
     empirical_missed_fill_penalty_pct = 0.0010
     empirical_cost_floor_min_pct = 0.0
+    execution_cost_artifact_enabled = True
+    execution_cost_artifact_dir = "artifacts/execution_cost"
+    execution_cost_artifact_filename = "execution_cost_calibration.latest.json"
+    execution_cost_artifact_max_age_minutes = 180.0
 
     # Width constraints for the box
     min_width_pct = 0.035  # 3.5%
@@ -2635,6 +2641,89 @@ class GridBrainV1Core(IStrategy):
         art_dir = self._user_data_dir() / self.regime_router_score_artifact_dir / run_id
         return art_dir / self.regime_router_score_artifact_file
 
+    @staticmethod
+    def _pair_fs(pair: str) -> str:
+        return str(pair or "unknown_pair").replace("/", "_").replace(":", "_").strip("_")
+
+    def _execution_cost_artifact_path(self, pair: str) -> Path:
+        base = self._user_data_dir() / str(self.execution_cost_artifact_dir or "artifacts/execution_cost")
+        pair_dir = base / self._pair_fs(pair)
+        return pair_dir / str(self.execution_cost_artifact_filename or "execution_cost_calibration.latest.json")
+
+    def _load_execution_cost_artifact(self, pair: str) -> Optional[Dict[str, object]]:
+        if not bool(getattr(self, "execution_cost_artifact_enabled", True)):
+            return None
+        path = self._execution_cost_artifact_path(pair)
+        if not path.is_file():
+            return None
+
+        cache = getattr(self, "_execution_cost_artifact_cache_by_pair", None)
+        if cache is None:
+            self._execution_cost_artifact_cache_by_pair = {}
+            cache = self._execution_cost_artifact_cache_by_pair
+        mtime_map = getattr(self, "_execution_cost_artifact_mtime_by_pair", None)
+        if mtime_map is None:
+            self._execution_cost_artifact_mtime_by_pair = {}
+            mtime_map = self._execution_cost_artifact_mtime_by_pair
+
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            mtime = -1.0
+        cached_mtime = self._safe_float(mtime_map.get(pair))
+        if cached_mtime is not None and abs(cached_mtime - mtime) <= 1e-9:
+            cached = cache.get(pair)
+            if isinstance(cached, dict):
+                return cached
+
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("pair") or "").strip() not in ("", str(pair)):
+            return None
+        errors = validate_schema(payload, "execution_cost_calibration.schema.json")
+        if errors:
+            return None
+
+        generated_at = payload.get("generated_at")
+        stale = False
+        if generated_at is not None:
+            try:
+                ts = pd.Timestamp(generated_at)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                age_minutes = (
+                    pd.Timestamp.now(tz="UTC") - ts.tz_convert("UTC")
+                ).total_seconds() / 60.0
+                stale = bool(age_minutes > float(self.execution_cost_artifact_max_age_minutes))
+            except Exception:
+                stale = False
+
+        normalized = {
+            "pair": str(payload.get("pair") or pair),
+            "generated_at": payload.get("generated_at"),
+            "cost_model_source": str(payload.get("cost_model_source") or "static"),
+            "sample_count": int(self._safe_float(payload.get("sample_count")) or 0),
+            "stale": bool(stale),
+            "spread_pct": self._safe_float(payload.get("realized_spread_pct")),
+            "adverse_selection_pct": self._safe_float(payload.get("adverse_selection_pct")),
+            "retry_reject_rate": self._safe_float(payload.get("post_only_retry_reject_rate")),
+            "missed_fill_rate": self._safe_float(payload.get("missed_fill_opportunity_rate")),
+            "recommended_floor_pct": (
+                self._safe_float(payload.get("recommended_cost_floor_bps")) / 10_000.0
+                if self._safe_float(payload.get("recommended_cost_floor_bps")) is not None
+                else None
+            ),
+            "artifact_path": str(path),
+        }
+        cache[pair] = normalized
+        mtime_map[pair] = float(mtime)
+        return normalized
+
     def _load_regime_bands_entries(self) -> None:
         if self._neutral_bands_loaded:
             return
@@ -3816,12 +3905,34 @@ class GridBrainV1Core(IStrategy):
         retry_reject_rate = self._safe_float(last_row.get("post_only_retry_reject_rate"))
         missed_fill_rate = self._safe_float(last_row.get("missed_fill_rate"))
         recommended_floor_pct = self._safe_float(last_row.get("recommended_cost_floor_pct"))
+        artifact = self._load_execution_cost_artifact(pair)
+        artifact_used = False
+        artifact_source = None
+        artifact_generated_at = None
+        if isinstance(artifact, dict) and not bool(artifact.get("stale", False)):
+            artifact_spread = self._safe_float(artifact.get("spread_pct"))
+            artifact_adverse = self._safe_float(artifact.get("adverse_selection_pct"))
+            artifact_retry = self._safe_float(artifact.get("retry_reject_rate"))
+            artifact_missed = self._safe_float(artifact.get("missed_fill_rate"))
+            artifact_floor = self._safe_float(artifact.get("recommended_floor_pct"))
+            spread_direct = artifact_spread if artifact_spread is not None else spread_direct
+            adverse_pct = artifact_adverse if artifact_adverse is not None else adverse_pct
+            retry_reject_rate = artifact_retry if artifact_retry is not None else retry_reject_rate
+            missed_fill_rate = artifact_missed if artifact_missed is not None else missed_fill_rate
+            recommended_floor_pct = artifact_floor if artifact_floor is not None else recommended_floor_pct
+            artifact_used = True
+            artifact_source = str(artifact.get("cost_model_source") or "empirical")
+            artifact_generated_at = artifact.get("generated_at")
         return {
             "spread_pct": spread_direct,
             "adverse_selection_pct": adverse_pct,
             "retry_reject_rate": retry_reject_rate,
             "missed_fill_rate": missed_fill_rate,
             "recommended_floor_pct": recommended_floor_pct,
+            "artifact_used": bool(artifact_used),
+            "artifact_source": artifact_source,
+            "artifact_generated_at": artifact_generated_at,
+            "artifact_path": artifact.get("artifact_path") if isinstance(artifact, dict) else None,
         }
 
     def _meta_drift_channels(
@@ -3999,6 +4110,10 @@ class GridBrainV1Core(IStrategy):
                     "last_sample_retry_reject_rate": observed.get("retry_reject_rate"),
                     "last_sample_missed_fill_rate": observed.get("missed_fill_rate"),
                     "last_sample_total_cost_pct": observed.get("total_pct"),
+                    "artifact_used": bool(empirical_sample.get("artifact_used", False)),
+                    "artifact_source": empirical_sample.get("artifact_source"),
+                    "artifact_generated_at": empirical_sample.get("artifact_generated_at"),
+                    "artifact_path": empirical_sample.get("artifact_path"),
                 }
             )
 

@@ -8,7 +8,7 @@ import pandas as pd
 
 from analytics.execution_cost_calibrator import EmpiricalCostCalibrator
 from data.data_quality_assessor import assess_data_quality
-from execution.capacity_guard import load_capacity_hint_state
+from execution.capacity_guard import compute_dynamic_capacity_state, load_capacity_hint_state
 from planner.replan_policy import ReplanThresholds, evaluate_replan_materiality
 from planner.start_stability import evaluate_start_stability
 from planner.volatility_policy_adapter import compute_n_level_bounds
@@ -81,6 +81,33 @@ def test_capacity_guard_module(tmp_path: Path) -> None:
     assert out["advisory_only"] is False
 
 
+def test_dynamic_capacity_guard_computes_cap_and_delay() -> None:
+    out = compute_dynamic_capacity_state(
+        max_orders_per_side=20,
+        n_levels=10,
+        quote_total=1000.0,
+        grid_budget_pct=1.0,
+        preferred_rung_cap=8,
+        runtime_spread_pct=0.01,
+        runtime_depth_thinning_score=0.8,
+        top_book_notional=50.0,
+        runtime_capacity_ok=True,
+        runtime_reasons=[],
+        spread_wide_threshold=0.002,
+        depth_thin_threshold=0.5,
+        spread_cap_multiplier=0.5,
+        depth_cap_multiplier=0.5,
+        min_rung_cap=1,
+        top_book_safety_fraction=0.2,
+        delay_replenish_on_thin=True,
+    )
+    assert out["capacity_ok"] is True
+    assert out["applied_rung_cap"] >= 1
+    assert out["rung_cap_applied"] is True
+    assert "DEPTH_THIN_AT_TOP" in out["reasons"]
+    assert out["delay_replenishment"] is True
+
+
 def test_data_quality_assessor_module() -> None:
     start = datetime.now(timezone.utc) - timedelta(minutes=45)
     dates = [start + timedelta(minutes=15 * i) for i in range(4)]
@@ -147,4 +174,3 @@ def test_chaos_profile_and_plan_signature_wrappers() -> None:
     }
     plan["plan_hash"] = compute_plan_hash(plan)
     assert validate_signature_fields(plan) == []
-

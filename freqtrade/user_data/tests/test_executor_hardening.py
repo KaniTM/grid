@@ -1,8 +1,13 @@
 # ruff: noqa: S101
 
+import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
+from core.plan_signature import compute_plan_hash
+from core.schema_validation import validate_schema
 from freqtrade.user_data.scripts import grid_executor_v1
 
 
@@ -12,12 +17,30 @@ def _base_plan(
     execution_hardening: dict | None = None,
     runtime_state: dict | None = None,
 ) -> dict:
-    return {
+    plan = {
+        "schema_version": "1.0.0",
+        "planner_version": "gridbrain_v1",
+        "pair": "ETH/USDT",
         "action": str(action),
+        "mode": "intraday",
+        "action_reason": "test",
+        "blockers": [],
+        "planner_health_state": "ok",
+        "materiality_class": "soft",
+        "replan_decision": "publish",
+        "replan_reasons": ["REPLAN_MATERIAL_BOX_CHANGE"],
+        "plan_id": str(uuid4()),
+        "decision_seq": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "valid_for_candle_ts": 1_700_000_000,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        "supersedes_plan_id": None,
         "exchange": "binance",
         "symbol": "ETH/USDT",
         "ts": "2026-02-26T00:00:00+00:00",
         "range": {"low": 95.0, "high": 105.0},
+        "range_diagnostics": {"lookback_bars_used": 96},
+        "box": {"low": 95.0, "high": 105.0, "mid": 100.0, "width_pct": 0.10},
         "grid": {
             "n_levels": 4,
             "step_price": 2.5,
@@ -28,10 +51,21 @@ def _base_plan(
                 "cooldown_bars": 1,
             },
         },
+        "risk": {"tp_price": 108.0, "sl_price": 92.0},
+        "signals_snapshot": {},
+        "runtime_hints": {},
+        "start_stability_score": 1.0,
+        "meta_drift_state": {"severity": "none"},
+        "cost_model_snapshot": {"source": "static"},
+        "module_states": {},
+        "capital_policy": {"grid_budget_pct": 1.0},
+        "update_policy": {"soft_adjust_max_step_frac": 0.5},
         "price_ref": {"close": 100.0},
         "runtime_state": runtime_state or {"clock_ts": 1_700_000_000},
         "execution_hardening": execution_hardening or {},
     }
+    plan["plan_hash"] = compute_plan_hash(plan)
+    return plan
 
 
 class _RetryThenAcceptExchange:
@@ -153,6 +187,7 @@ def test_rebuild_confirm_failure_is_tracked_separately(tmp_path: Path) -> None:
     rebuild_plan = _base_plan("START")
     rebuild_plan["range"]["high"] = 110.0
     rebuild_plan["grid"]["step_price"] = (110.0 - 95.0) / 4.0
+    rebuild_plan["plan_hash"] = compute_plan_hash(rebuild_plan)
     ex.step(rebuild_plan)
 
     state = grid_executor_v1.load_json(ex.state_out)
@@ -266,3 +301,98 @@ def test_executor_recovers_state_file_on_startup(tmp_path: Path) -> None:
     assert ex._fill_guard_last_clock_ts == 1700000000
     assert len(ex._orders) == 1
     assert ex._orders[0].order_id == "restored-1"
+
+
+def test_capacity_rung_cap_limits_seeded_orders_in_paper(tmp_path: Path) -> None:
+    ex = _executor(tmp_path)
+    plan = _base_plan(
+        "START",
+        runtime_state={
+            "clock_ts": 1_700_000_000,
+            "spread_pct": 0.01,
+            "depth_thinning_score": 0.9,
+        },
+        execution_hardening={
+            "capacity_cap": {
+                "enabled": True,
+                "spread_wide_threshold": 0.001,
+                "depth_thin_threshold": 0.5,
+                "spread_cap_multiplier": 0.5,
+                "depth_cap_multiplier": 0.5,
+                "min_rung_cap": 1,
+            }
+        },
+    )
+    plan["capital_policy"] = {"grid_budget_pct": 1.0, "preferred_rung_cap": 3}
+    plan["plan_hash"] = compute_plan_hash(plan)
+
+    ex.step(plan)
+
+    state = grid_executor_v1.load_json(ex.state_out)
+    runtime = state["runtime"]
+    assert runtime["capacity_guard"]["capacity_ok"] is True
+    assert runtime["capacity_guard"]["applied_rung_cap"] == 1
+    assert "EXEC_CAPACITY_RUNG_CAP_APPLIED" in runtime["exec_events"]
+    assert len(state["orders"]) == 1
+
+
+def test_capacity_hard_block_prevents_start(tmp_path: Path) -> None:
+    ex = _executor(tmp_path)
+    plan = _base_plan(
+        "START",
+        runtime_state={"clock_ts": 1_700_000_000},
+        execution_hardening={"capacity_cap": {"enabled": True}},
+    )
+    plan["runtime_hints"] = {
+        "capacity_hint": {
+            "allow_start": False,
+            "advisory_only": False,
+            "reason": "thin_book",
+        }
+    }
+    plan["plan_hash"] = compute_plan_hash(plan)
+
+    ex.step(plan)
+    state = grid_executor_v1.load_json(ex.state_out)
+    runtime = state["runtime"]
+    assert runtime["raw_action"] == "START"
+    assert runtime["effective_action"] == "HOLD"
+    assert runtime["action_suppression_reason"] == "capacity_thin_block"
+    assert "BLOCK_CAPACITY_THIN" in runtime["warnings"]
+    assert state["orders"] == []
+
+
+def test_execution_cost_feedback_writes_artifact_and_lifecycle_logs(tmp_path: Path) -> None:
+    ex = _executor(tmp_path)
+    plan = _base_plan(
+        "START",
+        runtime_state={"clock_ts": 1_700_000_000, "spread_pct": 0.002},
+        execution_hardening={
+            "execution_cost_feedback": {
+                "enabled": True,
+                "window": 16,
+                "percentile": 90.0,
+                "min_samples": 1,
+                "stale_steps": 32,
+            }
+        },
+    )
+    plan["capital_policy"] = {"grid_budget_pct": 1.0}
+    plan["plan_hash"] = compute_plan_hash(plan)
+
+    ex.step(plan)
+    state = grid_executor_v1.load_json(ex.state_out)
+    runtime = state["runtime"]
+    artifact = runtime["execution_cost_artifact"]
+    paths = runtime["execution_cost_artifact_paths"]
+
+    assert runtime["execution_cost_feedback_enabled"] is True
+    assert runtime["execution_cost_step_metrics"]["orders_placed"] > 0
+    assert artifact["pair"] == "ETH/USDT"
+    assert artifact["sample_count"] >= 1
+    assert Path(paths["artifact_latest"]).is_file()
+    assert Path(paths["orders_lifecycle"]).is_file()
+    assert Path(paths["fills_lifecycle"]).exists()
+
+    artifact_payload = json.loads(Path(paths["artifact_latest"]).read_text(encoding="utf-8"))
+    assert validate_schema(artifact_payload, "execution_cost_calibration.schema.json") == []

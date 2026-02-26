@@ -2247,7 +2247,7 @@ Status values used:
 
 ### 26.1.3 Module registry items that are DONE (complete list)
 
-- `M001`, `M003`, `M004`, `M005`
+- `M001`, `M003`, `M004`, `M005`, `M009`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
 - `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
 - `M301`, `M302`, `M303`, `M304`, `M305`
@@ -2257,7 +2257,7 @@ Status values used:
 - `M701`
 - `M801`, `M802`, `M803`, `M804`, `M806`
 - `M901`, `M902`
-- `M1001`, `M1002`, `M1007`, `M1008`
+- `M1001`, `M1002`, `M1005`, `M1007`, `M1008`
 
 ### 26.1.4 Section 21 file checklist that is DONE
 
@@ -2330,8 +2330,16 @@ Status values used:
      - per-bar box/grid parameter parity (`box_low/high`, `n_levels`, `step_price`)
      - replan/materiality classification parity
    - Replay summary/curve now expose explicit consistency fields (`replan_decision_counts`, `materiality_class_counts`, `selected_plan_snapshots`, `false_start_*`, and per-row `plan_*` mirror fields) for stable regression checks.
-7. Complete depth-aware dynamic capacity cap enforcement (not only hint ingestion) from Sections 16/18.
-8. Complete full execution-cost lifecycle feedback loop (fill/order lifecycle standardization + calibration artifact discipline) from Sections 13/18.
+7. [DONE 2026-02-26] Complete depth-aware dynamic capacity cap enforcement (not only hint ingestion) from Sections 16/18.
+   - Added dynamic capacity guard computation (`capacity_ok`, `max_safe_active_rungs`, `max_safe_rung_notional`, reasons, delay-replenishment) in `execution/capacity_guard.py`.
+   - Executor now enforces dynamic rung caps in START/HOLD/soft-adjust paths, blocks START when capacity is hard-thin, and applies `EXEC_CAPACITY_RUNG_CAP_APPLIED` / `BLOCK_CAPACITY_THIN` runtime diagnostics.
+   - Replenishment path now respects capacity delay/rung-cap limits (skip + tracked missed opportunities) so runtime behavior matches Section 16.3 semantics.
+   - Added enforcement tests in `freqtrade/user_data/tests/test_executor_hardening.py` and module-level coverage in `freqtrade/tests/scripts/test_section21_modules.py`.
+8. [DONE 2026-02-26] Complete full execution-cost lifecycle feedback loop (fill/order lifecycle standardization + calibration artifact discipline) from Sections 13/18.
+   - Executor now emits standardized order/fill lifecycle logs (`order_lifecycle.jsonl`, `fills_lifecycle.jsonl`) and writes schema-validated calibration artifacts (`execution_cost_calibration.latest.json` + timestamp archives).
+   - Executor runtime state now exposes execution-cost feedback metrics/artifact paths for observability and reproducible replay diagnostics.
+   - Planner now ingests validated execution-cost calibration artifacts as empirical sample inputs (when fresh) in `_empirical_cost_sample`, closing the executor→planner feedback loop.
+   - Added end-to-end coverage for artifact emission/validation and planner artifact consumption in `freqtrade/user_data/tests/test_executor_hardening.py` and `freqtrade/user_data/tests/test_phase3_validation.py`.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
@@ -2341,7 +2349,6 @@ Status values used:
 - `M006` Volatility policy adapter
 - `M007` Empirical execution cost calibration loop
 - `M008` Stress/chaos replay harness
-- `M009` Depth-aware capacity cap
 - `M010` Enum registry + plan diff snapshots
 - `M205` Minimum range length + breakout confirm bars
 - `M209` Log-space quartiles + 1.386 extensions (log-space detail incomplete)
@@ -2357,7 +2364,6 @@ Status values used:
 - `M809` Buy-ratio micro-bias policy usage
 - `M1003` Minimal order-flow metrics full module behavior
 - `M1004` Atomic handoff duplicate-safe contract completeness
-- `M1005` Empirical execution feedback loop completeness
 - `M1006` Stress replay as standard validation completeness
 
 #### 26.2.2 Modules currently NOT_IMPLEMENTED

@@ -1,6 +1,8 @@
 # ruff: noqa: S101
 
 from collections import deque
+import json
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -615,3 +617,47 @@ def test_meta_drift_state_maps_to_actions() -> None:
     )
     assert state_running["drift_detected"] is True
     assert state_running["recommended_action"] in {"HARD_STOP", "PAUSE_STARTS"}
+
+
+def test_empirical_cost_sample_uses_execution_cost_artifact(tmp_path: Path) -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    pair = "PAIR/ART"
+    pair_fs = pair.replace("/", "_").replace(":", "_")
+    artifact_dir = tmp_path / "artifacts" / "execution_cost" / pair_fs
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / "execution_cost_calibration.latest.json"
+    artifact_payload = {
+        "schema_version": "1.0.0",
+        "generated_at": "2026-02-26T00:00:00+00:00",
+        "pair": pair,
+        "window": 256,
+        "sample_count": 64,
+        "cost_model_source": "empirical",
+        "percentile": 90.0,
+        "realized_spread_pct": 0.003,
+        "adverse_selection_pct": 0.001,
+        "post_only_retry_reject_rate": 0.2,
+        "missed_fill_opportunity_rate": 0.15,
+        "recommended_cost_floor_bps": 16.0,
+    }
+    artifact_path.write_text(json.dumps(artifact_payload), encoding="utf-8")
+
+    strategy.config = {"user_data_dir": str(tmp_path)}
+    strategy.execution_cost_artifact_enabled = True
+    strategy.execution_cost_artifact_dir = "artifacts/execution_cost"
+    strategy.execution_cost_artifact_filename = "execution_cost_calibration.latest.json"
+    strategy.execution_cost_artifact_max_age_minutes = 60 * 24
+    strategy._execution_cost_artifact_cache_by_pair = {}
+    strategy._execution_cost_artifact_mtime_by_pair = {}
+
+    sample = strategy._empirical_cost_sample(
+        pair,
+        pd.Series({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0}),
+        100.0,
+    )
+    assert sample["artifact_used"] is True
+    assert sample["spread_pct"] == pytest.approx(0.003)
+    assert sample["adverse_selection_pct"] == pytest.approx(0.001)
+    assert sample["retry_reject_rate"] == pytest.approx(0.2)
+    assert sample["missed_fill_rate"] == pytest.approx(0.15)
+    assert sample["recommended_floor_pct"] == pytest.approx(0.0016)

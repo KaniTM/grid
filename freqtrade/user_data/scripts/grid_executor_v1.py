@@ -11,6 +11,8 @@ from typing import Deque, Dict, List, Optional, Set, Tuple
 import numpy as np
 from core.plan_signature import compute_plan_hash, plan_is_expired, plan_pair, validate_signature_fields
 from core.schema_validation import validate_schema
+from analytics.execution_cost_calibrator import EmpiricalCostCalibrator
+from execution.capacity_guard import compute_dynamic_capacity_state
 
 try:
     import ccxt  # optional, only needed for --mode ccxt
@@ -283,13 +285,13 @@ def _safe_float(x, default=None):
         return default
 
 
-def _safe_int(x, default: int) -> int:
+def _safe_int(x, default: Optional[int] = None) -> Optional[int]:
     try:
         if x is None:
-            return int(default)
+            return int(default) if default is not None else None
         return int(x)
     except Exception:
-        return int(default)
+        return int(default) if default is not None else None
 
 
 def _safe_bool(x, default: bool) -> bool:
@@ -307,6 +309,10 @@ def _safe_bool(x, default: bool) -> bool:
         return bool(x)
     except Exception:
         return bool(default)
+
+
+def _pair_fs(pair: str) -> str:
+    return str(pair or "unknown_pair").replace("/", "_").replace(":", "_").strip("_")
 
 
 def _extract_rung_weights(plan: Dict, n_levels: int) -> Optional[List[float]]:
@@ -468,6 +474,9 @@ class GridExecutorV1:
         self._runtime_exec_events: List[str] = []
         self._runtime_pause_reasons: List[str] = []
         self._runtime_confirm: Dict[str, object] = {}
+        self._capacity_guard_state: Dict[str, object] = {}
+        self._capacity_rung_cap_applied_total: int = 0
+        self._capacity_replenish_skipped_total: int = 0
 
         # Step-12 hardening defaults; can be overridden per-plan.
         self._post_only_place_attempts: int = max(int(self.ccxt_retries), 3)
@@ -489,6 +498,14 @@ class GridExecutorV1:
         self._confirm_spread_max: Optional[float] = None
         self._confirm_depth_thinning_max: Optional[float] = None
         self._confirm_jump_max: Optional[float] = 0.01
+        self._capacity_cap_enabled: bool = True
+        self._capacity_spread_wide_threshold: float = 0.0030
+        self._capacity_depth_thin_threshold: float = 0.60
+        self._capacity_spread_cap_multiplier: float = 0.60
+        self._capacity_depth_cap_multiplier: float = 0.60
+        self._capacity_min_rung_cap: int = 1
+        self._capacity_top_book_safety_fraction: float = 0.25
+        self._capacity_delay_replenish_on_thin: bool = True
 
         self._reconcile_price_tol_ticks: int = 1
         self._reconcile_price_tol_frac: float = 0.00025
@@ -509,6 +526,23 @@ class GridExecutorV1:
         self._last_applied_plan_hash: Optional[str] = None
         self._applied_plan_ids: Deque[str] = deque(maxlen=4096)
         self._applied_plan_id_set: Set[str] = set()
+
+        # Section 13.2 / M1005 execution-cost lifecycle feedback loop.
+        self._execution_cost_feedback_enabled: bool = True
+        self._execution_cost_window: int = 256
+        self._execution_cost_percentile: float = 90.0
+        self._execution_cost_min_samples: int = 8
+        self._execution_cost_stale_steps: int = 128
+        self._execution_cost_retry_penalty_pct: float = 0.001
+        self._execution_cost_missed_fill_penalty_pct: float = 0.001
+        self._execution_cost_calibrator = EmpiricalCostCalibrator(self._execution_cost_window)
+        self._execution_cost_last_artifact: Optional[Dict[str, object]] = None
+        self._execution_cost_artifact_paths_by_pair: Dict[str, Dict[str, str]] = {}
+        self._execution_cost_samples_written_by_pair: Dict[str, int] = {}
+        self._execution_cost_step_metrics: Dict[str, object] = {}
+        self._execution_cost_artifact_root = (
+            Path(self.state_out).resolve().parent / "artifacts" / "execution_cost"
+        )
 
         if self.mode == "ccxt":
             if ccxt is None:
@@ -671,6 +705,17 @@ class GridExecutorV1:
         self._runtime_confirm = {}
         self._last_reconcile_summary = {}
         self._last_reconcile_skipped_due_cap = False
+        self._capacity_guard_state = {}
+        self._execution_cost_step_metrics = {
+            "orders_placed": 0,
+            "orders_rejected": 0,
+            "orders_canceled": 0,
+            "orders_repriced": 0,
+            "fills": 0,
+            "missed_fill_opportunities": 0,
+            "fill_spread_samples": [],
+            "fill_adverse_selection_samples": [],
+        }
 
     def _append_runtime_warning(self, code: str) -> None:
         c = str(code).strip()
@@ -808,6 +853,12 @@ class GridExecutorV1:
         cfg = self._execution_cfg(plan)
         post_cfg = cfg.get("post_only", {}) if isinstance(cfg.get("post_only"), dict) else {}
         conf_cfg = cfg.get("confirm_hooks", {}) if isinstance(cfg.get("confirm_hooks"), dict) else {}
+        cap_cfg = cfg.get("capacity_cap", {}) if isinstance(cfg.get("capacity_cap"), dict) else {}
+        cost_cfg = (
+            cfg.get("execution_cost_feedback", {})
+            if isinstance(cfg.get("execution_cost_feedback"), dict)
+            else {}
+        )
         rec_cfg = cfg.get("reconcile", {}) if isinstance(cfg.get("reconcile"), dict) else {}
         ccxt_cfg = cfg.get("ccxt", {}) if isinstance(cfg.get("ccxt"), dict) else {}
 
@@ -861,6 +912,86 @@ class GridExecutorV1:
         self._confirm_depth_thinning_max = depth_max if depth_max is not None and depth_max > 0 else None
         jump_max = _safe_float(conf_cfg.get("jump_max"), default=self._confirm_jump_max)
         self._confirm_jump_max = jump_max if jump_max is not None and jump_max > 0 else None
+
+        self._capacity_cap_enabled = _safe_bool(cap_cfg.get("enabled"), self._capacity_cap_enabled)
+        self._capacity_spread_wide_threshold = max(
+            _safe_float(cap_cfg.get("spread_wide_threshold"), default=self._capacity_spread_wide_threshold) or 0.0,
+            0.0,
+        )
+        self._capacity_depth_thin_threshold = max(
+            _safe_float(cap_cfg.get("depth_thin_threshold"), default=self._capacity_depth_thin_threshold) or 0.0,
+            0.0,
+        )
+        self._capacity_spread_cap_multiplier = max(
+            _safe_float(cap_cfg.get("spread_cap_multiplier"), default=self._capacity_spread_cap_multiplier) or 0.0,
+            0.0,
+        )
+        self._capacity_depth_cap_multiplier = max(
+            _safe_float(cap_cfg.get("depth_cap_multiplier"), default=self._capacity_depth_cap_multiplier) or 0.0,
+            0.0,
+        )
+        self._capacity_min_rung_cap = max(
+            _safe_int(cap_cfg.get("min_rung_cap"), self._capacity_min_rung_cap),
+            1,
+        )
+        self._capacity_top_book_safety_fraction = max(
+            _safe_float(
+                cap_cfg.get("top_book_safety_fraction"),
+                default=self._capacity_top_book_safety_fraction,
+            )
+            or 0.0,
+            0.0,
+        )
+        self._capacity_delay_replenish_on_thin = _safe_bool(
+            cap_cfg.get("delay_replenish_on_thin"),
+            self._capacity_delay_replenish_on_thin,
+        )
+
+        self._execution_cost_feedback_enabled = _safe_bool(
+            cost_cfg.get("enabled"),
+            self._execution_cost_feedback_enabled,
+        )
+        window = max(_safe_int(cost_cfg.get("window"), self._execution_cost_window), 1)
+        if window != self._execution_cost_window:
+            self._execution_cost_window = int(window)
+            self._execution_cost_calibrator = EmpiricalCostCalibrator(self._execution_cost_window)
+        self._execution_cost_percentile = float(
+            np.clip(
+                _safe_float(cost_cfg.get("percentile"), default=self._execution_cost_percentile)
+                or self._execution_cost_percentile,
+                0.0,
+                100.0,
+            )
+        )
+        self._execution_cost_min_samples = max(
+            _safe_int(cost_cfg.get("min_samples"), self._execution_cost_min_samples),
+            1,
+        )
+        self._execution_cost_stale_steps = max(
+            _safe_int(cost_cfg.get("stale_steps"), self._execution_cost_stale_steps),
+            0,
+        )
+        self._execution_cost_retry_penalty_pct = max(
+            _safe_float(
+                cost_cfg.get("retry_penalty_pct"),
+                default=self._execution_cost_retry_penalty_pct,
+            )
+            or 0.0,
+            0.0,
+        )
+        self._execution_cost_missed_fill_penalty_pct = max(
+            _safe_float(
+                cost_cfg.get("missed_fill_penalty_pct"),
+                default=self._execution_cost_missed_fill_penalty_pct,
+            )
+            or 0.0,
+            0.0,
+        )
+        artifact_rel = str(cost_cfg.get("artifact_dir") or "").strip()
+        if artifact_rel:
+            self._execution_cost_artifact_root = (
+                Path(self.state_out).resolve().parent / artifact_rel
+            )
 
         self._reconcile_price_tol_ticks = max(
             _safe_int(rec_cfg.get("price_tol_ticks"), self._reconcile_price_tol_ticks),
@@ -1058,6 +1189,418 @@ class GridExecutorV1:
             "post_only_burst": burst,
         }
 
+    def _extract_capacity_inputs(self, plan: Dict) -> Dict[str, object]:
+        runtime = plan.get("runtime_state", {}) or {}
+        runtime_hints = plan.get("runtime_hints", {}) or {}
+        signals = plan.get("signals", {}) or {}
+        diagnostics = plan.get("diagnostics", {}) or {}
+        capacity_hint = runtime_hints.get("capacity_hint") or {}
+        if not isinstance(capacity_hint, dict):
+            capacity_hint = {}
+
+        spread_pct = _safe_float(runtime.get("spread_pct"), default=None)
+        if spread_pct is None:
+            spread_pct = _safe_float(diagnostics.get("spread_pct"), default=None)
+        if spread_pct is None:
+            spread_pct = _safe_float(signals.get("spread_pct"), default=None)
+        if spread_pct is None:
+            spread_pct = _safe_float((plan.get("grid", {}) or {}).get("est_spread_pct"), default=None)
+
+        depth_thinning = _safe_float(runtime.get("depth_thinning_score"), default=None)
+        if depth_thinning is None:
+            depth_thinning = _safe_float(diagnostics.get("depth_thinning_score"), default=None)
+        if depth_thinning is None:
+            depth_thinning = _safe_float(signals.get("depth_thinning_score"), default=None)
+
+        top_book_notional = _safe_float(runtime.get("top_book_notional"), default=None)
+        if top_book_notional is None:
+            bid_notional = _safe_float(runtime.get("top_bid_notional"), default=None)
+            ask_notional = _safe_float(runtime.get("top_ask_notional"), default=None)
+            vals = [x for x in [bid_notional, ask_notional] if x is not None and x > 0]
+            if vals:
+                top_book_notional = float(min(vals))
+        if top_book_notional is None:
+            depth_top_levels = runtime.get("depth_top_levels_notional")
+            if isinstance(depth_top_levels, dict):
+                vals = [
+                    _safe_float(depth_top_levels.get("bid"), default=None),
+                    _safe_float(depth_top_levels.get("ask"), default=None),
+                ]
+                vals = [x for x in vals if x is not None and x > 0]
+                if vals:
+                    top_book_notional = float(min(vals))
+            else:
+                top_book_notional = _safe_float(depth_top_levels, default=None)
+
+        runtime_capacity_ok = True
+        runtime_reasons: List[str] = []
+        runtime_cap_ok_raw = runtime.get("capacity_ok")
+        if isinstance(runtime_cap_ok_raw, bool):
+            runtime_capacity_ok = bool(runtime_cap_ok_raw)
+        for src in (
+            runtime.get("capacity_reasons"),
+            diagnostics.get("capacity_reasons"),
+            capacity_hint.get("reason"),
+        ):
+            if isinstance(src, list):
+                runtime_reasons.extend([str(x) for x in src if str(x).strip()])
+            elif src is not None and str(src).strip():
+                runtime_reasons.append(str(src))
+
+        hint_allow = capacity_hint.get("allow_start")
+        hint_advisory_only = capacity_hint.get("advisory_only")
+        if isinstance(hint_allow, bool):
+            advisory = bool(hint_advisory_only) if isinstance(hint_advisory_only, bool) else True
+            if not hint_allow and not advisory:
+                runtime_capacity_ok = False
+                if "BLOCK_CAPACITY_THIN" not in runtime_reasons:
+                    runtime_reasons.append("BLOCK_CAPACITY_THIN")
+
+        preferred_rung_cap = _safe_int((plan.get("capital_policy", {}) or {}).get("preferred_rung_cap"), 0)
+        if preferred_rung_cap is not None and preferred_rung_cap <= 0:
+            preferred_rung_cap = _safe_int(capacity_hint.get("preferred_rung_cap"), default=None)
+
+        return {
+            "spread_pct": spread_pct,
+            "depth_thinning_score": depth_thinning,
+            "top_book_notional": top_book_notional,
+            "runtime_capacity_ok": bool(runtime_capacity_ok),
+            "runtime_reasons": runtime_reasons,
+            "preferred_rung_cap": preferred_rung_cap,
+        }
+
+    def _compute_capacity_state(
+        self,
+        plan: Dict,
+        *,
+        n_levels: int,
+        grid_budget_pct: float,
+    ) -> Dict[str, object]:
+        if not self._capacity_cap_enabled:
+            state = {
+                "enabled": False,
+                "capacity_ok": True,
+                "max_safe_active_rungs": int(self.max_orders_per_side),
+                "max_safe_rung_notional": None,
+                "reasons": [],
+                "delay_replenishment": False,
+                "preferred_rung_cap": None,
+                "base_rung_cap": int(self.max_orders_per_side),
+                "applied_rung_cap": int(self.max_orders_per_side),
+                "rung_cap_applied": False,
+                "spread_pct": None,
+                "depth_thinning_score": None,
+                "top_book_notional": None,
+            }
+            self._capacity_guard_state = state
+            return state
+
+        inputs = self._extract_capacity_inputs(plan)
+        state = compute_dynamic_capacity_state(
+            max_orders_per_side=int(self.max_orders_per_side),
+            n_levels=int(n_levels),
+            quote_total=float(self.quote_total),
+            grid_budget_pct=float(grid_budget_pct),
+            preferred_rung_cap=_safe_int(inputs.get("preferred_rung_cap"), default=None),
+            runtime_spread_pct=_safe_float(inputs.get("spread_pct"), default=None),
+            runtime_depth_thinning_score=_safe_float(inputs.get("depth_thinning_score"), default=None),
+            top_book_notional=_safe_float(inputs.get("top_book_notional"), default=None),
+            runtime_capacity_ok=bool(inputs.get("runtime_capacity_ok", True)),
+            runtime_reasons=[str(x) for x in (inputs.get("runtime_reasons") or [])],
+            spread_wide_threshold=float(self._capacity_spread_wide_threshold),
+            depth_thin_threshold=float(self._capacity_depth_thin_threshold),
+            spread_cap_multiplier=float(self._capacity_spread_cap_multiplier),
+            depth_cap_multiplier=float(self._capacity_depth_cap_multiplier),
+            min_rung_cap=int(self._capacity_min_rung_cap),
+            top_book_safety_fraction=float(self._capacity_top_book_safety_fraction),
+            delay_replenish_on_thin=bool(self._capacity_delay_replenish_on_thin),
+        )
+        state["enabled"] = True
+        self._capacity_guard_state = state
+        if bool(state.get("rung_cap_applied")):
+            self._capacity_rung_cap_applied_total = int(self._capacity_rung_cap_applied_total + 1)
+            self._append_runtime_exec_event("EXEC_CAPACITY_RUNG_CAP_APPLIED")
+        if not bool(state.get("capacity_ok", True)):
+            self._append_runtime_warning("BLOCK_CAPACITY_THIN")
+            self._append_runtime_pause_reason("BLOCK_CAPACITY_THIN")
+        return state
+
+    def _enforce_capacity_rung_cap(
+        self,
+        orders: List[RestingOrder],
+        *,
+        rung_cap: int,
+        ref_price: float,
+        symbol: Optional[str] = None,
+    ) -> List[RestingOrder]:
+        cap = max(int(rung_cap), 0)
+        if cap <= 0:
+            return []
+
+        def _rank(side_orders: List[RestingOrder]) -> List[RestingOrder]:
+            return sorted(
+                side_orders,
+                key=lambda o: (
+                    abs(float(o.price) - float(ref_price)),
+                    abs(int(o.level_index)),
+                    float(o.price),
+                ),
+            )
+
+        buys = [o for o in orders if str(o.side).lower() == "buy"]
+        sells = [o for o in orders if str(o.side).lower() == "sell"]
+        keep_ids = {
+            id(o)
+            for o in (_rank(buys)[:cap] + _rank(sells)[:cap])
+        }
+        out: List[RestingOrder] = []
+        for o in orders:
+            if id(o) in keep_ids:
+                out.append(o)
+            else:
+                o.status = "canceled"
+                if symbol is not None:
+                    self._record_order_lifecycle_event(
+                        symbol=symbol,
+                        event_type="canceled",
+                        side=o.side,
+                        price=o.price,
+                        qty_base=o.qty_base,
+                        level_index=o.level_index,
+                        order_id=o.order_id,
+                        reason="capacity_rung_cap",
+                        phase="capacity",
+                    )
+        return out
+
+    def _execution_cost_paths(self, symbol: str) -> Dict[str, str]:
+        pair_fs = _pair_fs(symbol)
+        paths = self._execution_cost_artifact_paths_by_pair.get(pair_fs)
+        if paths:
+            return paths
+        root = Path(self._execution_cost_artifact_root).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        pair_dir = root / pair_fs
+        pair_dir.mkdir(parents=True, exist_ok=True)
+        paths = {
+            "artifact_latest": str(pair_dir / "execution_cost_calibration.latest.json"),
+            "artifact_archive_dir": str(pair_dir),
+            "orders_lifecycle": str(pair_dir / "order_lifecycle.jsonl"),
+            "fills_lifecycle": str(pair_dir / "fills_lifecycle.jsonl"),
+        }
+        self._execution_cost_artifact_paths_by_pair[pair_fs] = paths
+        return paths
+
+    @staticmethod
+    def _append_jsonl(path: str, payload: Dict[str, object]) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+    def _record_order_lifecycle_event(
+        self,
+        *,
+        symbol: str,
+        event_type: str,
+        side: Optional[str] = None,
+        price: Optional[float] = None,
+        qty_base: Optional[float] = None,
+        level_index: Optional[int] = None,
+        order_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        phase: Optional[str] = None,
+    ) -> None:
+        if not self._execution_cost_feedback_enabled:
+            return
+        payload: Dict[str, object] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pair": str(symbol),
+            "event_type": str(event_type),
+            "mode": str(self.mode),
+            "side": str(side) if side is not None else None,
+            "price": float(price) if price is not None else None,
+            "qty_base": float(qty_base) if qty_base is not None else None,
+            "level_index": int(level_index) if level_index is not None else None,
+            "order_id": str(order_id) if order_id is not None else None,
+            "reason": str(reason) if reason is not None else None,
+            "phase": str(phase) if phase is not None else None,
+        }
+        paths = self._execution_cost_paths(symbol)
+        self._append_jsonl(paths["orders_lifecycle"], payload)
+        step = self._execution_cost_step_metrics
+        evt = str(event_type).lower()
+        if evt in ("placed", "seeded", "replenished"):
+            step["orders_placed"] = int(step.get("orders_placed", 0) + 1)
+        elif evt in ("rejected", "post_only_reject"):
+            step["orders_rejected"] = int(step.get("orders_rejected", 0) + 1)
+        elif evt == "canceled":
+            step["orders_canceled"] = int(step.get("orders_canceled", 0) + 1)
+        elif evt == "repriced":
+            step["orders_repriced"] = int(step.get("orders_repriced", 0) + 1)
+        elif evt == "missed_fill":
+            step["missed_fill_opportunities"] = int(step.get("missed_fill_opportunities", 0) + 1)
+
+    def _record_fill_lifecycle_event(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        price: float,
+        qty_base: float,
+        level_index: int,
+        order_id: Optional[str],
+        ref_price: Optional[float],
+        reason: str,
+    ) -> None:
+        if not self._execution_cost_feedback_enabled:
+            return
+        spread_pct = None
+        adverse_pct = None
+        if ref_price is not None and float(ref_price) > 0:
+            spread_pct = abs(float(price) - float(ref_price)) / float(ref_price)
+            if str(side).lower() == "buy":
+                adverse_pct = max(float(ref_price) - float(price), 0.0) / float(ref_price)
+            else:
+                adverse_pct = max(float(price) - float(ref_price), 0.0) / float(ref_price)
+        payload: Dict[str, object] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pair": str(symbol),
+            "event_type": "fill",
+            "mode": str(self.mode),
+            "side": str(side),
+            "price": float(price),
+            "qty_base": float(qty_base),
+            "level_index": int(level_index),
+            "order_id": str(order_id) if order_id is not None else None,
+            "ref_price": float(ref_price) if ref_price is not None else None,
+            "realized_spread_pct": spread_pct,
+            "adverse_selection_pct": adverse_pct,
+            "reason": str(reason),
+        }
+        paths = self._execution_cost_paths(symbol)
+        self._append_jsonl(paths["fills_lifecycle"], payload)
+        step = self._execution_cost_step_metrics
+        step["fills"] = int(step.get("fills", 0) + 1)
+        if spread_pct is not None:
+            spreads = step.get("fill_spread_samples", [])
+            spreads.append(float(spread_pct))
+            step["fill_spread_samples"] = spreads
+        if adverse_pct is not None:
+            advs = step.get("fill_adverse_selection_samples", [])
+            advs.append(float(adverse_pct))
+            step["fill_adverse_selection_samples"] = advs
+
+    def _publish_execution_cost_artifact(
+        self,
+        *,
+        plan: Dict,
+        symbol: str,
+        ref_price: Optional[float],
+        prev_mark_price: Optional[float],
+    ) -> None:
+        if not self._execution_cost_feedback_enabled:
+            self._execution_cost_last_artifact = None
+            return
+
+        step = self._execution_cost_step_metrics
+        spreads = [float(x) for x in (step.get("fill_spread_samples") or [])]
+        adverse = [float(x) for x in (step.get("fill_adverse_selection_samples") or [])]
+        spread_sample = float(np.mean(spreads)) if spreads else _safe_float(
+            (plan.get("runtime_state", {}) or {}).get("spread_pct"),
+            default=_safe_float((plan.get("grid", {}) or {}).get("est_spread_pct"), default=0.0),
+        )
+        adverse_sample = float(np.mean(adverse)) if adverse else None
+        if adverse_sample is None and prev_mark_price is not None and ref_price not in (None, 0):
+            adverse_sample = abs(float(ref_price) - float(prev_mark_price)) / float(ref_price)
+
+        placed = int(step.get("orders_placed", 0))
+        rejected = int(step.get("orders_rejected", 0))
+        fills = int(step.get("fills", 0))
+        missed = int(step.get("missed_fill_opportunities", 0))
+        retry_reject_rate = float(rejected / max(placed + rejected, 1))
+        missed_fill_rate = float(missed / max(missed + fills, 1))
+
+        sample = self._execution_cost_calibrator.observe(
+            symbol,
+            spread_pct=spread_sample,
+            adverse_selection_pct=adverse_sample,
+            retry_reject_rate=retry_reject_rate,
+            missed_fill_rate=missed_fill_rate,
+            retry_penalty_pct=float(self._execution_cost_retry_penalty_pct),
+            missed_fill_penalty_pct=float(self._execution_cost_missed_fill_penalty_pct),
+            recommended_floor_pct=None,
+        )
+        snapshot = self._execution_cost_calibrator.snapshot(
+            symbol,
+            percentile=float(self._execution_cost_percentile),
+            min_samples=int(self._execution_cost_min_samples),
+            stale_bars=int(self._execution_cost_stale_steps),
+        )
+        cost_model_source = "empirical"
+        if bool(snapshot.get("stale", True)):
+            cost_model_source = "static"
+        total_pct = _safe_float(snapshot.get("total_cost_pct_percentile"), default=None)
+        if total_pct is None:
+            total_pct = _safe_float(sample.get("total_pct"), default=0.0)
+        artifact = {
+            "schema_version": "1.0.0",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "pair": str(symbol),
+            "window": int(self._execution_cost_window),
+            "sample_count": int(snapshot.get("sample_count", 0)),
+            "cost_model_source": str(cost_model_source),
+            "percentile": float(self._execution_cost_percentile),
+            "realized_spread_pct": float(
+                _safe_float(snapshot.get("spread_pct_percentile"), default=spread_sample or 0.0) or 0.0
+            ),
+            "adverse_selection_pct": float(
+                _safe_float(snapshot.get("adverse_selection_pct_percentile"), default=adverse_sample or 0.0) or 0.0
+            ),
+            "post_only_retry_reject_rate": float(
+                _safe_float(snapshot.get("retry_reject_rate_percentile"), default=retry_reject_rate) or 0.0
+            ),
+            "missed_fill_opportunity_rate": float(
+                _safe_float(snapshot.get("missed_fill_rate_percentile"), default=missed_fill_rate) or 0.0
+            ),
+            "recommended_cost_floor_bps": float(max(total_pct or 0.0, 0.0) * 10_000.0),
+            "notes": {
+                "orders_placed_step": int(placed),
+                "orders_rejected_step": int(rejected),
+                "orders_canceled_step": int(step.get("orders_canceled", 0)),
+                "orders_repriced_step": int(step.get("orders_repriced", 0)),
+                "fills_step": int(fills),
+                "missed_fill_opportunities_step": int(missed),
+                "capacity_replenish_skipped_total": int(self._capacity_replenish_skipped_total),
+                "capacity_rung_cap_applied_total": int(self._capacity_rung_cap_applied_total),
+            },
+        }
+        schema_errors = validate_schema(artifact, "execution_cost_calibration.schema.json")
+        if schema_errors:
+            self._append_runtime_warning("WARN_COST_ARTIFACT_SCHEMA_INVALID")
+            log_event(
+                "warning",
+                "execution_cost_artifact_schema_invalid",
+                errors=schema_errors[:3],
+                pair=symbol,
+            )
+            return
+
+        paths = self._execution_cost_paths(symbol)
+        Path(paths["orders_lifecycle"]).touch(exist_ok=True)
+        Path(paths["fills_lifecycle"]).touch(exist_ok=True)
+        write_json(paths["artifact_latest"], artifact)
+        sample_count = int(artifact.get("sample_count", 0))
+        prev_written = int(self._execution_cost_samples_written_by_pair.get(symbol, -1))
+        if sample_count > prev_written:
+            ts_safe = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archive_path = str(
+                Path(paths["artifact_archive_dir"]) / f"execution_cost_calibration.{ts_safe}.json"
+            )
+            write_json(archive_path, artifact)
+            self._execution_cost_samples_written_by_pair[symbol] = sample_count
+        self._execution_cost_last_artifact = artifact
+
     def _order_match_tolerant(
         self,
         desired: RestingOrder,
@@ -1126,6 +1669,7 @@ class GridExecutorV1:
         ref_price: float,
         limits: Dict,
         grid_budget_pct: float,
+        rung_cap_per_side: Optional[int] = None,
         rung_weights: Optional[List[float]] = None,
     ) -> List[RestingOrder]:
         """
@@ -1146,11 +1690,15 @@ class GridExecutorV1:
                 if self.base_total > 0:
                     sells.append((i, px))
 
+        side_cap = int(self.max_orders_per_side)
+        if rung_cap_per_side is not None:
+            side_cap = max(min(int(rung_cap_per_side), side_cap), 0)
+
         # cap per side
-        if len(buys) > self.max_orders_per_side:
-            buys = buys[-self.max_orders_per_side:]
-        if len(sells) > self.max_orders_per_side:
-            sells = sells[:self.max_orders_per_side]
+        if len(buys) > side_cap:
+            buys = buys[-side_cap:]
+        if len(sells) > side_cap:
+            sells = sells[:side_cap]
 
         out: List[RestingOrder] = []
         fee = self.maker_fee_pct / 100.0
@@ -1237,7 +1785,17 @@ class GridExecutorV1:
                 self._ccxt_backoff_until_ts = 0.0
                 self._last_ccxt_error = None
                 self._post_only_reject_streak = 0
-                return (res or {}).get("id")
+                order_id = (res or {}).get("id")
+                self._record_order_lifecycle_event(
+                    symbol=symbol,
+                    event_type="placed",
+                    side=side,
+                    price=curr_px,
+                    qty_base=qt,
+                    order_id=str(order_id) if order_id is not None else None,
+                    reason="ccxt_create_limit",
+                )
+                return order_id
             except Exception as exc:
                 last_err = str(exc)
                 self._last_ccxt_error = str(exc)
@@ -1262,6 +1820,14 @@ class GridExecutorV1:
 
                 self._register_post_only_reject(str(exc))
                 self._append_runtime_exec_event("EXEC_POST_ONLY_RETRY")
+                self._record_order_lifecycle_event(
+                    symbol=symbol,
+                    event_type="post_only_reject",
+                    side=side,
+                    price=curr_px,
+                    qty_base=qt,
+                    reason=str(exc),
+                )
                 if attempt >= (max_attempts - 1):
                     break
 
@@ -1276,6 +1842,14 @@ class GridExecutorV1:
                     time.sleep(float(backoff_ms) / 1000.0)
 
         if last_err is not None:
+            self._record_order_lifecycle_event(
+                symbol=symbol,
+                event_type="rejected",
+                side=side,
+                price=curr_px,
+                qty_base=qt,
+                reason=last_err,
+            )
             log_event(
                 "warning",
                 "place_limit_failed",
@@ -1356,7 +1930,20 @@ class GridExecutorV1:
             oid = str(live_rows[j].get("order_id") or "").strip()
             if not oid:
                 continue
+            side = str(live_rows[j].get("side") or "")
+            price = _safe_float(live_rows[j].get("price"), default=None)
+            qty = _safe_float(live_rows[j].get("amount"), default=None)
             self._ccxt_cancel_order(oid, symbol)
+            self._record_order_lifecycle_event(
+                symbol=symbol,
+                event_type="canceled",
+                side=side,
+                price=price,
+                qty_base=qty,
+                order_id=oid,
+                reason="reconcile_stale",
+                phase="reconcile",
+            )
             action_budget -= 1
             cancel_count += 1
 
@@ -1374,6 +1961,16 @@ class GridExecutorV1:
                 ro.order_id = None
                 ro.status = "rejected"
                 skipped_due_cap = True
+                self._record_order_lifecycle_event(
+                    symbol=symbol,
+                    event_type="rejected",
+                    side=ro.side,
+                    price=ro.price,
+                    qty_base=ro.qty_base,
+                    level_index=ro.level_index,
+                    reason="reconcile_action_cap",
+                    phase="reconcile",
+                )
                 new_orders.append(ro)
                 continue
 
@@ -1464,6 +2061,8 @@ class GridExecutorV1:
         limits: Dict,
         *,
         fill_bar_index: int,
+        ref_price: Optional[float],
+        capacity_state: Dict[str, object],
     ) -> None:
         """
         Fetch user trades since last_trade_ms and:
@@ -1530,7 +2129,52 @@ class GridExecutorV1:
             filled_qty = amount
             if filled_qty > 0:
                 if self._fill_guard.allow(ro.side, ro.level_index, fill_bar_index):
+                    self._record_fill_lifecycle_event(
+                        symbol=symbol,
+                        side=side,
+                        price=price,
+                        qty_base=filled_qty,
+                        level_index=ro.level_index,
+                        order_id=oid if oid else ro.order_id,
+                        ref_price=ref_price,
+                        reason="trade_fill",
+                    )
                     action_attempted = False
+                    replenish_side = "sell" if ro.side == "buy" else "buy"
+                    rung_cap = max(_safe_int(capacity_state.get("applied_rung_cap"), self.max_orders_per_side), 0)
+                    delay_replenish = bool(capacity_state.get("delay_replenishment", False))
+                    active_on_side = int(
+                        len(
+                            [
+                                x
+                                for x in self._orders
+                                if x.status in ("open", "partial")
+                                and str(x.side).lower() == replenish_side
+                            ]
+                        )
+                    )
+                    if delay_replenish:
+                        self._capacity_replenish_skipped_total = int(self._capacity_replenish_skipped_total + 1)
+                        self._record_order_lifecycle_event(
+                            symbol=symbol,
+                            event_type="missed_fill",
+                            side=replenish_side,
+                            qty_base=filled_qty,
+                            reason="capacity_delay_replenishment",
+                            phase="replenish",
+                        )
+                        continue
+                    if rung_cap > 0 and active_on_side >= rung_cap:
+                        self._capacity_replenish_skipped_total = int(self._capacity_replenish_skipped_total + 1)
+                        self._record_order_lifecycle_event(
+                            symbol=symbol,
+                            event_type="missed_fill",
+                            side=replenish_side,
+                            qty_base=filled_qty,
+                            reason="capacity_rung_cap_reached",
+                            phase="replenish",
+                        )
+                        continue
                     if ro.side == "buy":
                         next_idx = ro.level_index + 1
                         px = self._levels_for_index(levels, next_idx)
@@ -1541,6 +2185,18 @@ class GridExecutorV1:
                                 action_attempted = True
                                 new_oid = self._ccxt_place_limit("sell", symbol, new_qty, new_px, limits)
                                 self._orders.append(RestingOrder("sell", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
+                                if new_oid is not None:
+                                    self._record_order_lifecycle_event(
+                                        symbol=symbol,
+                                        event_type="replenished",
+                                        side="sell",
+                                        price=new_px,
+                                        qty_base=new_qty,
+                                        level_index=next_idx,
+                                        order_id=str(new_oid),
+                                        reason="replace_on_fill",
+                                        phase="replenish",
+                                    )
                     else:
                         next_idx = ro.level_index - 1
                         px = self._levels_for_index(levels, next_idx)
@@ -1551,6 +2207,18 @@ class GridExecutorV1:
                                 action_attempted = True
                                 new_oid = self._ccxt_place_limit("buy", symbol, new_qty, new_px, limits)
                                 self._orders.append(RestingOrder("buy", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
+                                if new_oid is not None:
+                                    self._record_order_lifecycle_event(
+                                        symbol=symbol,
+                                        event_type="replenished",
+                                        side="buy",
+                                        price=new_px,
+                                        qty_base=new_qty,
+                                        level_index=next_idx,
+                                        order_id=str(new_oid),
+                                        reason="replace_on_fill",
+                                        phase="replenish",
+                                    )
                     if action_attempted:
                         self._fill_guard.mark(ro.side, ro.level_index, fill_bar_index)
 
@@ -1637,6 +2305,14 @@ class GridExecutorV1:
                 raw_action = "STOP"
                 self._last_stop_reason = "sl_hit"
 
+        grid_budget_pct = float(plan.get("capital_policy", {}).get("grid_budget_pct", 1.0))
+        grid_budget_pct = float(np.clip(grid_budget_pct, 0.0, 1.0))
+        capacity_state = self._compute_capacity_state(
+            plan,
+            n_levels=n_levels,
+            grid_budget_pct=grid_budget_pct,
+        )
+
         # Refresh balances (ccxt)
         if self.mode == "ccxt":
             self._sync_balance_ccxt()
@@ -1647,6 +2323,8 @@ class GridExecutorV1:
                     levels,
                     limits,
                     fill_bar_index=fill_bar_index,
+                    ref_price=ref_price,
+                    capacity_state=capacity_state,
                 )
 
         rebuild = False
@@ -1684,6 +2362,17 @@ class GridExecutorV1:
                     # Duplicate STOP on already-cleared state: suppress churn.
                     effective_action = "HOLD"
                     suppression_reason = "duplicate_stop_already_cleared"
+
+        if effective_action == "START":
+            if not bool(capacity_state.get("capacity_ok", True)):
+                effective_action = "HOLD"
+                suppression_reason = "capacity_thin_block"
+                self._append_runtime_exec_event("BLOCK_CAPACITY_THIN")
+                log_event(
+                    "warning",
+                    "capacity_blocked_start",
+                    capacity_state=capacity_state,
+                )
 
         if effective_action == "START":
             confirm_phase = "rebuild" if (rebuild and has_active_orders) else "entry"
@@ -1768,6 +2457,12 @@ class GridExecutorV1:
 
             self._orders = []
             self._record_applied_plan(plan)
+            self._publish_execution_cost_artifact(
+                plan=plan,
+                symbol=symbol,
+                ref_price=ref_price,
+                prev_mark_price=prev_mark_price,
+            )
             self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
             self._prev_plan = plan
             self._last_effective_action_signature = _action_signature(
@@ -1775,13 +2470,16 @@ class GridExecutorV1:
             )
             return
 
-        grid_budget_pct = float(plan.get("capital_policy", {}).get("grid_budget_pct", 1.0))
-        grid_budget_pct = float(np.clip(grid_budget_pct, 0.0, 1.0))
-
         # HOLD: manage only existing ladder, never seed from empty.
         if effective_action == "HOLD":
             if not has_active_orders:
                 self._record_applied_plan(plan)
+                self._publish_execution_cost_artifact(
+                    plan=plan,
+                    symbol=symbol,
+                    ref_price=ref_price,
+                    prev_mark_price=prev_mark_price,
+                )
                 self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
                 self._prev_plan = plan
                 self._last_effective_action_signature = _action_signature("HOLD", plan_sig)
@@ -1793,16 +2491,46 @@ class GridExecutorV1:
                     px = self._levels_for_index(levels, o.level_index)
                     if px is None:
                         continue
+                    old_px = float(o.price)
                     if self.exchange is not None:
                         px = float(quantize_price(self.exchange, symbol, px))
                     o.price = float(px)
+                    if abs(float(old_px) - float(o.price)) > 1e-12:
+                        self._record_order_lifecycle_event(
+                            symbol=symbol,
+                            event_type="repriced",
+                            side=o.side,
+                            price=o.price,
+                            qty_base=o.qty_base,
+                            level_index=o.level_index,
+                            order_id=o.order_id,
+                            phase="soft_adjust",
+                        )
+
+            desired = [o for o in self._orders if o.status in ("open", "partial")]
+            desired = self._enforce_capacity_rung_cap(
+                desired,
+                rung_cap=_safe_int(
+                    capacity_state.get("applied_rung_cap"),
+                    self.max_orders_per_side,
+                ),
+                ref_price=float(ref_price),
+                symbol=symbol,
+            )
 
             # Keep live venue in sync without seeding new ladder.
             if self.mode == "ccxt":
-                desired = [o for o in self._orders if o.status in ("open", "partial")]
                 self._ccxt_reconcile_set(desired, symbol, limits)
+            else:
+                self._orders = desired
 
             self._record_applied_plan(plan)
+            self._publish_execution_cost_artifact(
+                plan=plan,
+                symbol=symbol,
+                ref_price=ref_price,
+                prev_mark_price=prev_mark_price,
+            )
             self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
             self._prev_plan = plan
             self._last_effective_action_signature = _action_signature("HOLD", plan_sig)
@@ -1811,7 +2539,24 @@ class GridExecutorV1:
         # START: seed/rebuild/soft-adjust.
         if (not has_active_orders) or rebuild or self._prev_plan is None:
             desired = self._desired_initial_ladder(
-                levels, ref_price, limits, grid_budget_pct, rung_weights=rung_weights
+                levels,
+                ref_price,
+                limits,
+                grid_budget_pct,
+                rung_cap_per_side=_safe_int(
+                    capacity_state.get("applied_rung_cap"),
+                    self.max_orders_per_side,
+                ),
+                rung_weights=rung_weights,
+            )
+            desired = self._enforce_capacity_rung_cap(
+                desired,
+                rung_cap=_safe_int(
+                    capacity_state.get("applied_rung_cap"),
+                    self.max_orders_per_side,
+                ),
+                ref_price=float(ref_price),
+                symbol=symbol,
             )
 
             if self.exchange is not None:
@@ -1821,6 +2566,17 @@ class GridExecutorV1:
 
             if self.mode == "paper":
                 self._orders = desired
+                for ro in desired:
+                    self._record_order_lifecycle_event(
+                        symbol=symbol,
+                        event_type="seeded",
+                        side=ro.side,
+                        price=ro.price,
+                        qty_base=ro.qty_base,
+                        level_index=ro.level_index,
+                        order_id=ro.order_id,
+                        phase="seed",
+                    )
             else:
                 self._ccxt_reconcile_set(desired, symbol, limits)
 
@@ -1829,19 +2585,57 @@ class GridExecutorV1:
                 px = self._levels_for_index(levels, o.level_index)
                 if px is None:
                     continue
+                old_px = float(o.price)
                 if self.exchange is not None:
                     px = float(quantize_price(self.exchange, symbol, px))
                 o.price = float(px)
+                if abs(float(old_px) - float(o.price)) > 1e-12:
+                    self._record_order_lifecycle_event(
+                        symbol=symbol,
+                        event_type="repriced",
+                        side=o.side,
+                        price=o.price,
+                        qty_base=o.qty_base,
+                        level_index=o.level_index,
+                        order_id=o.order_id,
+                        phase="soft_adjust",
+                    )
 
             if self.mode == "ccxt":
                 desired = [o for o in self._orders if o.status in ("open", "partial")]
+                desired = self._enforce_capacity_rung_cap(
+                    desired,
+                    rung_cap=_safe_int(
+                        capacity_state.get("applied_rung_cap"),
+                        self.max_orders_per_side,
+                    ),
+                    ref_price=float(ref_price),
+                    symbol=symbol,
+                )
                 self._ccxt_reconcile_set(desired, symbol, limits)
+            else:
+                desired = [o for o in self._orders if o.status in ("open", "partial")]
+                self._orders = self._enforce_capacity_rung_cap(
+                    desired,
+                    rung_cap=_safe_int(
+                        capacity_state.get("applied_rung_cap"),
+                        self.max_orders_per_side,
+                    ),
+                    ref_price=float(ref_price),
+                    symbol=symbol,
+                )
 
         else:
             # START and no plan change: keep current set.
             pass
 
         self._record_applied_plan(plan)
+        self._publish_execution_cost_artifact(
+            plan=plan,
+            symbol=symbol,
+            ref_price=ref_price,
+            prev_mark_price=prev_mark_price,
+        )
         self._write_state(plan, ex_name, symbol, step, n_levels, box_low, box_high)
         self._prev_plan = plan
         self._last_effective_action_signature = _action_signature("START", plan_sig)
@@ -1889,6 +2683,15 @@ class GridExecutorV1:
             "reconcile_skipped_due_cap": bool(self._last_reconcile_skipped_due_cap),
             "fill_guard_bar_seq": int(self._fill_guard_bar_seq),
             "fill_guard_last_clock_ts": self._fill_guard_last_clock_ts,
+            "capacity_guard": dict(self._capacity_guard_state or {}),
+            "capacity_rung_cap_applied_total": int(self._capacity_rung_cap_applied_total),
+            "capacity_replenish_skipped_total": int(self._capacity_replenish_skipped_total),
+            "execution_cost_feedback_enabled": bool(self._execution_cost_feedback_enabled),
+            "execution_cost_step_metrics": dict(self._execution_cost_step_metrics or {}),
+            "execution_cost_artifact": dict(self._execution_cost_last_artifact or {}),
+            "execution_cost_artifact_paths": dict(
+                self._execution_cost_paths(symbol) if self._execution_cost_feedback_enabled else {}
+            ),
             "ccxt_error_streak": int(self._ccxt_error_streak),
             "ccxt_backoff_until_ts": float(self._ccxt_backoff_until_ts),
             "last_ccxt_error": self._last_ccxt_error,
