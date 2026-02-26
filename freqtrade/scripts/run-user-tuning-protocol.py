@@ -61,12 +61,27 @@ DEFAULT_RANK_STABILITY: Dict[str, Any] = {
     "min_jaccard": 0.20,
 }
 
+DEFAULT_ML_OVERLAY_GATES: Dict[str, Any] = {
+    "enabled": False,
+    "min_range_auc": 0.52,
+    "min_breakout_auc": 0.52,
+    "max_range_brier": 0.30,
+    "max_breakout_brier": 0.30,
+    "max_range_ece": 0.20,
+    "max_breakout_ece": 0.20,
+    "min_range_coverage": 0.10,
+    "min_breakout_coverage": 0.10,
+    "require_ml_eval_pass": True,
+    "require_compare_pass": True,
+}
+
 DEFAULT_PROMOTION: Dict[str, Any] = {
     "objective_metric": "avg_pnl_pct",
     "objective_improvement_min": 0.05,
     "require_chaos_pass": True,
     "require_ablation_pass": True,
     "require_rank_stability_pass": True,
+    "require_ml_overlay_pass": False,
 }
 
 
@@ -198,6 +213,14 @@ def _summary_path(user_data: Path, run_id: str) -> Path:
     return user_data / "walkforward" / str(run_id).strip() / "summary.json"
 
 
+def _ml_eval_summary_path(user_data: Path, run_id: str) -> Path:
+    return user_data / "ml_overlay" / "walkforward" / str(run_id).strip() / "summary.json"
+
+
+def _ml_compare_summary_path(user_data: Path, run_id: str) -> Path:
+    return user_data / "ml_overlay" / "compare" / str(run_id).strip() / "summary.json"
+
+
 def _load_summary(user_data: Path, run_id: str) -> Optional[Dict[str, Any]]:
     rid = str(run_id or "").strip()
     if not rid:
@@ -206,6 +229,15 @@ def _load_summary(user_data: Path, run_id: str) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     payload = _read_json(path)
+    return payload if payload else None
+
+
+def _load_optional_json(path_str: str) -> Optional[Dict[str, Any]]:
+    txt = str(path_str or "").strip()
+    if not txt:
+        return None
+    path = Path(txt).resolve()
+    payload = _read_json(path) if path.exists() else {}
     return payload if payload else None
 
 
@@ -564,6 +596,157 @@ def _evaluate_chaos(
     }
 
 
+def _ml_target_metric(summary: Dict[str, Any], target: str, metric: str) -> Optional[float]:
+    targets = summary.get("targets", {}) if isinstance(summary.get("targets"), dict) else {}
+    block = targets.get(target, {}) if isinstance(targets.get(target), dict) else {}
+    value = block.get(metric)
+    if value is None:
+        return None
+    return float(_to_float(value, default=0.0))
+
+
+def _evaluate_ml_overlay_gate(
+    ml_eval_summary: Optional[Dict[str, Any]],
+    ml_compare_summary: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not bool(cfg.get("enabled", False)):
+        return {
+            "passed": True,
+            "checks": [_check("ml_overlay_gate_disabled", True, None, None, "==", skipped=True)],
+            "ml_eval": {},
+            "ml_compare": {},
+        }
+
+    checks: List[Dict[str, Any]] = []
+    has_eval = isinstance(ml_eval_summary, dict) and bool(ml_eval_summary)
+    checks.append(_check("ml_eval_summary_present", has_eval, bool(has_eval), True, "=="))
+
+    if has_eval:
+        range_auc = _ml_target_metric(ml_eval_summary or {}, "range_continuation", "auc")
+        breakout_auc = _ml_target_metric(ml_eval_summary or {}, "breakout_risk", "auc")
+        range_brier = _ml_target_metric(ml_eval_summary or {}, "range_continuation", "brier")
+        breakout_brier = _ml_target_metric(ml_eval_summary or {}, "breakout_risk", "brier")
+        range_ece = _ml_target_metric(ml_eval_summary or {}, "range_continuation", "ece")
+        breakout_ece = _ml_target_metric(ml_eval_summary or {}, "breakout_risk", "ece")
+        range_cov = _ml_target_metric(ml_eval_summary or {}, "range_continuation", "coverage")
+        breakout_cov = _ml_target_metric(ml_eval_summary or {}, "breakout_risk", "coverage")
+        eval_gate_pass = bool((ml_eval_summary or {}).get("gates", {}).get("passed", False))
+
+        checks.append(
+            _check(
+                "require_ml_eval_pass",
+                (not bool(cfg.get("require_ml_eval_pass", True))) or bool(eval_gate_pass),
+                bool(eval_gate_pass),
+                bool(cfg.get("require_ml_eval_pass", True)),
+                "==",
+                skipped=(not bool(cfg.get("require_ml_eval_pass", True))),
+            )
+        )
+        checks.append(
+            _check(
+                "min_range_auc",
+                range_auc is not None and float(range_auc) >= float(cfg.get("min_range_auc", 0.0)),
+                range_auc,
+                float(cfg.get("min_range_auc", 0.0)),
+                ">=",
+                skipped=(range_auc is None),
+            )
+        )
+        checks.append(
+            _check(
+                "min_breakout_auc",
+                breakout_auc is not None and float(breakout_auc) >= float(cfg.get("min_breakout_auc", 0.0)),
+                breakout_auc,
+                float(cfg.get("min_breakout_auc", 0.0)),
+                ">=",
+                skipped=(breakout_auc is None),
+            )
+        )
+        checks.append(
+            _check(
+                "max_range_brier",
+                range_brier is not None and float(range_brier) <= float(cfg.get("max_range_brier", 1.0)),
+                range_brier,
+                float(cfg.get("max_range_brier", 1.0)),
+                "<=",
+                skipped=(range_brier is None),
+            )
+        )
+        checks.append(
+            _check(
+                "max_breakout_brier",
+                breakout_brier is not None
+                and float(breakout_brier) <= float(cfg.get("max_breakout_brier", 1.0)),
+                breakout_brier,
+                float(cfg.get("max_breakout_brier", 1.0)),
+                "<=",
+                skipped=(breakout_brier is None),
+            )
+        )
+        checks.append(
+            _check(
+                "max_range_ece",
+                range_ece is not None and float(range_ece) <= float(cfg.get("max_range_ece", 1.0)),
+                range_ece,
+                float(cfg.get("max_range_ece", 1.0)),
+                "<=",
+                skipped=(range_ece is None),
+            )
+        )
+        checks.append(
+            _check(
+                "max_breakout_ece",
+                breakout_ece is not None and float(breakout_ece) <= float(cfg.get("max_breakout_ece", 1.0)),
+                breakout_ece,
+                float(cfg.get("max_breakout_ece", 1.0)),
+                "<=",
+                skipped=(breakout_ece is None),
+            )
+        )
+        checks.append(
+            _check(
+                "min_range_coverage",
+                range_cov is not None and float(range_cov) >= float(cfg.get("min_range_coverage", 0.0)),
+                range_cov,
+                float(cfg.get("min_range_coverage", 0.0)),
+                ">=",
+                skipped=(range_cov is None),
+            )
+        )
+        checks.append(
+            _check(
+                "min_breakout_coverage",
+                breakout_cov is not None and float(breakout_cov) >= float(cfg.get("min_breakout_coverage", 0.0)),
+                breakout_cov,
+                float(cfg.get("min_breakout_coverage", 0.0)),
+                ">=",
+                skipped=(breakout_cov is None),
+            )
+        )
+    else:
+        checks.append(_check("require_ml_eval_pass", False, False, True, "=="))
+
+    compare_required = bool(cfg.get("require_compare_pass", True))
+    has_compare = isinstance(ml_compare_summary, dict) and bool(ml_compare_summary)
+    if compare_required:
+        checks.append(_check("ml_compare_summary_present", has_compare, bool(has_compare), True, "=="))
+        compare_passed = bool((ml_compare_summary or {}).get("gates", {}).get("passed", False))
+        checks.append(_check("require_compare_pass", compare_passed, bool(compare_passed), True, "=="))
+    else:
+        checks.append(
+            _check("ml_compare_summary_present", True, bool(has_compare), True, "==", skipped=True)
+        )
+        checks.append(_check("require_compare_pass", True, None, None, "==", skipped=True))
+
+    return {
+        "passed": all(bool(c.get("passed")) or bool(c.get("skipped")) for c in checks),
+        "checks": checks,
+        "ml_eval": ml_eval_summary or {},
+        "ml_compare": ml_compare_summary or {},
+    }
+
+
 def _infer_slot(exp: Dict[str, Any], summary: Dict[str, Any]) -> str:
     if str(exp.get("slot") or "").strip():
         return str(exp.get("slot")).strip()
@@ -640,7 +823,7 @@ def _validate_summary_with_schema(summary: Dict[str, Any], schema: Dict[str, Any
         for k in metrics_req:
             if k not in m:
                 errors.append(f"experiment[{idx}] metrics missing field: {k}")
-        for gate_key in ("oos_gate", "chaos_gate", "ablation_gate", "rank_stability_gate"):
+        for gate_key in ("oos_gate", "chaos_gate", "ablation_gate", "rank_stability_gate", "ml_overlay_gate"):
             g = exp.get(gate_key, {}) if isinstance(exp.get(gate_key), dict) else {}
             for rk in gate_req:
                 if rk not in g:
@@ -691,6 +874,7 @@ def main() -> int:
     gates_abl_cfg = _deep_merge(DEFAULT_ABLATION_GATES, defaults.get("ablation_gates"))
     gates_chaos_cfg = _deep_merge(DEFAULT_CHAOS_GATES, defaults.get("chaos_gates"))
     gates_rank_cfg = _deep_merge(DEFAULT_RANK_STABILITY, defaults.get("rank_stability"))
+    gates_ml_overlay_cfg = _deep_merge(DEFAULT_ML_OVERLAY_GATES, defaults.get("ml_overlay_gates"))
     promotion_cfg = _deep_merge(DEFAULT_PROMOTION, defaults.get("promotion"))
 
     experiments = manifest.get("experiments", []) if isinstance(manifest.get("experiments"), list) else []
@@ -723,6 +907,7 @@ def main() -> int:
                     "ablation_gate": {"passed": False, "checks": []},
                     "chaos_gate": {"passed": False, "checks": []},
                     "rank_stability_gate": {"passed": False, "checks": []},
+                    "ml_overlay_gate": {"passed": False, "checks": []},
                     "promoted": False,
                 }
             )
@@ -751,6 +936,7 @@ def main() -> int:
                     "ablation_gate": {"passed": False, "checks": []},
                     "chaos_gate": {"passed": False, "checks": []},
                     "rank_stability_gate": {"passed": False, "checks": []},
+                    "ml_overlay_gate": {"passed": False, "checks": []},
                     "promoted": False,
                 }
             )
@@ -845,6 +1031,44 @@ def main() -> int:
         )
         chaos_gate = _evaluate_chaos(metrics, chaos_profiles_out, exp_chaos_cfg)
 
+        ml_overlay_root = exp.get("ml_overlay", {}) if isinstance(exp.get("ml_overlay"), dict) else {}
+        ml_eval_cfg = exp.get("ml_overlay_eval", {}) if isinstance(exp.get("ml_overlay_eval"), dict) else {}
+        if not ml_eval_cfg and isinstance(ml_overlay_root.get("eval"), dict):
+            ml_eval_cfg = ml_overlay_root.get("eval", {})
+        ml_compare_cfg = (
+            exp.get("ml_overlay_compare", {}) if isinstance(exp.get("ml_overlay_compare"), dict) else {}
+        )
+        if not ml_compare_cfg and isinstance(ml_overlay_root.get("compare"), dict):
+            ml_compare_cfg = ml_overlay_root.get("compare", {})
+
+        ml_eval_run_id = str(ml_eval_cfg.get("run_id") or "").strip()
+        ml_eval_summary = (
+            _load_optional_json(str(ml_eval_cfg.get("summary_path") or ""))
+            if str(ml_eval_cfg.get("summary_path") or "").strip()
+            else None
+        )
+        if ml_eval_summary is None and ml_eval_run_id:
+            ml_eval_path = _ml_eval_summary_path(user_data, ml_eval_run_id)
+            if ml_eval_path.exists():
+                ml_eval_summary = _read_json(ml_eval_path)
+
+        ml_compare_run_id = str(ml_compare_cfg.get("run_id") or "").strip()
+        ml_compare_summary = (
+            _load_optional_json(str(ml_compare_cfg.get("summary_path") or ""))
+            if str(ml_compare_cfg.get("summary_path") or "").strip()
+            else None
+        )
+        if ml_compare_summary is None and ml_compare_run_id:
+            ml_compare_path = _ml_compare_summary_path(user_data, ml_compare_run_id)
+            if ml_compare_path.exists():
+                ml_compare_summary = _read_json(ml_compare_path)
+
+        exp_ml_cfg = _deep_merge(
+            gates_ml_overlay_cfg,
+            exp.get("ml_overlay_gates") if isinstance(exp.get("ml_overlay_gates"), dict) else None,
+        )
+        ml_overlay_gate = _evaluate_ml_overlay_gate(ml_eval_summary, ml_compare_summary, exp_ml_cfg)
+
         exp_promo_cfg = _deep_merge(
             promotion_cfg,
             exp.get("promotion") if isinstance(exp.get("promotion"), dict) else None,
@@ -857,6 +1081,8 @@ def main() -> int:
             all_gates_pass = all_gates_pass and bool(ablation_gate.get("passed"))
         if bool(exp_promo_cfg.get("require_chaos_pass", True)):
             all_gates_pass = all_gates_pass and bool(chaos_gate.get("passed"))
+        if bool(exp_promo_cfg.get("require_ml_overlay_pass", False)):
+            all_gates_pass = all_gates_pass and bool(ml_overlay_gate.get("passed"))
 
         current_champion = champions.get(slot, {}) if isinstance(champions.get(slot), dict) else {}
         objective_metric = str(exp_promo_cfg.get("objective_metric") or "avg_pnl_pct")
@@ -890,6 +1116,7 @@ def main() -> int:
             "ablation_gate": ablation_gate,
             "chaos_gate": chaos_gate,
             "rank_stability_gate": rank_gate,
+            "ml_overlay_gate": ml_overlay_gate,
             "promotion": {
                 "objective_metric": objective_metric,
                 "candidate_objective": candidate_objective,
@@ -927,6 +1154,7 @@ def main() -> int:
             "ablation_pass": bool(ablation_gate.get("passed")),
             "chaos_pass": bool(chaos_gate.get("passed")),
             "rank_pass": bool(rank_gate.get("passed")),
+            "ml_overlay_pass": bool(ml_overlay_gate.get("passed")),
         }
 
         registry_history = registry.get("history", []) if isinstance(registry.get("history"), list) else []
@@ -961,6 +1189,7 @@ def main() -> int:
             "ablation_gates": gates_abl_cfg,
             "chaos_gates": gates_chaos_cfg,
             "rank_stability": gates_rank_cfg,
+            "ml_overlay_gates": gates_ml_overlay_cfg,
             "promotion": promotion_cfg,
         },
         "experiments_total": len(enabled_experiments),

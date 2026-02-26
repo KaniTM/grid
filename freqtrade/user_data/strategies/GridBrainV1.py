@@ -672,7 +672,8 @@ class GridBrainV1Core(IStrategy):
     cvd_rung_bias_strength = 0.35
 
     # FreqAI confidence overlay (soft nudges; deterministic loop remains primary)
-    freqai_overlay_enabled = True
+    freqai_overlay_enabled = False
+    freqai_overlay_gate_mode = "advisory"  # advisory | strict
     freqai_overlay_strict_predict = False
     freqai_overlay_confidence_min = 0.55
     freqai_overlay_breakout_scale = 0.02
@@ -5150,6 +5151,12 @@ class GridBrainV1Core(IStrategy):
         ml_breakout_risk_high = bool(ml_overlay.get("breakout_risk_high", False))
         ml_do_predict = ml_overlay.get("do_predict")
         ml_source = str(ml_overlay.get("source", "none"))
+        ml_gate_mode = str(getattr(self, "freqai_overlay_gate_mode", "advisory") or "advisory").strip().lower()
+        if ml_gate_mode not in {"advisory", "strict"}:
+            ml_gate_mode = "advisory"
+        ml_gate_hard = bool(ml_gate_mode == "strict")
+        ml_gate_effective_ok = bool(ml_gate_ok) if ml_gate_hard else True
+        ml_applied_adjustments: List[Dict] = []
 
         # CVD divergence/BOS module.
         cvd_state = self._cvd_state(
@@ -5313,6 +5320,13 @@ class GridBrainV1Core(IStrategy):
             tp_price_plan = float(min(tp_price_plan, ml_quick_tp_candidate))
             tp_selection["source"] = "ml_quick_tp_candidate"
             tp_selection["nearest_conservative"] = float(tp_price_plan)
+            ml_applied_adjustments.append(
+                {
+                    "type": "tp_cap",
+                    "source": "ml_quick_tp_candidate",
+                    "value": float(tp_price_plan),
+                }
+            )
 
         tp_candidates = {
             "base_tp": float(tp_price),
@@ -5440,6 +5454,7 @@ class GridBrainV1Core(IStrategy):
             self.rung_weight_min,
             self.rung_weight_max,
         )
+        rung_weights_before_ml = [float(x) for x in rung_weights]
         rung_weights = self._apply_ml_rung_safety(
             levels_arr,
             rung_weights,
@@ -5450,6 +5465,18 @@ class GridBrainV1Core(IStrategy):
             self.rung_weight_min,
             self.rung_weight_max,
         )
+        ml_rung_adjusted = bool(
+            any(abs(float(a) - float(b)) > 1e-12 for a, b in zip(rung_weights_before_ml, rung_weights))
+        )
+        if ml_rung_adjusted:
+            ml_applied_adjustments.append(
+                {
+                    "type": "rung_edge_safety",
+                    "source": "ml_p_breakout",
+                    "p_breakout": p_breakout,
+                    "edge_cut_max": float(self.freqai_overlay_rung_edge_cut_max),
+                }
+            )
         micro_poc_vrvp_steps = None
         if micro_poc is not None and vrvp_poc is not None and step_price > 0:
             micro_poc_vrvp_steps = abs(micro_poc - vrvp_poc) / step_price
@@ -5715,7 +5742,7 @@ class GridBrainV1Core(IStrategy):
             ("fvg_gate_ok", bool(fvg_gate_ok)),
             ("mrvd_gate_ok", bool(mrvd_gate_ok)),
             ("cvd_gate_ok", bool(cvd_gate_ok)),
-            ("ml_gate_ok", bool(ml_gate_ok)),
+            ("ml_gate_ok", bool(ml_gate_effective_ok)),
             ("band_slope_gate_ok", bool(band_slope_gate_ok)),
             ("excursion_asymmetry_gate_ok", bool(excursion_asymmetry_gate_ok)),
             ("drift_slope_gate_ok", bool(drift_slope_gate_ok)),
@@ -6147,15 +6174,19 @@ class GridBrainV1Core(IStrategy):
                 },
                 "ml_overlay": {
                     "enabled": bool(self.freqai_overlay_enabled),
+                    "gate_mode": str(ml_gate_mode),
+                    "gate_hard_blocking": bool(ml_gate_hard),
                     "strict_predict": bool(self.freqai_overlay_strict_predict),
                     "source": ml_source,
                     "do_predict": ml_do_predict,
                     "p_range": p_range,
                     "p_breakout": p_breakout,
-                "ml_confidence": ml_confidence,
-                "gate_ok": bool(ml_gate_ok),
+                    "ml_confidence": ml_confidence,
+                    "gate_raw_ok": bool(ml_gate_ok),
+                    "gate_ok": bool(ml_gate_effective_ok),
                     "breakout_risk_high": bool(ml_breakout_risk_high),
                     "quick_tp_candidate": ml_quick_tp_candidate,
+                    "applied_adjustments": list(ml_applied_adjustments),
                 },
             },
             "materiality": {
@@ -6365,9 +6396,12 @@ class GridBrainV1Core(IStrategy):
                 "ml_overlay_enabled": bool(self.freqai_overlay_enabled),
                 "ml_overlay_source": ml_source,
                 "ml_do_predict": ml_do_predict,
-                "ml_gate_ok": bool(ml_gate_ok),
+                "ml_gate_mode": str(ml_gate_mode),
+                "ml_gate_raw_ok": bool(ml_gate_ok),
+                "ml_gate_ok": bool(ml_gate_effective_ok),
                 "ml_breakout_risk_high": bool(ml_breakout_risk_high),
                 "ml_quick_tp_candidate": ml_quick_tp_candidate,
+                "ml_applied_adjustments": list(ml_applied_adjustments),
                 "micro_poc": micro_poc,
                 "micro_hvn_levels": [float(x) for x in micro_hvn_levels],
                 "micro_lvn_levels": [float(x) for x in micro_lvn_levels],
@@ -6665,6 +6699,7 @@ class GridBrainV1Core(IStrategy):
                 },
                 "ml_overlay": {
                     "enabled": bool(self.freqai_overlay_enabled),
+                    "gate_mode": str(ml_gate_mode),
                     "strict_predict": bool(self.freqai_overlay_strict_predict),
                     "confidence_min": float(self.freqai_overlay_confidence_min),
                     "breakout_scale": float(self.freqai_overlay_breakout_scale),

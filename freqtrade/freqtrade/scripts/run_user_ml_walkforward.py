@@ -5,10 +5,8 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-SCRIPT_FILE = (
-    Path(__file__).resolve().parents[2] / "scripts" / "run-user-tuning-protocol.py"
-)
-MODULE_NAME = "freqtrade.scripts._run_user_tuning_protocol_impl"
+SCRIPT_FILE = Path(__file__).resolve().parents[2] / "scripts" / "run-user-ml-walkforward.py"
+MODULE_NAME = "freqtrade.scripts._run_user_ml_walkforward_impl"
 
 
 def _load_impl() -> ModuleType:
@@ -35,20 +33,7 @@ def _load_impl() -> ModuleType:
 
 _IMPL = _load_impl()
 
-__all__ = [
-    "build_parser",
-    "main",
-    "_collect_metrics",
-    "_evaluate_oos_gates",
-    "_evaluate_chaos",
-    "_evaluate_ablations",
-    "_evaluate_ml_overlay_gate",
-]
+__all__ = ["build_parser", "main"]
 
 build_parser = getattr(_IMPL, "build_parser")
 main = getattr(_IMPL, "main")
-_collect_metrics = getattr(_IMPL, "_collect_metrics")
-_evaluate_oos_gates = getattr(_IMPL, "_evaluate_oos_gates")
-_evaluate_chaos = getattr(_IMPL, "_evaluate_chaos")
-_evaluate_ablations = getattr(_IMPL, "_evaluate_ablations")
-_evaluate_ml_overlay_gate = getattr(_IMPL, "_evaluate_ml_overlay_gate")

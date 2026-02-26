@@ -29,12 +29,26 @@
       "top_k": 3,
       "min_jaccard": 0.20
     },
+    "ml_overlay_gates": {
+      "enabled": false,
+      "min_range_auc": 0.52,
+      "min_breakout_auc": 0.52,
+      "max_range_brier": 0.30,
+      "max_breakout_brier": 0.30,
+      "max_range_ece": 0.20,
+      "max_breakout_ece": 0.20,
+      "min_range_coverage": 0.10,
+      "min_breakout_coverage": 0.10,
+      "require_ml_eval_pass": true,
+      "require_compare_pass": true
+    },
     "promotion": {
       "objective_metric": "avg_pnl_pct",
       "objective_improvement_min": 0.05,
       "require_chaos_pass": true,
       "require_ablation_pass": true,
-      "require_rank_stability_pass": true
+      "require_rank_stability_pass": true,
+      "require_ml_overlay_pass": false
     }
   },
   "experiments": [
@@ -63,6 +77,12 @@
             "required": true
           }
         ]
+      },
+      "ml_overlay_eval": {
+        "run_id": "ml_eval_router_v3_relaxed"
+      },
+      "ml_overlay_compare": {
+        "run_id": "ml_compare_router_v3_strict"
       }
     }
   ]

@@ -18,6 +18,7 @@
     "ablation_gate",
     "chaos_gate",
     "rank_stability_gate",
+    "ml_overlay_gate",
     "promoted"
   ],
   "required_metrics_fields": [

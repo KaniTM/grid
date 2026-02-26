@@ -1811,7 +1811,7 @@ For each module, mark status in code review: `UNKNOWN / PLANNED / PARTIAL / DONE
 
 ### M1008 — FreqAI/ML confidence overlay (not primary)
 - Default: `OFF` until deterministic core stable
-- Status: `PLANNED`
+- Status: `IMPLEMENTED` (confidence-only, bounded, deterministic core preserved)
 
 ---
 
@@ -2055,6 +2055,17 @@ Roll in with ablations and clear reason codes:
 3. confidence-only integration
 4. compare deterministic-only vs deterministic+ML OOS
 
+### Status update (2026-02-26)
+- Implemented leakage-safe labeling pipeline: `freqtrade/scripts/run-user-ml-labels.py` (+ wrapper module).
+- Implemented ML walk-forward evaluator with calibration/coverage metrics and promotion-friendly gate summary: `freqtrade/scripts/run-user-ml-walkforward.py` (+ wrapper module).
+- Implemented deterministic vs ML OOS comparator: `freqtrade/scripts/run-user-ml-overlay-compare.py` (+ wrapper module).
+- Hardened planner integration so ML stays confidence-only:
+  - default `freqai_overlay_enabled = False`
+  - explicit advisory/strict gate mode (`freqai_overlay_gate_mode`)
+  - plan diagnostics include raw/effective gate state and applied ML adjustments.
+- Extended tuning protocol for optional ML overlay gates (`ml_overlay_gate`) with manifest defaults and strict promotion integration.
+- Added dedicated Step-14 pytest coverage in `freqtrade/user_data/tests/test_ml_overlay_step14.py`.
+
 ---
 
 # 21) Repo Files to Create (for Codex to target immediately)
@@ -2176,12 +2187,6 @@ This is the intended path to a system that is not only feature-rich, but **stabl
 # 26) Implementation Status
 
 ## 26.1 DONE
-- # 2) System Architecture (Brain / Simulator / Executor / Overlay)
-- # 11) Phase-2: Regime Filters and Build Gates (Detailed)
-- # 13) Phase-4: Grid Sizing, START Filters, Targets, Risk
-- 2026-02-26 sync: `13.7` no-repeat/LSI guard moved from metadata-only to enforced behavior across simulator + executor, with regression tests.
-- 2026-02-26 sync: `#10 Meta Drift Guard` implemented (soft pause + hard-stop integration, drift outputs logged).
-- 2026-02-26 sync: Step 6 synthetic regime-shift replay validation implemented via dedicated replay suite (`freqtrade/user_data/tests/test_meta_drift_replay.py`).
 
 ## 2.1 Brain / Planner (`GridBrainV1`)
 
@@ -2661,8 +2666,6 @@ Planner should log **all blockers**, not just first blocker.
 
 ---
 
-## 26.2 TODO (ordered by priority)
-
 4. # 10) Meta Drift Guard (Change-Point / Regime Drift Kill-Switch) [DONE 2026-02-26; synthetic replay validation DONE 2026-02-26]
 
 ## 10.1 Purpose
@@ -2674,8 +2677,8 @@ Catch sudden or gradual distribution changes not fully captured by standard gate
 - `rvol_15m`
 - `spread_pct` (executor/live or simulated approximation)
 - `box_pos_abs_delta`
-- `orderbook_imbalance` (later)
-- `depth_thinning_score` (later)
+- `orderbook_imbalance`
+- `depth_thinning_score`
 
 ## 10.3 Detection Approach
 - Page-Hinkley / CUSUM-style online drift detection (lightweight)
@@ -2706,6 +2709,7 @@ Status: implemented (see Section 10 status update above and plan output `meta_dr
 5. reconnect/error recovery hardening
 
 ---
+
 6. ## Step 13 — Formal Tuning Protocol Enforcement
 1. experiment manifests
 2. champion/challenger registry
@@ -2714,7 +2718,15 @@ Status: implemented (see Section 10 status update above and plan output `meta_dr
 5. chaos-profile validation gate
 
 ---
-   (and Section 23 text below)
+7. ## Step 14 — ML/FreqAI Confidence Overlay (last)
+1. leakage-safe labels
+2. walk-forward ML eval
+3. confidence-only integration
+4. compare deterministic-only vs deterministic+ML OOS
+Status: implemented (see Step 14 status update above).
+
+## 26.2 TODO (ordered by priority)
+
    # 23) Complexity Control Rule (Strategic Guardrail)
 
 The best gains from this point forward come from:
@@ -2726,13 +2738,6 @@ The best gains from this point forward come from:
 - and making logs/explanations bulletproof.
 
 **Do not add more signal modules before stabilizing the deterministic core + replan/handoff/testing pipeline.**
-
----
-7. ## Step 14 — ML/FreqAI Confidence Overlay (last)
-1. leakage-safe labels
-2. walk-forward ML eval
-3. confidence-only integration
-4. compare deterministic-only vs deterministic+ML OOS
 
 ---
 8. # 21) Repo Files to Create (for Codex to target immediately)
@@ -2749,7 +2754,7 @@ The best gains from this point forward come from:
 - `schemas/chaos_profile.schema.json`
 
 ## 21.2 Strongly recommended
-- `core/enums.py` (or equivalent shared enum registry)
+- `core/enums.py`
 - `schemas/decision_log.schema.json`
 - `schemas/event_log.schema.json`
 - `experiments/manifest.yaml`
