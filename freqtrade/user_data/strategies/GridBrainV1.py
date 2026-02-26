@@ -541,6 +541,11 @@ class GridBrainV1Core(IStrategy):
 
     poc_acceptance_enabled: bool = True
     poc_acceptance_lookback_bars: int = 8
+    poc_alignment_enabled: bool = True
+    poc_alignment_strict_enabled: bool = True
+    poc_alignment_lookback_bars: int = 8
+    poc_alignment_max_step_diff: float = 1.0
+    poc_alignment_max_width_frac: float = 0.05
 
     # ========= v1 locked defaults =========
     # Box builder (15m)
@@ -606,6 +611,8 @@ class GridBrainV1Core(IStrategy):
     vrvp_poc_outside_box_max_frac = 0.005
     vrvp_max_box_shift_frac = 0.005
     vrvp_reject_if_still_outside = True
+    fallback_poc_estimator_enabled = True
+    fallback_poc_lookback_bars = 96
 
     # BBWP + squeeze gates
     bbwp_enabled = True
@@ -760,6 +767,10 @@ class GridBrainV1Core(IStrategy):
     # Width constraints for the box
     min_width_pct = 0.035  # 3.5%
     max_width_pct = 0.060  # 6.0%
+    box_width_avg_veto_enabled = True
+    box_width_avg_veto_lookback = 20
+    box_width_avg_veto_min_samples = 5
+    box_width_avg_veto_max_ratio = 1.20
 
     # Stop rules (15m)
     stop_confirm_bars = 2
@@ -1001,10 +1012,12 @@ class GridBrainV1Core(IStrategy):
     _data_quality_issues_by_pair: Dict[str, Dict[str, object]] = {}
     _materiality_epoch_bar_count_by_pair: Dict[str, int] = {}
     _box_history_by_pair: Dict[str, deque] = {}
+    _box_width_history_by_pair: Dict[str, deque] = {}
     _last_width_pct_by_pair: Dict[str, float] = {}
     _last_tp_price_by_pair: Dict[str, float] = {}
     _last_sl_price_by_pair: Dict[str, float] = {}
     _poc_acceptance_crossed_by_pair: Dict[str, bool] = {}
+    _poc_alignment_crossed_by_pair: Dict[str, bool] = {}
     _plan_guard_decision_count_by_pair: Dict[str, int] = {}
     _mid_history_by_pair: Dict[str, deque] = {}
     _hvp_cooloff_by_pair: Dict[str, bool] = {}
@@ -1291,6 +1304,151 @@ class GridBrainV1Core(IStrategy):
                 self._poc_acceptance_crossed_by_pair[pair] = True
                 return True
         return False
+
+    @staticmethod
+    def _fallback_poc_estimate(df: DataFrame, lookback: int) -> Optional[float]:
+        if lookback <= 0 or df is None or df.empty:
+            return None
+        required = ("high", "low", "close")
+        if any(col not in df.columns for col in required):
+            return None
+        window = df.iloc[-lookback:] if len(df) >= lookback else df
+        if window.empty:
+            return None
+        highs = pd.to_numeric(window["high"], errors="coerce")
+        lows = pd.to_numeric(window["low"], errors="coerce")
+        closes = pd.to_numeric(window["close"], errors="coerce")
+        typical = (highs + lows + closes) / 3.0
+        if typical.dropna().empty:
+            return None
+        if "volume" in window.columns:
+            volumes = pd.to_numeric(window["volume"], errors="coerce").fillna(0.0)
+            volume_sum = float(volumes.sum())
+            if volume_sum > 0.0:
+                weighted = float((typical.fillna(0.0) * volumes).sum() / volume_sum)
+                if np.isfinite(weighted):
+                    return weighted
+        median_typical = float(typical.dropna().median())
+        return median_typical if np.isfinite(median_typical) else None
+
+    def _box_width_history(self, pair: str) -> deque:
+        window = max(int(self.box_width_avg_veto_lookback), 1)
+        hist = self._box_width_history_by_pair.get(pair)
+        if hist is None:
+            hist = deque(maxlen=window)
+            self._box_width_history_by_pair[pair] = hist
+            return hist
+        if hist.maxlen != window:
+            hist = deque(list(hist), maxlen=window)
+            self._box_width_history_by_pair[pair] = hist
+        return hist
+
+    def _box_width_avg_veto_state(self, pair: str, width_pct: float) -> Dict[str, object]:
+        history = self._box_width_history(pair)
+        samples = len(history)
+        rolling_avg = float(np.mean(history)) if samples > 0 else None
+        ratio = None
+        if rolling_avg is not None and rolling_avg > 0.0:
+            ratio = float(width_pct / rolling_avg)
+        enabled = bool(self.box_width_avg_veto_enabled)
+        min_samples = max(int(self.box_width_avg_veto_min_samples), 1)
+        max_ratio = float(max(self.box_width_avg_veto_max_ratio, 1.0))
+        veto = bool(
+            enabled
+            and rolling_avg is not None
+            and samples >= min_samples
+            and ratio is not None
+            and ratio > max_ratio
+        )
+        return {
+            "enabled": bool(enabled),
+            "samples": int(samples),
+            "lookback": int(max(int(self.box_width_avg_veto_lookback), 1)),
+            "min_samples": int(min_samples),
+            "max_ratio": float(max_ratio),
+            "rolling_avg_width_pct": float(rolling_avg) if rolling_avg is not None else None,
+            "width_pct": float(width_pct),
+            "ratio_to_rolling_avg": float(ratio) if ratio is not None else None,
+            "veto": bool(veto),
+        }
+
+    def _record_accepted_box_width(self, pair: str, width_pct: float) -> None:
+        history = self._box_width_history(pair)
+        history.append(float(width_pct))
+
+    def _poc_alignment_state(
+        self,
+        pair: str,
+        df: DataFrame,
+        vrvp_poc: Optional[float],
+        micro_poc: Optional[float],
+        step_price: float,
+        box_low: float,
+        box_high: float,
+    ) -> Dict[str, object]:
+        enabled = bool(self.poc_alignment_enabled)
+        strict = bool(self.poc_alignment_strict_enabled)
+        lookback = max(int(self.poc_alignment_lookback_bars), 1)
+        max_step_diff = float(max(self.poc_alignment_max_step_diff, 0.0))
+        max_width_frac = float(max(self.poc_alignment_max_width_frac, 0.0))
+        box_width = float(max(float(box_high) - float(box_low), 0.0))
+        threshold = float(max(max_step_diff * max(step_price, 0.0), max_width_frac * box_width))
+
+        vrvp_value = self._safe_float(vrvp_poc)
+        micro_value = self._safe_float(micro_poc)
+        if not enabled or vrvp_value is None or micro_value is None:
+            return {
+                "enabled": bool(enabled),
+                "strict": bool(strict),
+                "ok": True,
+                "misaligned": False,
+                "diff": None,
+                "threshold": float(threshold),
+                "crossed": True,
+                "crossed_vrvp": None,
+                "crossed_micro": None,
+                "block_reason": None,
+            }
+
+        diff = abs(float(vrvp_value) - float(micro_value))
+        misaligned = bool(diff > threshold)
+        if not misaligned:
+            self._poc_alignment_crossed_by_pair[pair] = True
+            return {
+                "enabled": bool(enabled),
+                "strict": bool(strict),
+                "ok": True,
+                "misaligned": False,
+                "diff": float(diff),
+                "threshold": float(threshold),
+                "crossed": True,
+                "crossed_vrvp": None,
+                "crossed_micro": None,
+                "block_reason": None,
+            }
+
+        crossed_vrvp = bool(self._poc_cross_detected(df, vrvp_value, lookback))
+        crossed_micro = bool(self._poc_cross_detected(df, micro_value, lookback))
+        crossed_now = bool(crossed_vrvp and crossed_micro)
+        crossed_prev = bool(self._poc_alignment_crossed_by_pair.get(pair, False))
+        crossed = bool(crossed_prev or crossed_now)
+        if crossed:
+            self._poc_alignment_crossed_by_pair[pair] = True
+
+        ok = bool((not strict) or crossed)
+        block_reason = str(BlockReason.BLOCK_POC_ALIGNMENT_FAIL) if (strict and not crossed) else None
+        return {
+            "enabled": bool(enabled),
+            "strict": bool(strict),
+            "ok": bool(ok),
+            "misaligned": bool(misaligned),
+            "diff": float(diff),
+            "threshold": float(threshold),
+            "crossed": bool(crossed),
+            "crossed_vrvp": bool(crossed_vrvp),
+            "crossed_micro": bool(crossed_micro),
+            "block_reason": block_reason,
+        }
 
     @staticmethod
     def _efficiency_ratio(series: pd.Series, period: int) -> Optional[float]:
@@ -5464,6 +5622,7 @@ class GridBrainV1Core(IStrategy):
             and (not volatility_bucket_block_start)
         )
         volatility_strictness_blocked = bool(not volatility_strictness_ok)
+        box_block_reasons: List[BlockReason] = []
 
         # ---- Build box on 15m ----
         lo_p, hi_p, width_pct, used_lb, pad = self._build_box_15m(
@@ -5471,6 +5630,7 @@ class GridBrainV1Core(IStrategy):
             min_width_pct=box_width_min_effective,
             max_width_pct=box_width_max_effective,
         )
+        width_avg_state = self._box_width_avg_veto_state(pair, float(width_pct))
         overlap_pruned = self._box_overlap_prune(pair, lo_p, hi_p)
 
         # VRVP POC/VAH/VAL + deterministic box shift toward POC.
@@ -5478,6 +5638,15 @@ class GridBrainV1Core(IStrategy):
         vrvp_poc = self._safe_float(vrvp.get("poc"))
         vrvp_vah = self._safe_float(vrvp.get("vah"))
         vrvp_val = self._safe_float(vrvp.get("val"))
+        vrvp_source = "vrvp"
+        fallback_poc_used = False
+        fallback_poc_value = None
+        if vrvp_poc is None and bool(self.fallback_poc_estimator_enabled):
+            fallback_poc_value = self._fallback_poc_estimate(dataframe, int(self.fallback_poc_lookback_bars))
+            if fallback_poc_value is not None:
+                vrvp_poc = float(fallback_poc_value)
+                vrvp_source = "fallback"
+                fallback_poc_used = True
         vrvp_box_shift = 0.0
         vrvp_dist_frac = None
         vrvp_poc_inside_box = False
@@ -5522,6 +5691,9 @@ class GridBrainV1Core(IStrategy):
             "poc": vrvp_poc,
             "vah": vrvp_vah,
             "val": vrvp_val,
+            "source": str(vrvp_source),
+            "fallback_used": bool(fallback_poc_used),
+            "fallback_poc": float(fallback_poc_value) if fallback_poc_value is not None else None,
             "poc_inside_box": bool(vrvp_poc_inside_box),
             "poc_dist_frac_after_shift": float(vrvp_dist_frac) if vrvp_dist_frac is not None else None,
             "box_shift_applied": float(vrvp_box_shift),
@@ -5551,6 +5723,9 @@ class GridBrainV1Core(IStrategy):
         use_candidate = True
         if neutral_mode_active and stored_box is not None:
             use_candidate = bool(rebuild_for_shift or rebuild_for_time)
+        if bool(width_avg_state.get("veto", False)):
+            use_candidate = False
+            box_block_reasons.append(BlockReason.BLOCK_BOX_WIDTH_TOO_WIDE)
         if overlap_pruned:
             use_candidate = False
             box_block_reasons.append(BlockReason.BLOCK_BOX_OVERLAP_HIGH)
@@ -5579,10 +5754,18 @@ class GridBrainV1Core(IStrategy):
             active_vrvp = candidate_vrvp
             self._box_state_by_pair[pair] = dict(active_box)
             used_lb_int = int(active_box.get("used_lookback", used_lb))
-            candidate_signature = self._box_signature(lo_p, hi_p, used_lb_int, pad_effective)
+            candidate_signature = self._box_signature(
+                lo_p,
+                hi_p,
+                used_lb_int,
+                float(active_box.get("pad", pad)),
+            )
             self._box_signature_by_pair[pair] = candidate_signature
             if signature_changed:
                 self._poc_acceptance_crossed_by_pair.pop(pair, None)
+                self._poc_alignment_crossed_by_pair.pop(pair, None)
+            if signature_changed or stored_box is None or len(self._box_width_history(pair)) == 0:
+                self._record_accepted_box_width(pair, float(width_pct))
             self._box_rebuild_bars_since_by_pair[pair] = 0
             self._record_box_history(pair, lo_p, hi_p)
             box_rebuild_wait_bars = 0
@@ -5596,6 +5779,11 @@ class GridBrainV1Core(IStrategy):
             self._box_state_by_pair[pair] = dict(active_box)
             self._box_rebuild_bars_since_by_pair[pair] = bars_since + 1
             box_rebuild_wait_bars = bars_since + 1
+        active_vrvp_source = str((active_vrvp or {}).get("source") or vrvp_source)
+        active_fallback_used = bool((active_vrvp or {}).get("fallback_used", fallback_poc_used))
+        active_fallback_poc = self._safe_float((active_vrvp or {}).get("fallback_poc"))
+        if active_fallback_poc is None:
+            active_fallback_poc = self._safe_float(fallback_poc_value)
         lo_p = float(active_box["lo"])
         hi_p = float(active_box["hi"])
         pad_effective = float(active_box.get("pad", pad))
@@ -6036,6 +6224,16 @@ class GridBrainV1Core(IStrategy):
         micro_void_slope = float(self._safe_float(micro_vap.get("void_slope")) or 0.0)
         poc_candidates = [x for x in (final_vrvp_poc, micro_poc) if x is not None]
         poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, poc_candidates)
+        poc_alignment = self._poc_alignment_state(
+            pair=pair,
+            df=dataframe,
+            vrvp_poc=final_vrvp_poc,
+            micro_poc=micro_poc,
+            step_price=step_price,
+            box_low=lo_p,
+            box_high=hi_p,
+        )
+        poc_alignment_ok = bool(poc_alignment.get("ok", True))
 
         # FVG stack (Defensive + IMFVG + Session FVG).
         fvg_state = self._fvg_stack_state(
@@ -6056,7 +6254,7 @@ class GridBrainV1Core(IStrategy):
         fvg_fresh_pause = bool(fvg_state.get("fresh_defensive_pause", False))
         session_fvg_pause_active = bool(fvg_state.get("session_pause_active", False))
         session_fvg_inside_block = bool(fvg_state.get("session_inside_block", False))
-        box_block_reasons = self._derive_box_block_reasons(fvg_state)
+        box_block_reasons.extend(self._derive_box_block_reasons(fvg_state))
         if self._box_straddles_cached_breakout(pair, lo_p, hi_p, step_price):
             box_block_reasons.append(BlockReason.BLOCK_BOX_STRADDLE_BREAKOUT_LEVEL)
         session_zone_high = session_high
@@ -6555,6 +6753,8 @@ class GridBrainV1Core(IStrategy):
             phase2_gate_failures.append(BlockReason.BLOCK_START_RSI_BAND)
         if self.poc_acceptance_enabled and (not poc_acceptance_satisfied):
             phase2_gate_failures.append(BlockReason.BLOCK_NO_POC_ACCEPTANCE)
+        if not poc_alignment_ok:
+            phase2_gate_failures.append(BlockReason.BLOCK_POC_ALIGNMENT_FAIL)
         if not mrvd_proximity_ok:
             phase2_gate_failures.append(BlockReason.BLOCK_VAH_VAL_POC_PROXIMITY)
         if not basis_cross_ok:
@@ -6588,9 +6788,11 @@ class GridBrainV1Core(IStrategy):
             ("excursion_asymmetry_gate_ok", bool(excursion_asymmetry_gate_ok)),
             ("drift_slope_gate_ok", bool(drift_slope_gate_ok)),
             ("step_cost_ok", bool(step_cost_block_reason is None)),
+            ("width_avg_veto_ok", bool(not width_avg_state.get("veto", False))),
             ("start_box_position_ok", bool(start_box_position_ok)),
             ("rsi_guard_ok", bool(rsi_ok)),
             ("poc_acceptance_ok", bool(poc_acceptance_satisfied)),
+            ("poc_alignment_ok", bool(poc_alignment_ok)),
             ("mrvd_proximity_ok", bool(mrvd_proximity_ok)),
             ("basis_cross_ok", bool(basis_cross_ok)),
             ("capacity_hint_ok", bool(capacity_hint_ok)),
@@ -6616,9 +6818,11 @@ class GridBrainV1Core(IStrategy):
             "breakout_confirm_gate_ok",
             "vrvp_box_ok",
             "step_cost_ok",
+            "width_avg_veto_ok",
             "start_box_position_ok",
             "rsi_guard_ok",
             "poc_acceptance_ok",
+            "poc_alignment_ok",
         }
         core_gates_ok = bool(all(ok for name, ok in gate_checks if name in core_gate_names))
         gate_ratio_ok = bool(gate_pass_ratio >= gate_start_min_pass_ratio_effective)
@@ -6737,6 +6941,7 @@ class GridBrainV1Core(IStrategy):
             and bool(volatility_strictness_ok)
             and (not box_block_active)
             and bool(poc_acceptance_satisfied)
+            and bool(poc_alignment_ok)
         )
         start_blocked = bool(start_signal and (reclaim_active or cooldown_active))
         failed_core_gates = [name for name, ok in gate_checks if (name in core_gate_names) and (not ok)]
@@ -6794,6 +6999,8 @@ class GridBrainV1Core(IStrategy):
             start_block_reasons.extend([str(x) for x in box_block_reasons])
         if self.poc_acceptance_enabled and not poc_acceptance_satisfied:
             start_block_reasons.append(str(BlockReason.BLOCK_NO_POC_ACCEPTANCE))
+        if not poc_alignment_ok:
+            start_block_reasons.append(str(BlockReason.BLOCK_POC_ALIGNMENT_FAIL))
         if phase2_gate_failures:
             start_block_reasons.extend([str(x) for x in phase2_gate_failures])
         if not planner_health_ok:
@@ -6802,6 +7009,8 @@ class GridBrainV1Core(IStrategy):
             start_block_reasons.extend([str(x) for x in data_quality_reasons])
         start_block_reasons = list(dict.fromkeys(start_block_reasons))
         warning_codes = [str(x) for x in (cost_floor.get("warning_codes") or [])]
+        if active_fallback_used:
+            warning_codes.append(str(WarningCode.WARN_VRVP_UNAVAILABLE_FALLBACK_POC))
         warning_codes = list(dict.fromkeys(warning_codes))
 
         # ---- Action (final) ----
@@ -6860,6 +7069,7 @@ class GridBrainV1Core(IStrategy):
             "box_position_ok": bool(start_box_position_ok),
             "rsi_guard_ok": bool(rsi_ok),
             "poc_acceptance_ok": bool(poc_acceptance_satisfied),
+            "poc_alignment_ok": bool(poc_alignment_ok),
             "mrvd_proximity_ok": bool(mrvd_proximity_ok),
             "basis_cross_ok": bool(basis_cross_ok),
             "start_stability_ok": bool(start_stability_ok),
@@ -6871,6 +7081,7 @@ class GridBrainV1Core(IStrategy):
             "cost_step_ok": bool(step_cost_block_reason is None),
             "min_range_len_ok": bool(min_range_len_ok),
             "breakout_confirm_gate_ok": bool(breakout_confirm_gate_ok),
+            "width_avg_veto_ok": bool(not width_avg_state.get("veto", False)),
             "volatility_policy_ok": bool(volatility_strictness_ok),
         }
 
@@ -6945,6 +7156,9 @@ class GridBrainV1Core(IStrategy):
                     "lookback_bars": int(self.vrvp_lookback_bars),
                     "bins": int(self.vrvp_bins),
                     "value_area_pct": float(self.vrvp_value_area_pct),
+                    "source": str(active_vrvp_source),
+                    "fallback_used": bool(active_fallback_used),
+                    "fallback_poc": float(active_fallback_poc) if active_fallback_poc is not None else None,
                     "poc": vrvp_poc,
                     "vah": vrvp_vah,
                     "val": vrvp_val,
@@ -6961,11 +7175,13 @@ class GridBrainV1Core(IStrategy):
                 },
                 "validation": {
                     "blockers": [str(x) for x in box_block_reasons],
+                    "width_avg_veto": dict(width_avg_state),
                     "poc_acceptance": {
                         "required": bool(self.poc_acceptance_enabled),
                         "satisfied": bool(poc_acceptance_satisfied),
                         "lookback_bars": int(self.poc_acceptance_lookback_bars),
                     },
+                    "poc_alignment": dict(poc_alignment),
                     "min_range_len": {
                         "required_bars": int(min_range_len_required),
                         "range_len_bars_current": int(range_len_bars_current),
@@ -7237,6 +7453,17 @@ class GridBrainV1Core(IStrategy):
                 "basis_lower_15m": basis_lower,
                 "basis_cross_confirm": bool(basis_cross_confirm),
                 "basis_cross_ok": bool(basis_cross_ok),
+                "poc_alignment_enabled": bool(poc_alignment.get("enabled", False)),
+                "poc_alignment_strict": bool(poc_alignment.get("strict", False)),
+                "poc_alignment_ok": bool(poc_alignment_ok),
+                "poc_alignment_misaligned": bool(poc_alignment.get("misaligned", False)),
+                "poc_alignment_diff": self._safe_float(poc_alignment.get("diff")),
+                "poc_alignment_threshold": self._safe_float(poc_alignment.get("threshold")),
+                "vrvp_source": str(active_vrvp_source),
+                "vrvp_fallback_used": bool(active_fallback_used),
+                "width_avg_veto_enabled": bool(width_avg_state.get("enabled", False)),
+                "width_avg_veto": bool(width_avg_state.get("veto", False)),
+                "width_avg_ratio": self._safe_float(width_avg_state.get("ratio_to_rolling_avg")),
                 "midline_bias_enabled": bool(midline_bias.get("enabled", False)),
                 "midline_bias_active": bool(midline_bias.get("active", False)),
                 "midline_bias_poc_neutral": bool(midline_bias.get("poc_neutral", False)),
@@ -7564,10 +7791,21 @@ class GridBrainV1Core(IStrategy):
                     "start_box_position_guard_enabled": bool(self.start_box_position_guard_enabled),
                     "start_box_position_min_frac": float(self.start_box_position_min_frac),
                     "start_box_position_max_frac": float(self.start_box_position_max_frac),
+                    "box_width_avg_veto_enabled": bool(self.box_width_avg_veto_enabled),
+                    "box_width_avg_veto_lookback": int(self.box_width_avg_veto_lookback),
+                    "box_width_avg_veto_min_samples": int(self.box_width_avg_veto_min_samples),
+                    "box_width_avg_veto_max_ratio": float(self.box_width_avg_veto_max_ratio),
                     "min_range_len_bars": int(self.min_range_len_bars),
                     "breakout_confirm_bars": int(self.breakout_confirm_bars),
                     "breakout_confirm_buffer_mode": str(self.breakout_confirm_buffer_mode),
                     "breakout_confirm_buffer_value": float(self.breakout_confirm_buffer_value),
+                    "fallback_poc_estimator_enabled": bool(self.fallback_poc_estimator_enabled),
+                    "fallback_poc_lookback_bars": int(self.fallback_poc_lookback_bars),
+                    "poc_alignment_enabled": bool(self.poc_alignment_enabled),
+                    "poc_alignment_strict_enabled": bool(self.poc_alignment_strict_enabled),
+                    "poc_alignment_lookback_bars": int(self.poc_alignment_lookback_bars),
+                    "poc_alignment_max_step_diff": float(self.poc_alignment_max_step_diff),
+                    "poc_alignment_max_width_frac": float(self.poc_alignment_max_width_frac),
                     "basis_cross_confirm_enabled": bool(self.basis_cross_confirm_enabled),
                     "capacity_hint_hard_block": bool(self.capacity_hint_hard_block),
                 },
@@ -7884,6 +8122,10 @@ class GridBrainV1Core(IStrategy):
             "lookback_bars_used": int(used_lb),
             "pad": float(pad),
             "box_block_reasons": [str(x) for x in box_block_reasons],
+            "width_avg_veto": dict(width_avg_state),
+            "poc_alignment": dict(poc_alignment),
+            "vrvp_source": str(active_vrvp_source),
+            "vrvp_fallback_used": bool(active_fallback_used),
             "quartile_space": str(quartile_space),
             "extension_factor": float(extension_factor),
             "extension_1386": {

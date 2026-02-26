@@ -2249,7 +2249,7 @@ Status values used:
 
 - `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M007`, `M008`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
-- `M201`, `M202`, `M203`, `M205`, `M206`, `M207`, `M208`, `M209`, `M210`, `M211`, `M213`
+- `M201`, `M202`, `M203`, `M204`, `M205`, `M206`, `M207`, `M208`, `M209`, `M210`, `M211`, `M212`, `M213`
 - `M301`, `M302`, `M303`, `M304`, `M305`
 - `M401`, `M402`, `M403`, `M405`
 - `M501`, `M503`, `M504`
@@ -2382,6 +2382,18 @@ Status values used:
     - Added optional fallback TP candidate emission (`midline_bias_tp`) used by nearest-conservative TP selection only when fallback is active and sensible.
     - Wired full fallback diagnostics into plan payloads (`range.validation.midline_bias_fallback`, `exit.midline_bias`, `runtime_state.midline_bias`, `diagnostics.midline_bias`, and signal fields).
     - Added focused tests in `freqtrade/user_data/tests/test_phase3_validation.py` covering both active (POC-neutral) and inactive (directional POC) fallback paths.
+18. [DONE 2026-02-26] Complete M204 percent-of-average width veto.
+    - Added deterministic rolling-width veto policy (`box_width_avg_veto_*`) that blocks candidate box adoption when width exceeds configured ratio over accepted-box rolling mean.
+    - Wired veto diagnostics (`samples`, `rolling_avg_width_pct`, `ratio_to_rolling_avg`, thresholds) into `range.validation.width_avg_veto`, `range_diagnostics`, `signals`, and start filters.
+    - Preserved guard behavior by mapping violations to canonical `BLOCK_BOX_WIDTH_TOO_WIDE` and including it in aggregated blocker output.
+19. [DONE 2026-02-26] Complete M212 fallback POC estimator contract.
+    - Added deterministic fallback POC estimator (`_fallback_poc_estimate`) using volume-weighted typical price (median fallback) when VRVP POC is unavailable.
+    - Wired fallback usage/source into plan payloads (`range.volume_profile.source`, `fallback_used`, `fallback_poc`) and diagnostics.
+    - Added warning emission `WARN_VRVP_UNAVAILABLE_FALLBACK_POC` when fallback POC replaces missing VRVP POC.
+20. [DONE 2026-02-26] Complete M502 strict POC alignment gate behavior.
+    - Added strict micro-POC vs VRVP-POC alignment state (`_poc_alignment_state`) with configurable step/width thresholds and cross-confirm discipline.
+    - START gating now blocks with canonical `BLOCK_POC_ALIGNMENT_FAIL` when misalignment persists without required cross confirmation.
+    - Wired alignment diagnostics into `range.validation.poc_alignment`, runtime signals, start filters, and blocker aggregation.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
@@ -2389,7 +2401,6 @@ Status values used:
 
 - `M404` Protections layer (drawdown/protection extensions incomplete)
 - `M406` Structured event taxonomy/bus contract
-- `M502` POC alignment check strict behavior
 - `M505` Micro-VAP bias/re-entry discipline completeness
 - `M606` FVG-VP full module behavior
 - `M702` Smart breakout channels full behavior
@@ -2401,8 +2412,6 @@ Status values used:
 #### 26.2.2 Modules currently NOT_IMPLEMENTED
 
 - `M113` Boom & Doom impulse guard
-- `M204` Percent-of-average width veto
-- `M212` Fallback POC estimator contract
 - `M306` Directional skip-one rule
 - `M307` Next-rung ghost lines (UI)
 - `M601` Lightweight OB module
@@ -2452,7 +2461,7 @@ Status values used:
 - `M201` DONE
 - `M202` DONE
 - `M203` DONE
-- `M204` NOT_IMPLEMENTED
+- `M204` DONE
 - `M205` DONE
 - `M206` DONE
 - `M207` DONE
@@ -2460,7 +2469,7 @@ Status values used:
 - `M209` DONE
 - `M210` DONE
 - `M211` DONE
-- `M212` NOT_IMPLEMENTED
+- `M212` DONE
 - `M213` DONE
 
 - `M301` DONE
@@ -2479,7 +2488,7 @@ Status values used:
 - `M406` PARTIAL
 
 - `M501` DONE
-- `M502` PARTIAL
+- `M502` DONE
 - `M503` DONE
 - `M504` DONE
 - `M505` PARTIAL

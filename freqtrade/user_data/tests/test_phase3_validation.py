@@ -390,6 +390,76 @@ def test_midline_bias_fallback_stays_inactive_when_vrvp_poc_not_neutral() -> Non
     assert state["tp_candidate"] is None
 
 
+def test_fallback_poc_estimate_uses_volume_weighted_typical_price() -> None:
+    df = pd.DataFrame(
+        {
+            "high": [101.0, 102.0, 103.0],
+            "low": [99.0, 100.0, 101.0],
+            "close": [100.0, 101.0, 102.0],
+            "volume": [10.0, 20.0, 30.0],
+        }
+    )
+    poc = GridBrainV1Core._fallback_poc_estimate(df, lookback=3)
+    t1 = (101.0 + 99.0 + 100.0) / 3.0
+    t2 = (102.0 + 100.0 + 101.0) / 3.0
+    t3 = (103.0 + 101.0 + 102.0) / 3.0
+    expected = (t1 * 10.0 + t2 * 20.0 + t3 * 30.0) / 60.0
+    assert poc == pytest.approx(expected, rel=1e-6)
+
+
+def test_box_width_avg_veto_triggers_when_width_exceeds_rolling_ratio() -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.box_width_avg_veto_enabled = True
+    strategy.box_width_avg_veto_lookback = 20
+    strategy.box_width_avg_veto_min_samples = 5
+    strategy.box_width_avg_veto_max_ratio = 1.20
+    strategy._box_width_history_by_pair = {"PAIR/WIDTH": deque([0.04, 0.041, 0.039, 0.04, 0.041], maxlen=20)}
+
+    state = strategy._box_width_avg_veto_state("PAIR/WIDTH", 0.060)
+    assert state["veto"] is True
+    assert state["ratio_to_rolling_avg"] is not None
+    assert state["ratio_to_rolling_avg"] > 1.2
+
+
+def test_poc_alignment_strict_requires_cross_when_misaligned() -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.poc_alignment_enabled = True
+    strategy.poc_alignment_strict_enabled = True
+    strategy.poc_alignment_lookback_bars = 2
+    strategy.poc_alignment_max_step_diff = 1.0
+    strategy.poc_alignment_max_width_frac = 0.05
+    strategy._poc_alignment_crossed_by_pair = {}
+
+    df_no_cross = pd.DataFrame({"open": [98.0, 98.5], "close": [98.6, 99.0]})
+    blocked = strategy._poc_alignment_state(
+        pair="PAIR/POC",
+        df=df_no_cross,
+        vrvp_poc=100.0,
+        micro_poc=104.0,
+        step_price=1.0,
+        box_low=90.0,
+        box_high=110.0,
+    )
+    assert blocked["misaligned"] is True
+    assert blocked["ok"] is False
+    assert blocked["block_reason"] == str(BlockReason.BLOCK_POC_ALIGNMENT_FAIL)
+
+    df_cross = pd.DataFrame({"open": [99.0, 105.0], "close": [101.0, 103.0]})
+    passed = strategy._poc_alignment_state(
+        pair="PAIR/POC",
+        df=df_cross,
+        vrvp_poc=100.0,
+        micro_poc=104.0,
+        step_price=1.0,
+        box_low=90.0,
+        box_high=110.0,
+    )
+    assert passed["misaligned"] is True
+    assert passed["crossed"] is True
+    assert passed["ok"] is True
+    assert passed["block_reason"] is None
+
+
 def test_poc_acceptance_handles_multiple_candidates() -> None:
     strategy = object.__new__(GridBrainV1Core)
     strategy.poc_acceptance_enabled = True
