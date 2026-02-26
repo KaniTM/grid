@@ -2233,7 +2233,7 @@ Status values used:
 - `Step 1` -> `PARTIAL`
 - `Step 2` -> `PARTIAL`
 - `Step 3` -> `PARTIAL`
-- `Step 4` -> `PARTIAL`
+- `Step 4` -> `DONE`
 - `Step 5` -> `DONE`
 - `Step 6` -> `DONE`
 - `Step 7` -> `DONE`
@@ -2247,7 +2247,7 @@ Status values used:
 
 ### 26.1.3 Module registry items that are DONE (complete list)
 
-- `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M007`, `M009`, `M010`
+- `M001`, `M002`, `M003`, `M004`, `M005`, `M006`, `M007`, `M008`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
 - `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
 - `M301`, `M302`, `M303`, `M304`, `M305`
@@ -2363,12 +2363,15 @@ Status values used:
     - Cost-floor selection now enforces conservative empirical candidates (`configured percentile`, `p75`, `p90`, `recommended`) with explicit `selection_reason` diagnostics.
     - Empirical promotion now requires live samples when configured; proxy-only warmups stay static and emit `WARN_COST_MODEL_STALE` until readiness is met.
     - Executor lifecycle calibration now tags samples as `lifecycle`, and tests cover proxy-only fallback, artifact-backed promotion, and live-sample accounting.
+14. [DONE 2026-02-26] Finalize M008 stress/chaos acceptance-grade fault-injection coverage.
+    - Strengthened `freqtrade/user_data/tests/test_chaos_replay_harness.py` to assert per-perturbation counter activation and matching operational rail effects for latency/spread/reject/missing/delayed/data-gap profiles.
+    - Added deterministic replay assertions for seeded chaos counters and deterministic-vs-chaos delta parity.
+    - Added explicit “explain changes under chaos” assertions via non-zero deterministic-vs-chaos deltas plus reason-distribution payload presence in replay summary.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M008` Stress/chaos replay harness
 - `M205` Minimum range length + breakout confirm bars
 - `M209` Log-space quartiles + 1.386 extensions (log-space detail incomplete)
 - `M213` Midline bias fallback (full policy incomplete)
@@ -2416,7 +2419,7 @@ Status values used:
 - `M005` DONE
 - `M006` DONE
 - `M007` DONE
-- `M008` PARTIAL
+- `M008` DONE
 - `M009` DONE
 - `M010` DONE
 
