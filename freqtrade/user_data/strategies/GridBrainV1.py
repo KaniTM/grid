@@ -53,6 +53,14 @@ from planner.volatility_policy_adapter import (
     compute_n_level_bounds,
     compute_volatility_policy_view,
 )
+from planner.structure.order_blocks import (
+    OrderBlockConfig,
+    build_order_block_snapshot,
+)
+from planner.structure.liquidity_sweeps import (
+    LiquiditySweepConfig,
+    analyze_liquidity_sweeps,
+)
 from risk.meta_drift_guard import MetaDriftGuard as ExternalMetaDriftGuard
 
 LOOKBACK_SUFFIXES = ("_bars", "_lookback", "_window", "_period")
@@ -986,11 +994,33 @@ class GridBrainV1Core(IStrategy):
     smart_channel_volume_confirm_enabled = True
     smart_channel_volume_rvol_min = 1.10
     smart_channel_tp_nudge_step_multiple = 0.50
+    ob_enabled = True
+    ob_tf = "1h"
+    ob_use_wick_zone = True
+    ob_impulse_lookahead = 3
+    ob_impulse_atr_len = 14
+    ob_impulse_atr_mult = 1.0
+    ob_fresh_bars = 20
+    ob_max_age_bars = 400
+    ob_mitigation_mode = "wick"
+    ob_straddle_min_step_mult = 1.0
+    ob_tp_nudge_max_steps = 4.0
     zigzag_contraction_enabled = True
     zigzag_contraction_lookback_bars = 12
     zigzag_contraction_ratio_max = 0.95
     session_sweep_enabled = True
     session_sweep_retest_lookback_bars = 2
+    sweeps_enabled = True
+    sweep_pivot_len = 5
+    sweep_max_age_bars = 200
+    sweep_break_buffer_mode = "step"
+    sweep_break_buffer_value = 0.2
+    sweep_retest_window_bars = 12
+    sweep_retest_buffer_mode = "step"
+    sweep_retest_buffer_value = 0.2
+    sweep_stop_if_through_box_edge = True
+    sweep_retest_validation_mode = "Wick"
+    sweep_min_level_separation_steps = 1.0
     order_flow_enabled = True
     order_flow_spread_soft_max_pct = 0.0030
     order_flow_depth_thin_soft_max = 0.65
@@ -1057,6 +1087,7 @@ class GridBrainV1Core(IStrategy):
     _last_width_pct_by_pair: Dict[str, float] = {}
     _last_tp_price_by_pair: Dict[str, float] = {}
     _last_sl_price_by_pair: Dict[str, float] = {}
+    _ob_state_by_pair: Dict[str, Dict[str, object]] = {}
     _poc_acceptance_crossed_by_pair: Dict[str, bool] = {}
     _poc_alignment_crossed_by_pair: Dict[str, bool] = {}
     _plan_guard_decision_count_by_pair: Dict[str, int] = {}
@@ -2678,6 +2709,7 @@ class GridBrainV1Core(IStrategy):
             self._plan_guard_decision_count_by_pair,
             self._breakout_bars_since_by_pair,
             self._breakout_levels_by_pair,
+            self._ob_state_by_pair,
             self._meta_drift_prev_box_pos_by_pair,
         ]
         for store in stores:
@@ -2912,6 +2944,15 @@ class GridBrainV1Core(IStrategy):
         }:
             return str(ModuleName.LIQUIDITY_SWEEPS)
         if c in {
+            str(BlockReason.BLOCK_FRESH_OB_COOLOFF),
+            str(BlockReason.BLOCK_BOX_STRADDLE_OB_EDGE),
+            str(EventType.EVENT_OB_NEW_BULL),
+            str(EventType.EVENT_OB_NEW_BEAR),
+            str(EventType.EVENT_OB_TAGGED_BULL),
+            str(EventType.EVENT_OB_TAGGED_BEAR),
+        }:
+            return str(ModuleName.OB_MODULE)
+        if c in {
             str(EventType.EVENT_FVG_POC_TAG),
         }:
             return str(ModuleName.FVG_VP)
@@ -3137,6 +3178,8 @@ class GridBrainV1Core(IStrategy):
         box_high: float,
         step_price: float,
         buffer_frac: float,
+        *,
+        min_dist_step_mult: float = 1.0,
     ) -> bool:
         if level is None or step_price <= 0.0:
             return False
@@ -3144,13 +3187,16 @@ class GridBrainV1Core(IStrategy):
         if not (box_low - buffer <= float(level) <= box_high + buffer):
             return False
         level_val = float(level)
-        dist_lo = level_val - box_low
-        dist_hi = box_high - level_val
-        min_dist = min(
-            dist_lo if dist_lo >= 0 else float("inf"),
-            dist_hi if dist_hi >= 0 else float("inf"),
-        )
-        return bool(min_dist < float(step_price))
+        if level_val < box_low:
+            min_dist = float(box_low - level_val)
+        elif level_val > box_high:
+            min_dist = float(level_val - box_high)
+        else:
+            min_dist = float(min(level_val - box_low, box_high - level_val))
+        threshold = float(max(min_dist_step_mult, 0.0) * float(step_price))
+        if threshold <= 0.0:
+            threshold = float(step_price)
+        return bool(min_dist < threshold)
 
     def _box_quality_levels(self, lo_p: float, hi_p: float) -> Dict[str, float]:
         lo = float(lo_p)
@@ -5448,59 +5494,284 @@ class GridBrainV1Core(IStrategy):
         )
         return out
 
-    def _session_sweep_state(self, dataframe: DataFrame) -> Dict[str, object]:
+    def _informative_ohlc_frame(self, dataframe: DataFrame, tf: str) -> DataFrame:
+        suffix = f"_{str(tf).strip()}"
+        required = {
+            f"open{suffix}": "open",
+            f"high{suffix}": "high",
+            f"low{suffix}": "low",
+            f"close{suffix}": "close",
+        }
+        if not all(col in dataframe.columns for col in required):
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+        frame = pd.DataFrame(
+            {
+                "date": pd.to_datetime(
+                    dataframe["date"] if "date" in dataframe.columns else dataframe.index,
+                    utc=True,
+                    errors="coerce",
+                ),
+                "open": pd.to_numeric(dataframe[f"open{suffix}"], errors="coerce"),
+                "high": pd.to_numeric(dataframe[f"high{suffix}"], errors="coerce"),
+                "low": pd.to_numeric(dataframe[f"low{suffix}"], errors="coerce"),
+                "close": pd.to_numeric(dataframe[f"close{suffix}"], errors="coerce"),
+            }
+        )
+        frame = frame.dropna(subset=["date", "open", "high", "low", "close"])
+        if frame.empty:
+            return frame
+        frame = frame.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        return frame
+
+    def _order_block_state(
+        self,
+        *,
+        pair: str,
+        dataframe: DataFrame,
+        close: float,
+        step_price: float,
+        box_low: float,
+        box_high: float,
+    ) -> Dict[str, object]:
         out: Dict[str, object] = {
-            "enabled": bool(self.session_sweep_enabled),
+            "enabled": bool(self.ob_enabled),
+            "tf": str(self.ob_tf),
+            "bull": None,
+            "bear": None,
+            "bull_fresh": False,
+            "bear_fresh": False,
+            "bull_valid": False,
+            "bear_valid": False,
+            "fresh_block": False,
+            "fresh_block_sides": [],
+            "straddle_veto": False,
+            "straddle_side": None,
+            "straddle_level": None,
+            "tp_mid": None,
+            "tp_edge": None,
+            "event_new_bull": False,
+            "event_new_bear": False,
+            "event_tagged_bull": False,
+            "event_tagged_bear": False,
+        }
+        if not bool(self.ob_enabled):
+            return out
+
+        cfg = OrderBlockConfig(
+            enabled=bool(self.ob_enabled),
+            tf=str(self.ob_tf or "1h"),
+            use_wick_zone=bool(self.ob_use_wick_zone),
+            impulse_lookahead=int(self.ob_impulse_lookahead),
+            impulse_atr_len=int(self.ob_impulse_atr_len),
+            impulse_atr_mult=float(self.ob_impulse_atr_mult),
+            fresh_bars=int(self.ob_fresh_bars),
+            max_age_bars=int(self.ob_max_age_bars),
+            mitigation_mode=str(self.ob_mitigation_mode or "wick"),
+        )
+        ob_frame = self._informative_ohlc_frame(dataframe, cfg.tf)
+        snapshot = build_order_block_snapshot(ob_frame, cfg)
+
+        bull = snapshot.bull
+        bear = snapshot.bear
+        bull_dict = {
+            "created_ts": int(bull.created_ts),
+            "top": float(bull.top),
+            "bottom": float(bull.bottom),
+            "mid": float(bull.mid),
+            "mitigated": bool(bull.mitigated),
+            "last_mitigated_ts": int(bull.last_mitigated_ts) if bull.last_mitigated_ts is not None else None,
+            "age_bars": int(snapshot.bull_age_bars or 0),
+            "fresh": bool(snapshot.bull_fresh),
+            "valid": bool(snapshot.bull_valid),
+        } if bull is not None else None
+        bear_dict = {
+            "created_ts": int(bear.created_ts),
+            "top": float(bear.top),
+            "bottom": float(bear.bottom),
+            "mid": float(bear.mid),
+            "mitigated": bool(bear.mitigated),
+            "last_mitigated_ts": int(bear.last_mitigated_ts) if bear.last_mitigated_ts is not None else None,
+            "age_bars": int(snapshot.bear_age_bars or 0),
+            "fresh": bool(snapshot.bear_fresh),
+            "valid": bool(snapshot.bear_valid),
+        } if bear is not None else None
+
+        prev = self._ob_state_by_pair.get(pair)
+        prev_exists = isinstance(prev, dict)
+        prev_bull_created_ts = prev.get("bull_created_ts") if prev_exists else None
+        prev_bear_created_ts = prev.get("bear_created_ts") if prev_exists else None
+        prev_bull_mitigated_ts = prev.get("bull_last_mitigated_ts") if prev_exists else None
+        prev_bear_mitigated_ts = prev.get("bear_last_mitigated_ts") if prev_exists else None
+
+        bull_created_ts = int(bull.created_ts) if bull is not None else None
+        bear_created_ts = int(bear.created_ts) if bear is not None else None
+        bull_last_mitigated_ts = int(bull.last_mitigated_ts) if bull is not None and bull.last_mitigated_ts is not None else None
+        bear_last_mitigated_ts = int(bear.last_mitigated_ts) if bear is not None and bear.last_mitigated_ts is not None else None
+
+        event_new_bull = bool(prev_exists and bull_created_ts is not None and bull_created_ts != prev_bull_created_ts)
+        event_new_bear = bool(prev_exists and bear_created_ts is not None and bear_created_ts != prev_bear_created_ts)
+        event_tagged_bull = bool(
+            prev_exists
+            and bull_last_mitigated_ts is not None
+            and bull_last_mitigated_ts != prev_bull_mitigated_ts
+        )
+        event_tagged_bear = bool(
+            prev_exists
+            and bear_last_mitigated_ts is not None
+            and bear_last_mitigated_ts != prev_bear_mitigated_ts
+        )
+
+        self._ob_state_by_pair[pair] = {
+            "bull_created_ts": bull_created_ts,
+            "bear_created_ts": bear_created_ts,
+            "bull_last_mitigated_ts": bull_last_mitigated_ts,
+            "bear_last_mitigated_ts": bear_last_mitigated_ts,
+        }
+
+        fresh_block_sides: List[str] = []
+        price_buf = max(float(step_price), 0.0)
+        if bear_dict and bool(bear_dict.get("valid")) and bool(bear_dict.get("fresh")) and (not bool(bear_dict.get("mitigated"))):
+            if close <= float(bear_dict["top"]) + price_buf:
+                fresh_block_sides.append("bear")
+        if bull_dict and bool(bull_dict.get("valid")) and bool(bull_dict.get("fresh")) and (not bool(bull_dict.get("mitigated"))):
+            if close >= float(bull_dict["bottom"]) - price_buf:
+                fresh_block_sides.append("bull")
+        fresh_block = bool(fresh_block_sides)
+
+        straddle_side = None
+        straddle_level = None
+        straddle_veto = False
+        if bear_dict and bool(bear_dict.get("valid")):
+            straddle_side = "bear"
+            straddle_level = float(bear_dict["bottom"])
+        elif bull_dict and bool(bull_dict.get("valid")):
+            straddle_side = "bull"
+            straddle_level = float(bull_dict["top"])
+        if straddle_level is not None and step_price > 0 and box_high > box_low:
+            straddle_mult = float(max(self.ob_straddle_min_step_mult, 0.0))
+            straddle_veto = self._is_level_near_box(
+                straddle_level,
+                box_low,
+                box_high,
+                step_price,
+                straddle_mult,
+                min_dist_step_mult=straddle_mult if straddle_mult > 0 else 1.0,
+            )
+
+        tp_mid = None
+        tp_edge = None
+        opposite = bear_dict if bear_dict and bool(bear_dict.get("valid")) else None
+        if opposite is not None and step_price > 0:
+            max_dist = float(max(self.ob_tp_nudge_max_steps, 0.0) * step_price)
+            for key, value in (
+                ("tp_mid", float(opposite["mid"])),
+                ("tp_edge", float(opposite["bottom"])),
+            ):
+                if value <= close:
+                    continue
+                if value <= box_high:
+                    continue
+                if max_dist > 0 and (value - close) > max_dist:
+                    continue
+                if key == "tp_mid":
+                    tp_mid = float(value)
+                else:
+                    tp_edge = float(value)
+
+        out.update(
+            {
+                "bull": bull_dict,
+                "bear": bear_dict,
+                "bull_fresh": bool(snapshot.bull_fresh),
+                "bear_fresh": bool(snapshot.bear_fresh),
+                "bull_valid": bool(snapshot.bull_valid),
+                "bear_valid": bool(snapshot.bear_valid),
+                "fresh_block": bool(fresh_block),
+                "fresh_block_sides": fresh_block_sides,
+                "straddle_veto": bool(straddle_veto),
+                "straddle_side": straddle_side,
+                "straddle_level": float(straddle_level) if straddle_level is not None else None,
+                "tp_mid": float(tp_mid) if tp_mid is not None else None,
+                "tp_edge": float(tp_edge) if tp_edge is not None else None,
+                "event_new_bull": bool(event_new_bull),
+                "event_new_bear": bool(event_new_bear),
+                "event_tagged_bull": bool(event_tagged_bull),
+                "event_tagged_bear": bool(event_tagged_bear),
+            }
+        )
+        return out
+
+    def _session_sweep_state(
+        self,
+        dataframe: DataFrame,
+        *,
+        step_price: float = 0.0,
+        box_low: Optional[float] = None,
+        box_high: Optional[float] = None,
+    ) -> Dict[str, object]:
+        out: Dict[str, object] = {
+            "enabled": bool(self.session_sweep_enabled and self.sweeps_enabled),
             "session_high_prev": None,
             "session_low_prev": None,
             "sweep_high": False,
             "sweep_low": False,
             "break_retest_high": False,
             "break_retest_low": False,
+            "break_retest_high_recent": False,
+            "break_retest_low_recent": False,
             "tp_nudge": None,
             "stop_triggered": False,
             "block_start": False,
+            "through_box_edge": False,
+            "events_recent": [],
         }
-        if not self.session_sweep_enabled or len(dataframe) < 3:
+        if (not self.session_sweep_enabled) or (not self.sweeps_enabled) or len(dataframe) < 3:
             return out
-        if "date" in dataframe.columns:
-            dates = pd.to_datetime(dataframe["date"], utc=True, errors="coerce")
-        else:
-            dates = pd.to_datetime(dataframe.index, utc=True, errors="coerce")
-        if dates.isna().all():
-            return out
-        current_day = dates.iloc[-1].floor("D")
-        session = dataframe.loc[dates.dt.floor("D") == current_day]
-        if len(session) < 2:
-            return out
-        prev_rows = session.iloc[:-1]
-        cur = session.iloc[-1]
-        sh = self._safe_float(pd.to_numeric(prev_rows["high"], errors="coerce").max())
-        sl = self._safe_float(pd.to_numeric(prev_rows["low"], errors="coerce").min())
-        hi = self._safe_float(cur.get("high"))
-        lo = self._safe_float(cur.get("low"))
-        cl = self._safe_float(cur.get("close"))
-        if None in {sh, sl, hi, lo, cl}:
-            return out
-        closes = pd.to_numeric(session["close"], errors="coerce").dropna().astype(float)
-        prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else None
-        sweep_high = bool(float(hi) > float(sh) and float(cl) < float(sh))
-        sweep_low = bool(float(lo) < float(sl) and float(cl) > float(sl))
-        break_retest_high = bool(prev_close is not None and prev_close > float(sh) and float(cl) < float(sh))
-        break_retest_low = bool(prev_close is not None and prev_close < float(sl) and float(cl) > float(sl))
-        tp_nudge = float(sh) if sweep_high and float(sh) > float(cl) else None
-        stop_triggered = bool(break_retest_high or break_retest_low)
+
+        cfg = LiquiditySweepConfig(
+            enabled=bool(self.sweeps_enabled),
+            pivot_len=int(self.sweep_pivot_len),
+            max_age_bars=int(self.sweep_max_age_bars),
+            break_buffer_mode=str(self.sweep_break_buffer_mode),
+            break_buffer_value=float(self.sweep_break_buffer_value),
+            retest_window_bars=int(self.sweep_retest_window_bars),
+            retest_buffer_mode=str(self.sweep_retest_buffer_mode),
+            retest_buffer_value=float(self.sweep_retest_buffer_value),
+            stop_if_through_box_edge=bool(self.sweep_stop_if_through_box_edge),
+            retest_validation_mode=str(self.sweep_retest_validation_mode),
+            min_level_separation_steps=float(self.sweep_min_level_separation_steps),
+        )
+        state = analyze_liquidity_sweeps(
+            dataframe,
+            cfg=cfg,
+            step_price=float(max(step_price, 0.0)),
+            box_low=self._safe_float(box_low),
+            box_high=self._safe_float(box_high),
+            event_hold_bars=int(max(self.session_sweep_retest_lookback_bars, 1)),
+        )
         out.update(
             {
-                "session_high_prev": float(sh),
-                "session_low_prev": float(sl),
-                "sweep_high": bool(sweep_high),
-                "sweep_low": bool(sweep_low),
-                "break_retest_high": bool(break_retest_high),
-                "break_retest_low": bool(break_retest_low),
-                "tp_nudge": tp_nudge,
-                "stop_triggered": bool(stop_triggered),
-                "block_start": bool(stop_triggered),
+                "enabled": bool(state.get("enabled", False)),
+                "session_high_prev": self._safe_float(state.get("swing_high")),
+                "session_low_prev": self._safe_float(state.get("swing_low")),
+                "sweep_high": bool(state.get("sweep_high", False)),
+                "sweep_low": bool(state.get("sweep_low", False)),
+                "break_retest_high": bool(state.get("break_retest_high", False)),
+                "break_retest_low": bool(state.get("break_retest_low", False)),
+                "break_retest_high_recent": bool(state.get("break_retest_high_recent", False)),
+                "break_retest_low_recent": bool(state.get("break_retest_low_recent", False)),
+                "tp_nudge": self._safe_float(state.get("tp_nudge")),
+                "stop_triggered": bool(state.get("stop_triggered", False)),
+                "block_start": bool(state.get("block_start", False)),
+                "through_box_edge": bool(state.get("through_box_edge", False)),
+                "events_recent": list(state.get("events_recent") or []),
+                "swing_high": self._safe_float(state.get("swing_high")),
+                "swing_low": self._safe_float(state.get("swing_low")),
+                "swing_high_index": state.get("swing_high_index"),
+                "swing_low_index": state.get("swing_low_index"),
+                "break_level_high": self._safe_float(state.get("break_level_high")),
+                "break_level_low": self._safe_float(state.get("break_level_low")),
+                "retest_validation_mode": str(state.get("retest_validation_mode", self.sweep_retest_validation_mode)),
             }
         )
         return out
@@ -6888,7 +7159,17 @@ class GridBrainV1Core(IStrategy):
             close=close,
             step_price=step_price,
         )
+        order_block_state = self._order_block_state(
+            pair=pair,
+            dataframe=dataframe,
+            close=close,
+            step_price=step_price,
+            box_low=lo_p,
+            box_high=hi_p,
+        )
         box_block_reasons.extend(self._derive_box_block_reasons(fvg_state))
+        if bool(order_block_state.get("straddle_veto", False)):
+            box_block_reasons.append(BlockReason.BLOCK_BOX_STRADDLE_OB_EDGE)
         if self._box_straddles_cached_breakout(pair, lo_p, hi_p, step_price):
             box_block_reasons.append(BlockReason.BLOCK_BOX_STRADDLE_BREAKOUT_LEVEL)
         session_zone_high = session_high
@@ -6941,7 +7222,12 @@ class GridBrainV1Core(IStrategy):
             donchian_low=donchian_low,
             rvol_15m=rvol_15m,
         )
-        session_sweep_state = self._session_sweep_state(dataframe)
+        session_sweep_state = self._session_sweep_state(
+            dataframe,
+            step_price=step_price,
+            box_low=lo_p,
+            box_high=hi_p,
+        )
         prev_close_for_flow = self._safe_float(dataframe["close"].iloc[-2]) if len(dataframe) >= 2 else None
         order_flow_state = self._order_flow_state(
             last_row=last,
@@ -6990,10 +7276,18 @@ class GridBrainV1Core(IStrategy):
             "channel_lower": channel_lower,
             "smart_channel_tp_nudge": self._safe_float(smart_channel_state.get("tp_nudge")),
             "session_sweep_tp_nudge": self._safe_float(session_sweep_state.get("tp_nudge")),
+            "ob_tp_mid": self._safe_float(order_block_state.get("tp_mid")),
+            "ob_tp_edge": self._safe_float(order_block_state.get("tp_edge")),
             "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
             "ml_quick_tp_candidate": ml_quick_tp_candidate,
         }
         tp_price_plan, tp_selection = self._select_tp_price(close, float(tp_price), tp_candidate_prices)
+        tp_source_alias = {
+            "ob_tp_mid": "OB_MID",
+            "ob_tp_edge": "OB_EDGE",
+            "session_sweep_tp_nudge": "SWEEP_NUDGE",
+        }
+        tp_selection["source"] = tp_source_alias.get(str(tp_selection.get("source")), tp_selection.get("source"))
 
         # Preserve existing fast-exit nudges while keeping "nearest conservative wins".
         if cvd_quick_tp_candidate is not None and cvd_quick_tp_candidate > close:
@@ -7046,6 +7340,8 @@ class GridBrainV1Core(IStrategy):
             "session_low": session_low,
             "session_sweep_tp_nudge": self._safe_float(session_sweep_state.get("tp_nudge")),
             "smart_channel_tp_nudge": self._safe_float(smart_channel_state.get("tp_nudge")),
+            "ob_tp_mid": self._safe_float(order_block_state.get("tp_mid")),
+            "ob_tp_edge": self._safe_float(order_block_state.get("tp_edge")),
             "cvd_quick_tp_candidate": cvd_quick_tp_candidate,
             "cvd_quick_tp_trigger": bool(cvd_quick_tp_trigger),
             "ml_quick_tp_candidate": ml_quick_tp_candidate,
@@ -7449,6 +7745,8 @@ class GridBrainV1Core(IStrategy):
                 phase2_gate_failures.append(BlockReason.COOLOFF_BBWP_EXTREME)
         if breakout_fresh_block_active:
             phase2_gate_failures.append(BlockReason.BLOCK_FRESH_BREAKOUT)
+        if bool(order_block_state.get("fresh_block", False)):
+            phase2_gate_failures.append(BlockReason.BLOCK_FRESH_OB_COOLOFF)
         if min_range_len_block_reason is not None:
             phase2_gate_failures.append(min_range_len_block_reason)
         if breakout_confirm_block_reason is not None:
@@ -7507,6 +7805,7 @@ class GridBrainV1Core(IStrategy):
             ("atr_ok", bool(atr_ok)),
             ("inside_7d", bool(inside_7d_gate_ok)),
             ("breakout_fresh_gate_ok", bool(not breakout_fresh_block_active)),
+            ("fresh_ob_gate_ok", bool(not order_block_state.get("fresh_block", False))),
             ("min_range_len_ok", bool(min_range_len_ok)),
             ("breakout_confirm_gate_ok", bool(breakout_confirm_gate_ok)),
             ("vrvp_box_ok", bool(vrvp_box_ok)),
@@ -7553,6 +7852,7 @@ class GridBrainV1Core(IStrategy):
             "inside_7d",
             "min_range_len_ok",
             "breakout_confirm_gate_ok",
+            "fresh_ob_gate_ok",
             "vrvp_box_ok",
             "step_cost_ok",
             "width_avg_veto_ok",
@@ -7626,6 +7926,18 @@ class GridBrainV1Core(IStrategy):
 
         reclaim_until_ts = int(self._reclaim_until_ts_by_pair.get(pair, 0) or 0)
         cooldown_until_ts = int(self._cooldown_until_ts_by_pair.get(pair, 0) or 0)
+        fresh_ob_event = bool(
+            bool(order_block_state.get("event_new_bull", False))
+            or bool(order_block_state.get("event_new_bear", False))
+        )
+        if (
+            fresh_ob_event
+            and bool(order_block_state.get("fresh_block", False))
+            and (not running_prev)
+            and reclaim_secs > 0
+        ):
+            reclaim_until_ts = max(int(reclaim_until_ts), int(clock_ts) + int(reclaim_secs))
+            self._reclaim_until_ts_by_pair[pair] = int(reclaim_until_ts)
         reclaim_active = bool(reclaim_until_ts and int(clock_ts) < reclaim_until_ts)
         cooldown_active = bool(cooldown_until_ts and int(clock_ts) < cooldown_until_ts)
         meta_drift_cooldown_extended = False
@@ -7702,6 +8014,8 @@ class GridBrainV1Core(IStrategy):
         breakout_block_active = bool(breakout_fresh_block_active)
         if breakout_block_active:
             start_block_reasons.append(str(BlockReason.BLOCK_FRESH_BREAKOUT))
+        if bool(order_block_state.get("fresh_block", False)):
+            start_block_reasons.append(str(BlockReason.BLOCK_FRESH_OB_COOLOFF))
         if not start_gate_ok:
             if gate_start_min_pass_ratio_effective >= 0.999:
                 start_block_reasons.extend([f"gate_fail:{name}" for name in failed_all_gates])
@@ -7855,6 +8169,7 @@ class GridBrainV1Core(IStrategy):
             "start_stability_ok": bool(start_stability_ok),
             "meta_drift_ok": bool(not meta_drift_soft_block),
             "planner_health_ok": bool(planner_health_ok),
+            "fresh_ob_ok": bool(not order_block_state.get("fresh_block", False)),
             "cooldown_ok": bool(not cooldown_active),
             "reclaim_ok": bool(not reclaim_active),
             "capacity_hint_ok": bool(capacity_hint_ok),
@@ -7904,10 +8219,18 @@ class GridBrainV1Core(IStrategy):
         if bool(session_sweep_state.get("sweep_low")):
             _append_structured_event(EventType.EVENT_SESSION_LOW_SWEEP, level=session_sweep_state.get("session_low_prev"))
             _append_structured_event(EventType.EVENT_SWEEP_WICK_LOW, level=session_sweep_state.get("session_low_prev"))
-        if bool(session_sweep_state.get("break_retest_high")):
+        if bool(session_sweep_state.get("break_retest_high_recent", session_sweep_state.get("break_retest_high", False))):
             _append_structured_event(EventType.EVENT_SWEEP_BREAK_RETEST_HIGH)
-        if bool(session_sweep_state.get("break_retest_low")):
+        if bool(session_sweep_state.get("break_retest_low_recent", session_sweep_state.get("break_retest_low", False))):
             _append_structured_event(EventType.EVENT_SWEEP_BREAK_RETEST_LOW)
+        if bool(order_block_state.get("event_new_bull", False)):
+            _append_structured_event(EventType.EVENT_OB_NEW_BULL, level=(order_block_state.get("bull") or {}).get("mid"))
+        if bool(order_block_state.get("event_new_bear", False)):
+            _append_structured_event(EventType.EVENT_OB_NEW_BEAR, level=(order_block_state.get("bear") or {}).get("mid"))
+        if bool(order_block_state.get("event_tagged_bull", False)):
+            _append_structured_event(EventType.EVENT_OB_TAGGED_BULL, level=(order_block_state.get("bull") or {}).get("mid"))
+        if bool(order_block_state.get("event_tagged_bear", False)):
+            _append_structured_event(EventType.EVENT_OB_TAGGED_BEAR, level=(order_block_state.get("bear") or {}).get("mid"))
         if bool(fvg_vp_state.get("poc_tagged")):
             _append_structured_event(
                 EventType.EVENT_FVG_POC_TAG,
@@ -8420,6 +8743,7 @@ class GridBrainV1Core(IStrategy):
                 "buy_ratio_bias": dict(buy_ratio_state),
                 "fvg_vp_state": dict(fvg_vp_state),
                 "smart_channel": dict(smart_channel_state),
+                "order_blocks": dict(order_block_state),
                 "session_sweep": dict(session_sweep_state),
                 "order_flow": dict(order_flow_state),
                 "drawdown_guard": dict(drawdown_state),
@@ -8802,9 +9126,32 @@ class GridBrainV1Core(IStrategy):
                     "volume_rvol_min": float(self.smart_channel_volume_rvol_min),
                     "tp_nudge_step_multiple": float(self.smart_channel_tp_nudge_step_multiple),
                 },
+                "order_blocks": {
+                    "enabled": bool(self.ob_enabled),
+                    "tf": str(self.ob_tf),
+                    "use_wick_zone": bool(self.ob_use_wick_zone),
+                    "impulse_lookahead": int(self.ob_impulse_lookahead),
+                    "impulse_atr_len": int(self.ob_impulse_atr_len),
+                    "impulse_atr_mult": float(self.ob_impulse_atr_mult),
+                    "fresh_bars": int(self.ob_fresh_bars),
+                    "max_age_bars": int(self.ob_max_age_bars),
+                    "mitigation_mode": str(self.ob_mitigation_mode),
+                    "straddle_min_step_mult": float(self.ob_straddle_min_step_mult),
+                    "tp_nudge_max_steps": float(self.ob_tp_nudge_max_steps),
+                },
                 "session_sweep": {
                     "enabled": bool(self.session_sweep_enabled),
                     "retest_lookback_bars": int(self.session_sweep_retest_lookback_bars),
+                    "pivot_len": int(self.sweep_pivot_len),
+                    "max_age_bars": int(self.sweep_max_age_bars),
+                    "break_buffer_mode": str(self.sweep_break_buffer_mode),
+                    "break_buffer_value": float(self.sweep_break_buffer_value),
+                    "retest_window_bars": int(self.sweep_retest_window_bars),
+                    "retest_buffer_mode": str(self.sweep_retest_buffer_mode),
+                    "retest_buffer_value": float(self.sweep_retest_buffer_value),
+                    "retest_validation_mode": str(self.sweep_retest_validation_mode),
+                    "stop_if_through_box_edge": bool(self.sweep_stop_if_through_box_edge),
+                    "min_level_separation_steps": float(self.sweep_min_level_separation_steps),
                 },
                 "order_flow": {
                     "enabled": bool(self.order_flow_enabled),
@@ -9059,6 +9406,7 @@ class GridBrainV1Core(IStrategy):
                 "dn": float(breakout_dn_level),
             },
             "zigzag_contraction": dict(zigzag_contraction_state),
+            "order_blocks": dict(order_block_state),
             "session_sweep": dict(session_sweep_state),
             "smart_channel": dict(smart_channel_state),
         }
@@ -9156,7 +9504,15 @@ class GridBrainV1Core(IStrategy):
             },
             "fvg_vp": {"enabled": bool(self.fvg_vp_enabled)},
             "smart_channel": {"enabled": bool(self.smart_channel_enabled)},
-            "session_sweep": {"enabled": bool(self.session_sweep_enabled)},
+            "order_blocks": {
+                "enabled": bool(self.ob_enabled),
+                "fresh_block": bool(order_block_state.get("fresh_block", False)),
+                "straddle_veto": bool(order_block_state.get("straddle_veto", False)),
+            },
+            "session_sweep": {
+                "enabled": bool(self.session_sweep_enabled and self.sweeps_enabled),
+                "retest_validation_mode": str(self.sweep_retest_validation_mode),
+            },
             "buy_ratio_bias": {"enabled": bool(self.buy_ratio_bias_enabled)},
             "order_flow_metrics": {"enabled": bool(self.order_flow_enabled)},
         }

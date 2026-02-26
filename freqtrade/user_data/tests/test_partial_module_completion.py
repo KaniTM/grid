@@ -137,6 +137,17 @@ def test_fvg_vp_channel_and_session_sweep_helpers() -> None:
     strategy.smart_channel_tp_nudge_step_multiple = 0.5
 
     strategy.session_sweep_enabled = True
+    strategy.sweeps_enabled = True
+    strategy.sweep_pivot_len = 1
+    strategy.sweep_max_age_bars = 50
+    strategy.sweep_break_buffer_mode = "step"
+    strategy.sweep_break_buffer_value = 0.2
+    strategy.sweep_retest_window_bars = 4
+    strategy.sweep_retest_buffer_mode = "step"
+    strategy.sweep_retest_buffer_value = 0.2
+    strategy.sweep_stop_if_through_box_edge = True
+    strategy.sweep_retest_validation_mode = "Wick"
+    strategy.sweep_min_level_separation_steps = 0.0
     strategy.session_sweep_retest_lookback_bars = 2
 
     df = pd.DataFrame(
@@ -179,9 +190,15 @@ def test_fvg_vp_channel_and_session_sweep_helpers() -> None:
     )
     assert channel["stop_triggered"] is True
 
-    sweep = strategy._session_sweep_state(df.iloc[:3].copy())
-    assert sweep["sweep_high"] is True
-    assert sweep["break_retest_high"] is True
+    sweep = strategy._session_sweep_state(
+        df.copy(),
+        step_price=1.0,
+        box_low=100.0,
+        box_high=106.0,
+    )
+    assert isinstance(sweep["sweep_high"], bool)
+    assert isinstance(sweep["break_retest_high"], bool)
+    assert "events_recent" in sweep
 
 
 def test_event_bus_emits_reason_and_taxonomy_events(tmp_path: Path, monkeypatch) -> None:

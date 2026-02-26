@@ -585,6 +585,12 @@ Use these fields (or equivalent):
 
 ## A.9 Module-Specific / Optional Advisory-to-Hard Blocks
 
+### `BLOCK_FRESH_OB_COOLOFF`
+- **Module:** lightweight order blocks
+- **Meaning:** Fresh opposite-side order block is active; START/REBUILD is paused during the OB cooloff window.
+- **Applies to:** `START`, `REBUILD`
+- **Severity:** hard (if enabled)
+
 ### `BLOCK_FRESH_FVG_COOLOFF`
 - **Module:** FVG modules (defensive/session/basic)
 - **Meaning:** Fresh qualifying FVG against bias/regime triggered cooloff until mitigation/reclaim.
