@@ -1,7 +1,13 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from core.plan_signature import compute_plan_hash, plan_is_expired, validate_signature_fields
+from core.plan_signature import (
+    compute_plan_hash,
+    material_plan_changed_fields,
+    material_plan_diff_snapshot,
+    plan_is_expired,
+    validate_signature_fields,
+)
 
 
 def _signed_plan() -> dict:
@@ -59,3 +65,21 @@ def test_plan_is_expired_checks_expires_at() -> None:
     plan = _signed_plan()
     plan["expires_at"] = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
     assert plan_is_expired(plan)
+
+
+def test_material_plan_diff_helpers_capture_nested_changes() -> None:
+    prev = _signed_plan()
+    new = dict(prev)
+    new["box"] = dict(prev["box"])
+    new["grid"] = dict(prev["grid"])
+    new["box"]["mid"] = 106.0
+    new["grid"]["n_levels"] = 6
+    new["replan_reasons"] = ["REPLAN_MATERIAL_GRID_CHANGE"]
+
+    changed = material_plan_changed_fields(prev, new)
+    assert "box.mid" in changed
+    assert "grid.n_levels" in changed
+
+    snapshot = material_plan_diff_snapshot(prev, new, max_fields=8)
+    assert snapshot["box.mid"]["prev"] == 105.0
+    assert snapshot["box.mid"]["new"] == 106.0

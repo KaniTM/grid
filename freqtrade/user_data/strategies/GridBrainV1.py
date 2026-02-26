@@ -22,8 +22,24 @@ from freqtrade.strategy import IStrategy, informative
 import talib.abstract as ta
 from core.atomic_json import write_json_atomic
 from technical import qtpylib
-from core.enums import BlockReason, MaterialityClass, StopReason, WarningCode
-from core.plan_signature import PLAN_SCHEMA_VERSION, PLANNER_VERSION_DEFAULT, compute_plan_hash
+from core.enums import (
+    BlockReason,
+    MaterialityClass,
+    ModuleName,
+    Severity,
+    StopReason,
+    WarningCode,
+    category_of_code,
+    is_canonical_code,
+)
+from core.plan_signature import (
+    PLAN_SCHEMA_VERSION,
+    PLANNER_VERSION_DEFAULT,
+    compute_plan_hash,
+    material_plan_changed_fields,
+    material_plan_diff_snapshot,
+    material_plan_payload,
+)
 from core.schema_validation import validate_schema
 from analytics.execution_cost_calibrator import (
     EmpiricalCostCalibrator as ExternalEmpiricalCostCalibrator,
@@ -917,13 +933,20 @@ class GridBrainV1Core(IStrategy):
     plan_schema_version = PLAN_SCHEMA_VERSION
     planner_version = PLANNER_VERSION_DEFAULT
     plan_expiry_seconds = 0
+    decision_log_enabled = True
+    event_log_enabled = True
+    decision_log_filename = "decision_log.jsonl"
+    event_log_filename = "event_log.jsonl"
+    decision_event_log_max_changed_fields = 24
 
     # -------- internal state (best-effort, per process) --------
     _last_written_ts_by_pair: Dict[str, int] = {}
     _last_plan_hash_by_pair: Dict[str, str] = {}
     _last_plan_base_hash_by_pair: Dict[str, str] = {}
+    _last_material_plan_payload_by_pair: Dict[str, Dict[str, object]] = {}
     _last_plan_id_by_pair: Dict[str, str] = {}
     _last_decision_seq_by_pair: Dict[str, int] = {}
+    _event_counter_by_pair: Dict[str, int] = {}
     _last_mid_by_pair: Dict[str, float] = {}
     _last_box_step_by_pair: Dict[str, float] = {}
     _reclaim_until_ts_by_pair: Dict[str, int] = {}
@@ -2284,8 +2307,10 @@ class GridBrainV1Core(IStrategy):
             self._last_written_ts_by_pair,
             self._last_plan_hash_by_pair,
             self._last_plan_base_hash_by_pair,
+            self._last_material_plan_payload_by_pair,
             self._last_plan_id_by_pair,
             self._last_decision_seq_by_pair,
+            self._event_counter_by_pair,
             self._last_mid_by_pair,
             self._last_box_step_by_pair,
             self._reclaim_until_ts_by_pair,
@@ -2346,7 +2371,8 @@ class GridBrainV1Core(IStrategy):
         need_seq = pair not in self._last_decision_seq_by_pair
         need_id = pair not in self._last_plan_id_by_pair
         need_hash = pair not in self._last_plan_hash_by_pair
-        if not (need_seq or need_id or need_hash):
+        need_material = pair not in self._last_material_plan_payload_by_pair
+        if not (need_seq or need_id or need_hash or need_material):
             return
 
         latest_path = os.path.join(self._plan_dir(exchange_name, pair), "grid_plan.latest.json")
@@ -2377,6 +2403,9 @@ class GridBrainV1Core(IStrategy):
             plan_hash = str(payload.get("plan_hash") or "").strip()
             if plan_hash:
                 self._last_plan_hash_by_pair[pair] = plan_hash
+
+        if need_material:
+            self._last_material_plan_payload_by_pair[pair] = material_plan_payload(payload)
 
     def _next_plan_identity(self, exchange_name: str, pair: str) -> Tuple[str, int, Optional[str]]:
         self._seed_plan_signature_state(exchange_name, pair)
@@ -2441,6 +2470,7 @@ class GridBrainV1Core(IStrategy):
         if last_hash == payload_hash:
             if base_plan_hash is not None:
                 self._last_plan_base_hash_by_pair[pair] = base_plan_hash
+            self._last_material_plan_payload_by_pair[pair] = material_plan_payload(plan)
             return
 
         self._atomic_write_json(latest_path, plan)
@@ -2456,8 +2486,153 @@ class GridBrainV1Core(IStrategy):
                 self._last_decision_seq_by_pair[pair] = decision_seq
         except Exception:
             pass
+        self._last_material_plan_payload_by_pair[pair] = material_plan_payload(plan)
         if base_plan_hash is not None:
             self._last_plan_base_hash_by_pair[pair] = base_plan_hash
+
+    def _decision_log_path(self, exchange_name: str, pair: str) -> Path:
+        return Path(self._plan_dir(exchange_name, pair)) / str(
+            self.decision_log_filename or "decision_log.jsonl"
+        )
+
+    def _event_log_path(self, exchange_name: str, pair: str) -> Path:
+        return Path(self._plan_dir(exchange_name, pair)) / str(
+            self.event_log_filename or "event_log.jsonl"
+        )
+
+    @staticmethod
+    def _append_jsonl(path: Path, payload: Dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=True))
+            handle.write("\n")
+
+    @staticmethod
+    def _severity_for_code(code: str) -> str:
+        cat = category_of_code(str(code)) if is_canonical_code(str(code)) else str(code).split("_", 1)[0]
+        if cat in {"BLOCK", "STOP"}:
+            return str(Severity.HARD)
+        if cat == "PAUSE":
+            return str(Severity.SOFT)
+        if cat == "WARN":
+            return str(Severity.ADVISORY)
+        return str(Severity.INFO)
+
+    @staticmethod
+    def _source_module_for_code(code: str) -> str:
+        c = str(code or "")
+        if c.startswith("BLOCK_STEP_") or c.startswith("WARN_COST_MODEL_"):
+            return str(ModuleName.COST_MODEL)
+        if c.startswith("BLOCK_CAPACITY_") or c.startswith("EXEC_CAPACITY_"):
+            return str(ModuleName.CAPACITY_GUARD)
+        if c.startswith("STOP_"):
+            return str(ModuleName.STOP_FRAMEWORK)
+        if c.startswith("BLOCK_DATA_") or c.startswith("PAUSE_DATA_"):
+            return str(ModuleName.DATA_QUALITY_MONITOR)
+        if c.startswith("BLOCK_META_DRIFT_") or c.startswith("EVENT_META_DRIFT_"):
+            return str(ModuleName.META_DRIFT_GUARD)
+        if c.startswith("REPLAN_"):
+            return str(ModuleName.REPLAN_POLICY)
+        return str(ModuleName.CONFLUENCE_AGGREGATOR)
+
+    def _next_event_id(self, pair: str, valid_for_candle_ts: int) -> str:
+        counter = int(self._event_counter_by_pair.get(pair, 0) + 1)
+        self._event_counter_by_pair[pair] = counter
+        return f"{self._pair_fs(pair)}-{int(valid_for_candle_ts)}-{counter:04d}"
+
+    def _emit_decision_and_event_logs(
+        self,
+        exchange_name: str,
+        pair: str,
+        plan: Dict[str, object],
+        *,
+        prev_plan_hash: Optional[str],
+        new_plan_hash: Optional[str],
+        changed_fields: List[str],
+        diff_snapshot: Dict[str, Dict[str, object]],
+        mode_candidate: Optional[str],
+        mode_final: Optional[str],
+        start_stability: Dict[str, object],
+        meta_drift_state: Dict[str, object],
+        planner_health_state: str,
+        blocker_codes: List[str],
+        warning_codes: List[str],
+        stop_codes: List[str],
+        close_price: float,
+    ) -> List[str]:
+        event_ids: List[str] = []
+        valid_for_candle_ts = int(plan.get("valid_for_candle_ts") or 0)
+        event_path = self._event_log_path(exchange_name, pair)
+        decision_path = self._decision_log_path(exchange_name, pair)
+        ts = str(plan.get("generated_at") or datetime.now(timezone.utc).isoformat())
+
+        if bool(getattr(self, "event_log_enabled", True)):
+            event_codes = [str(x) for x in blocker_codes + warning_codes + stop_codes if str(x).strip()]
+            safe_price = float(close_price) if math.isfinite(float(close_price)) else 0.0
+            for code in event_codes:
+                event_id = self._next_event_id(pair, valid_for_candle_ts)
+                event_row: Dict[str, object] = {
+                    "event_id": event_id,
+                    "ts": ts,
+                    "pair": str(pair),
+                    "event_type": str(code),
+                    "severity": self._severity_for_code(code),
+                    "source_module": self._source_module_for_code(code),
+                    "price": safe_price,
+                    "side": "long",
+                    "metadata": {
+                        "action": str(plan.get("action") or ""),
+                        "planner_health_state": str(planner_health_state),
+                        "canonical_code": bool(is_canonical_code(str(code))),
+                    },
+                }
+                if validate_schema(event_row, "event_log.schema.json"):
+                    continue
+                self._append_jsonl(event_path, event_row)
+                event_ids.append(event_id)
+
+        if bool(getattr(self, "decision_log_enabled", True)):
+            features = plan.get("signals_snapshot")
+            if not isinstance(features, dict):
+                features = {}
+            decision_row: Dict[str, object] = {
+                "timestamp": ts,
+                "pair": str(pair),
+                "mode_candidate": str(mode_candidate or ""),
+                "mode_final": str(mode_final or plan.get("mode") or ""),
+                "action": str(plan.get("action") or "HOLD"),
+                "blockers": [str(x) for x in blocker_codes],
+                "key_features_snapshot": {
+                    "close": features.get("close"),
+                    "rsi_15m": features.get("rsi_15m"),
+                    "adx_4h": features.get("adx_4h"),
+                    "bbw_1h_pct": features.get("bbw_1h_pct"),
+                    "rvol_15m": features.get("rvol_15m"),
+                    "price_in_box": features.get("price_in_box"),
+                    "start_signal": features.get("start_signal"),
+                },
+                "box_grid_params": {
+                    "box": dict(plan.get("box") or {}),
+                    "grid": dict(plan.get("grid") or {}),
+                    "risk": dict(plan.get("risk") or {}),
+                },
+                "start_stability": dict(start_stability or {}),
+                "meta_drift": dict(meta_drift_state or {}),
+                "planner_health": {
+                    "state": str(planner_health_state),
+                },
+                "replan_decision": str(plan.get("replan_decision") or ""),
+                "replan_reasons": [str(x) for x in (plan.get("replan_reasons") or [])],
+                "prev_plan_hash": str(prev_plan_hash) if prev_plan_hash else None,
+                "new_plan_hash": str(new_plan_hash) if new_plan_hash else None,
+                "changed_fields": [str(x) for x in changed_fields],
+                "event_ids_emitted": list(event_ids),
+                "plan_diff_snapshot": diff_snapshot,
+            }
+            if not validate_schema(decision_row, "decision_log.schema.json"):
+                self._append_jsonl(decision_path, decision_row)
+
+        return event_ids
 
     def _range_candidate(self, df: DataFrame, lookback: int) -> Tuple[float, float]:
         hi = float(df["high"].rolling(lookback).max().iloc[-1])
@@ -6960,16 +7135,6 @@ class GridBrainV1Core(IStrategy):
         else:
             action_reason = str(start_block_reasons[0]) if start_block_reasons else "HOLD_NO_ACTION"
 
-        changed_fields: List[str] = []
-        if abs(float(materiality_info.get("delta_mid_steps", 0.0))) > 0:
-            changed_fields.append("box.mid")
-        if abs(float(materiality_info.get("delta_width_pct", 0.0))) > 0:
-            changed_fields.append("box.width_pct")
-        if abs(float(materiality_info.get("delta_tp_steps", 0.0))) > 0:
-            changed_fields.append("risk.tp_price")
-        if abs(float(materiality_info.get("delta_sl_steps", 0.0))) > 0:
-            changed_fields.append("risk.sl_price")
-
         plan["schema_version"] = str(self.plan_schema_version)
         plan["planner_version"] = str(self.planner_version)
         plan["pair"] = str(pair)
@@ -7049,12 +7214,45 @@ class GridBrainV1Core(IStrategy):
                 "cooldown_bars": int(self.fill_no_repeat_cooldown_bars),
             },
         }
-        if changed_fields:
-            plan["changed_fields"] = changed_fields
+        prev_material_plan = self._last_material_plan_payload_by_pair.get(pair)
+        max_changed_fields = max(int(self.decision_event_log_max_changed_fields), 1)
+        changed_fields_all = material_plan_changed_fields(prev_material_plan, plan)
+        changed_fields = changed_fields_all[:max_changed_fields]
+        if len(changed_fields_all) > max_changed_fields:
+            plan["plan_diff_truncated_fields"] = int(len(changed_fields_all) - max_changed_fields)
+        plan["changed_fields"] = [str(x) for x in changed_fields]
+        plan_diff_snapshot = material_plan_diff_snapshot(
+            prev_material_plan,
+            plan,
+            max_fields=max_changed_fields,
+        )
+        if plan_diff_snapshot:
+            plan["plan_diff_snapshot"] = plan_diff_snapshot
 
         base_plan_hash = compute_plan_hash(plan)
         last_base_hash = self._last_plan_base_hash_by_pair.get(pair)
         base_hash_changed = bool(last_base_hash is None or (base_plan_hash != last_base_hash))
+        prev_plan_hash = self._last_plan_hash_by_pair.get(pair)
+        event_ids_emitted = self._emit_decision_and_event_logs(
+            ex_name,
+            pair,
+            plan,
+            prev_plan_hash=prev_plan_hash,
+            new_plan_hash=base_plan_hash,
+            changed_fields=changed_fields,
+            diff_snapshot=plan_diff_snapshot,
+            mode_candidate=str(router_state.get("desired_mode") or active_mode),
+            mode_final=str(active_mode),
+            start_stability=start_stability,
+            meta_drift_state=meta_drift_state,
+            planner_health_state=str(planner_health_state),
+            blocker_codes=[str(x) for x in start_block_reasons],
+            warning_codes=[str(x) for x in warning_codes],
+            stop_codes=[str(x) for x in stop_reason_flags_applied_active],
+            close_price=float(close),
+        )
+        if event_ids_emitted:
+            plan["event_ids_emitted"] = list(event_ids_emitted)
 
         # Write plan once per base candle timestamp
         if base_hash_changed and bool(materiality_info.get("publish", False)):

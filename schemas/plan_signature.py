@@ -7,6 +7,9 @@ from core.plan_signature import (
     PLANNER_VERSION_DEFAULT,
     SIGNATURE_REQUIRED_FIELDS,
     compute_plan_hash,
+    material_plan_changed_fields,
+    material_plan_diff_entries,
+    material_plan_diff_snapshot,
     material_plan_payload,
     plan_is_expired,
     plan_pair,
@@ -22,9 +25,11 @@ __all__ = [
     "MATERIAL_HASH_TOP_LEVEL_FIELDS",
     "stable_payload_hash",
     "material_plan_payload",
+    "material_plan_diff_entries",
+    "material_plan_changed_fields",
+    "material_plan_diff_snapshot",
     "compute_plan_hash",
     "validate_signature_fields",
     "plan_is_expired",
     "plan_pair",
 ]
-

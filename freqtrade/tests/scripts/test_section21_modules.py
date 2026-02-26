@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from analytics.execution_cost_calibrator import EmpiricalCostCalibrator
+from core.atomic_json import read_json_object, write_json_atomic
 from data.data_quality_assessor import assess_data_quality
 from execution.capacity_guard import compute_dynamic_capacity_state, load_capacity_hint_state
 from planner.replan_policy import ReplanThresholds, evaluate_replan_materiality
@@ -174,3 +175,11 @@ def test_chaos_profile_and_plan_signature_wrappers() -> None:
     }
     plan["plan_hash"] = compute_plan_hash(plan)
     assert validate_signature_fields(plan) == []
+
+
+def test_atomic_json_wrapper_roundtrip(tmp_path: Path) -> None:
+    path = tmp_path / "atomic.json"
+    payload = {"ok": True, "value": 42}
+    write_json_atomic(path, payload)
+    out = read_json_object(path)
+    assert out == payload

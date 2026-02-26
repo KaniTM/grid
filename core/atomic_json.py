@@ -9,6 +9,26 @@ from typing import Any, Mapping, Union
 PathLike = Union[str, os.PathLike[str], Path]
 
 
+def _fsync_parent_dir(path: Path) -> None:
+    """
+    Best-effort directory fsync so rename metadata is durable after power loss.
+    Not all filesystems/platforms allow opening directories; ignore those cases.
+    """
+    try:
+        fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def write_json_atomic(path: PathLike, payload: Mapping[str, Any]) -> None:
     """
     Atomically write a JSON object (tmp + fsync + rename).
@@ -24,6 +44,7 @@ def write_json_atomic(path: PathLike, payload: Mapping[str, Any]) -> None:
         os.fsync(handle.fileno())
 
     os.replace(str(tmp_path), str(out_path))
+    _fsync_parent_dir(out_path)
 
 
 def read_json_object(path: PathLike) -> dict:
@@ -31,4 +52,3 @@ def read_json_object(path: PathLike) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {path}")
     return payload
-

@@ -33,6 +33,7 @@ from grid_simulator_v1 import (
     simulate_grid_replay,
 )
 from GridBrainV1 import GridBrainV1
+from sim.chaos_profiles import default_chaos_profile
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -47,6 +48,31 @@ def _plan_get(d: dict, *path, default=None):
             return default
         cur = cur[k]
     return cur
+
+
+def run_stress_replay_validation(
+    *,
+    df: pd.DataFrame,
+    plans: list[dict],
+    quote_budget: float,
+    maker_fee_pct: float,
+) -> dict:
+    chaos_profile = default_chaos_profile()
+    chaos_profile["seed"] = 17
+    res = simulate_grid_replay(
+        df=df,
+        plans=plans,
+        start_quote=float(quote_budget),
+        start_base=0.0,
+        maker_fee_pct=float(maker_fee_pct),
+        stop_out_steps=1,
+        touch_fill=True,
+        max_orders_per_side=40,
+        close_on_stop=False,
+        chaos_profile=chaos_profile,
+        include_deterministic_delta=True,
+    )
+    return res.get("summary", {}) or {}
 
 
 def check_plan_schema_and_feature_outputs(plan: dict) -> None:
@@ -429,6 +455,27 @@ def check_weighted_ladder_and_simulator(plan: dict, quote_budget: float, maker_f
     _require("raw_action" in first_curve, "curve rows must include raw_action")
     _require("effective_action" in first_curve, "curve rows must include effective_action")
     _require("action_suppression_reason" in first_curve, "curve rows must include action_suppression_reason")
+
+    chaos_summary = run_stress_replay_validation(
+        df=df,
+        plans=[p_start, p_start_dup, p_hold, p_stop, p_stop_dup],
+        quote_budget=float(quote_budget),
+        maker_fee_pct=float(maker_fee_pct),
+    )
+    _require(bool(chaos_summary.get("chaos_profile_enabled")), "chaos replay validation must be enabled")
+    _require(isinstance(chaos_summary.get("chaos_counters", {}), dict), "chaos counters missing from replay summary")
+    _require(
+        isinstance(chaos_summary.get("deterministic_vs_chaos_delta", {}), dict),
+        "deterministic_vs_chaos_delta missing from replay summary",
+    )
+    _require(
+        "bars_with_spread_shock" in (chaos_summary.get("chaos_counters", {}) or {}),
+        "chaos counters should expose spread-shock coverage",
+    )
+    _require(
+        "fills_total_delta" in (chaos_summary.get("deterministic_vs_chaos_delta", {}) or {}),
+        "chaos validation should emit deterministic-vs-chaos replay deltas",
+    )
 
     print("[regression] check: weighted ladder + simulator behavior OK")
 

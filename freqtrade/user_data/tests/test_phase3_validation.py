@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 from core.enums import BlockReason, MaterialityClass, WarningCode
+from core.schema_validation import validate_schema
 from freqtrade.user_data.scripts import grid_executor_v1, grid_simulator_v1
 from freqtrade.user_data.strategies.GridBrainV1 import GridBrainV1Core, MetaDriftGuard
 
@@ -661,3 +662,70 @@ def test_empirical_cost_sample_uses_execution_cost_artifact(tmp_path: Path) -> N
     assert sample["retry_reject_rate"] == pytest.approx(0.2)
     assert sample["missed_fill_rate"] == pytest.approx(0.15)
     assert sample["recommended_floor_pct"] == pytest.approx(0.0016)
+
+
+def test_decision_and_event_logs_are_emitted_with_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.decision_log_enabled = True
+    strategy.event_log_enabled = True
+    strategy.decision_log_filename = "decision_log.jsonl"
+    strategy.event_log_filename = "event_log.jsonl"
+    strategy.plans_root_rel = "grid_plans"
+    strategy._event_counter_by_pair = {}
+
+    log_root = tmp_path / "plans"
+    monkeypatch.setenv("GRID_PLANS_ROOT_REL", str(log_root))
+
+    plan = {
+        "generated_at": "2026-02-26T00:00:00+00:00",
+        "valid_for_candle_ts": 1700000000,
+        "action": "HOLD",
+        "mode": "intraday",
+        "replan_decision": "publish",
+        "replan_reasons": ["REPLAN_MATERIAL_BOX_CHANGE"],
+        "signals_snapshot": {
+            "close": 100.0,
+            "rsi_15m": 50.0,
+            "adx_4h": 18.0,
+            "bbw_1h_pct": 22.0,
+            "rvol_15m": 1.0,
+            "price_in_box": True,
+            "start_signal": False,
+        },
+        "box": {"low": 95.0, "high": 105.0, "mid": 100.0, "width_pct": 0.10},
+        "grid": {"n_levels": 8, "step_price": 1.25},
+        "risk": {"tp_price": 106.0, "sl_price": 94.0},
+    }
+
+    event_ids = strategy._emit_decision_and_event_logs(
+        "binance",
+        "ETH/USDT",
+        plan,
+        prev_plan_hash="a" * 64,
+        new_plan_hash="b" * 64,
+        changed_fields=["box.mid", "risk.tp_price"],
+        diff_snapshot={"box.mid": {"prev": 99.0, "new": 100.0}},
+        mode_candidate="intraday",
+        mode_final="intraday",
+        start_stability={"score": 0.8, "ok": True},
+        meta_drift_state={"severity": "none"},
+        planner_health_state="ok",
+        blocker_codes=[str(BlockReason.BLOCK_START_BOX_POSITION)],
+        warning_codes=[str(WarningCode.WARN_COST_MODEL_STALE)],
+        stop_codes=["STOP_RANGE_SHIFT"],
+        close_price=100.0,
+    )
+
+    assert len(event_ids) == 3
+
+    decision_path = log_root / "binance" / "ETH_USDT" / "decision_log.jsonl"
+    event_path = log_root / "binance" / "ETH_USDT" / "event_log.jsonl"
+    assert decision_path.is_file()
+    assert event_path.is_file()
+
+    decision_row = json.loads(decision_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    event_rows = [json.loads(line) for line in event_path.read_text(encoding="utf-8").strip().splitlines()]
+
+    assert validate_schema(decision_row, "decision_log.schema.json") == []
+    assert all(validate_schema(row, "event_log.schema.json") == [] for row in event_rows)
+    assert decision_row["event_ids_emitted"] == event_ids

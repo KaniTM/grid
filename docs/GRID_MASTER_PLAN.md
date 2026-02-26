@@ -2204,8 +2204,8 @@ Status values used:
 - `Section 0) How to Use This File` -> `DOC_ONLY`
 - `Section 1) Purpose and Scope` -> `DOC_ONLY`
 - `Section 2) System Architecture` -> `DONE` (Brain/Simulator/Executor present; ML overlay present as confidence-only)
-- `Section 3) Global Invariants` -> `PARTIAL` (determinism + brain/sim parity largely implemented; full handoff/idempotency signature contract still incomplete)
-- `Section 4) Core Data Model` -> `PARTIAL` (core plan payload exists; full Section 19 signature/schema completeness not finished)
+- `Section 3) Global Invariants` -> `PARTIAL` (determinism + brain/sim parity + atomic/idempotent handoff are implemented; remaining optional observability refinements are still pending)
+- `Section 4) Core Data Model` -> `PARTIAL` (core plan/state payloads are implemented; some optional data-model extensions remain backlog)
 - `Section 5) Planner Health State` -> `DONE`
 - `Section 6) Planner Decision Loop` -> `DONE`
 - `Section 7) Replan Policy + Materiality` -> `DONE`
@@ -2215,12 +2215,12 @@ Status values used:
 - `Section 11) Phase-2 Regime Filters and Build Gates` -> `PARTIAL` (core set done; boom/doom still missing)
 - `Section 12) Phase-3 Box Builder` -> `PARTIAL` (core done; specific sub-policies still missing)
 - `Section 13) Phase-4 Grid Sizing/START/Targets/Risk` -> `DONE`
-- `Section 14) Brain->Executor Handoff Contract` -> `PARTIAL` (atomic write done; full plan signature + idempotent consume contract incomplete)
+- `Section 14) Brain->Executor Handoff Contract` -> `DONE`
 - `Section 15) Monitoring/STOP/REBUILD Runtime Rails` -> `PARTIAL`
 - `Section 16) Executor Design` -> `PARTIAL`
 - `Section 17) Testing/Replay/Tuning/Anti-overfit` -> `PARTIAL`
 - `Section 18) Module Registry` -> `PARTIAL` overall (mixed DONE/PARTIAL/NOT_IMPLEMENTED by module)
-- `Section 19) Plan/State/Log Schemas` -> `PARTIAL` (schemas and key fields not fully complete)
+- `Section 19) Plan/State/Log Schemas` -> `DONE`
 - `Section 20) Implementation Sequence` -> `PARTIAL` (Steps 12/13/14 done; several earlier sequence expectations still partial)
 - `Section 21) Repo Files to Create` -> `PARTIAL` (several files still missing)
 - `Section 22) Codex Working Rules` -> `DOC_ONLY`
@@ -2247,7 +2247,7 @@ Status values used:
 
 ### 26.1.3 Module registry items that are DONE (complete list)
 
-- `M001`, `M003`, `M004`, `M005`, `M009`
+- `M001`, `M002`, `M003`, `M004`, `M005`, `M009`, `M010`
 - `M101`, `M102`, `M103`, `M104`, `M105`, `M106`, `M107`, `M108`, `M109`, `M110`, `M111`, `M112`
 - `M201`, `M202`, `M203`, `M206`, `M207`, `M208`, `M210`, `M211`
 - `M301`, `M302`, `M303`, `M304`, `M305`
@@ -2257,7 +2257,7 @@ Status values used:
 - `M701`
 - `M801`, `M802`, `M803`, `M804`, `M806`
 - `M901`, `M902`
-- `M1001`, `M1002`, `M1005`, `M1007`, `M1008`
+- `M1001`, `M1002`, `M1004`, `M1005`, `M1006`, `M1007`, `M1008`
 
 ### 26.1.4 Section 21 file checklist that is DONE
 
@@ -2340,16 +2340,27 @@ Status values used:
    - Executor runtime state now exposes execution-cost feedback metrics/artifact paths for observability and reproducible replay diagnostics.
    - Planner now ingests validated execution-cost calibration artifacts as empirical sample inputs (when fresh) in `_empirical_cost_sample`, closing the executor→planner feedback loop.
    - Added end-to-end coverage for artifact emission/validation and planner artifact consumption in `freqtrade/user_data/tests/test_executor_hardening.py` and `freqtrade/user_data/tests/test_phase3_validation.py`.
+9. [DONE 2026-02-26] Complete M002/M1004 atomic handoff duplicate-safe contract hardening.
+   - Executor now persists and enforces duplicate protection for both `plan_id` and historical `plan_hash` sets (not only last hash).
+   - Executor now enforces stale-replay protections on `valid_for_candle_ts`, rejects pair mismatches, and validates `supersedes_plan_id` continuity when provided.
+   - Added coverage in `freqtrade/tests/scripts/test_grid_executor_handoff.py` for supersedes mismatch, stale candle timestamp rejection, pair mismatch rejection, and non-adjacent duplicate hash rejection.
+10. [DONE 2026-02-26] Complete M010 plan diff snapshots + decision/event log wiring.
+    - Added material diff helpers (`material_plan_changed_fields`, `material_plan_diff_snapshot`) in `core/plan_signature.py`.
+    - Planner now emits deterministic `changed_fields` and `plan_diff_snapshot` from material payload diffs (not heuristic-only deltas).
+    - Planner now writes schema-validated `decision_log.jsonl` and `event_log.jsonl` rows per decision tick with emitted event IDs.
+    - Added coverage in `freqtrade/tests/scripts/test_plan_signature_contract.py` and `freqtrade/user_data/tests/test_phase3_validation.py`.
+11. [DONE 2026-02-26] Complete M1006 stress replay as standard validation.
+    - Added `run_stress_replay_validation(...)` to `freqtrade/user_data/scripts/user_regression_suite.py` and wired it into default regression checks.
+    - Standard behavior validation now requires chaos replay summaries, chaos counters, and deterministic-vs-chaos delta metrics.
+    - Added dedicated coverage in `freqtrade/user_data/tests/test_stress_replay_standard_validation.py`.
 
 ### P2 (medium) - module registry remaining items (all non-DONE modules)
 
 #### 26.2.1 Modules currently PARTIAL
 
-- `M002` Atomic handoff + idempotency contract
 - `M006` Volatility policy adapter
 - `M007` Empirical execution cost calibration loop
 - `M008` Stress/chaos replay harness
-- `M010` Enum registry + plan diff snapshots
 - `M205` Minimum range length + breakout confirm bars
 - `M209` Log-space quartiles + 1.386 extensions (log-space detail incomplete)
 - `M213` Midline bias fallback (full policy incomplete)
@@ -2363,8 +2374,6 @@ Status values used:
 - `M805` Session high/low sweep + break-retest event behavior
 - `M809` Buy-ratio micro-bias policy usage
 - `M1003` Minimal order-flow metrics full module behavior
-- `M1004` Atomic handoff duplicate-safe contract completeness
-- `M1006` Stress replay as standard validation completeness
 
 #### 26.2.2 Modules currently NOT_IMPLEMENTED
 
@@ -2385,15 +2394,15 @@ Status values used:
 
 ### P3 (lower, but still in-scope from lines 1-2185)
 
-9. Keep Section 24 audit template synchronized with Section 26 statuses after each implementation wave.
-10. Keep Step sequencing notes in Section 20 updated as PARTIAL -> DONE transitions happen.
+12. Keep Section 24 audit template synchronized with Section 26 statuses after each implementation wave.
+13. Keep Step sequencing notes in Section 20 updated as PARTIAL -> DONE transitions happen.
 
 ---
 
 ## 26.3 Full module registry status map (no exclusions)
 
 - `M001` DONE
-- `M002` PARTIAL
+- `M002` DONE
 - `M003` DONE
 - `M004` DONE
 - `M005` DONE
@@ -2401,7 +2410,7 @@ Status values used:
 - `M007` PARTIAL
 - `M008` PARTIAL
 - `M009` DONE
-- `M010` PARTIAL
+- `M010` DONE
 
 - `M101` DONE
 - `M102` DONE
@@ -2486,9 +2495,9 @@ Status values used:
 - `M1001` DONE
 - `M1002` DONE
 - `M1003` PARTIAL
-- `M1004` PARTIAL
+- `M1004` DONE
 - `M1005` DONE
-- `M1006` PARTIAL
+- `M1006` DONE
 - `M1007` DONE
 - `M1008` DONE
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping as AbcMapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional
 from uuid import UUID
@@ -62,6 +63,81 @@ def material_plan_payload(plan: Mapping[str, Any]) -> Dict[str, Any]:
 
 def compute_plan_hash(plan: Mapping[str, Any]) -> str:
     return stable_payload_hash(material_plan_payload(plan))
+
+
+def _is_sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _material_diff_entries(
+    prev: Any,
+    new: Any,
+    *,
+    prefix: str,
+    out: list[tuple[str, Any, Any]],
+) -> None:
+    if isinstance(prev, AbcMapping) and isinstance(new, AbcMapping):
+        keys = sorted(set(prev.keys()) | set(new.keys()))
+        for key in keys:
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in prev:
+                out.append((path, None, new.get(key)))
+                continue
+            if key not in new:
+                out.append((path, prev.get(key), None))
+                continue
+            _material_diff_entries(prev.get(key), new.get(key), prefix=path, out=out)
+        return
+
+    if _is_sequence(prev) and _is_sequence(new):
+        if len(prev) != len(new):
+            out.append((prefix or "<root>", list(prev), list(new)))
+            return
+        for idx, (pv, nv) in enumerate(zip(prev, new)):
+            path = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            _material_diff_entries(pv, nv, prefix=path, out=out)
+        return
+
+    if _canonical_json(prev) != _canonical_json(new):
+        out.append((prefix or "<root>", prev, new))
+
+
+def material_plan_diff_entries(
+    prev_plan: Optional[Mapping[str, Any]],
+    new_plan: Mapping[str, Any],
+) -> list[tuple[str, Any, Any]]:
+    prev_payload = material_plan_payload(prev_plan or {})
+    new_payload = material_plan_payload(new_plan)
+    entries: list[tuple[str, Any, Any]] = []
+    _material_diff_entries(prev_payload, new_payload, prefix="", out=entries)
+    return entries
+
+
+def material_plan_changed_fields(
+    prev_plan: Optional[Mapping[str, Any]],
+    new_plan: Mapping[str, Any],
+) -> list[str]:
+    return [path for path, _, _ in material_plan_diff_entries(prev_plan, new_plan)]
+
+
+def material_plan_diff_snapshot(
+    prev_plan: Optional[Mapping[str, Any]],
+    new_plan: Mapping[str, Any],
+    *,
+    max_fields: int = 24,
+) -> Dict[str, Dict[str, Any]]:
+    entries = material_plan_diff_entries(prev_plan, new_plan)
+    if max_fields <= 0:
+        max_fields = 1
+    out: Dict[str, Dict[str, Any]] = {}
+    for path, prev_val, new_val in entries[:max_fields]:
+        out[path] = {"prev": prev_val, "new": new_val}
+    if len(entries) > max_fields:
+        out["_truncated_fields"] = {
+            "prev": len(entries) - max_fields,
+            "new": "truncated",
+        }
+    return out
 
 
 def _parse_iso8601(ts: str) -> Optional[datetime]:
@@ -164,4 +240,3 @@ def plan_pair(plan: Mapping[str, Any]) -> str:
     if symbol is not None and str(symbol).strip():
         return str(symbol)
     return ""
-

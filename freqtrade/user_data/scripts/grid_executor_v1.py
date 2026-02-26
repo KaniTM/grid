@@ -101,6 +101,7 @@ class ExecutorState:
     mode: str
     last_applied_plan_id: Optional[str]
     last_applied_seq: int
+    last_applied_valid_for_candle_ts: int
     last_plan_hash: Optional[str]
     executor_state_machine: str
 
@@ -120,6 +121,7 @@ class ExecutorState:
     runtime: Dict
     orders: List[Dict]
     applied_plan_ids: List[str]
+    applied_plan_hashes: List[str]
 
 
 # -----------------------------
@@ -523,9 +525,12 @@ class GridExecutorV1:
         self._recovery_error: Optional[str] = None
         self._last_applied_plan_id: Optional[str] = None
         self._last_applied_seq: int = 0
+        self._last_applied_valid_for_candle_ts: int = 0
         self._last_applied_plan_hash: Optional[str] = None
         self._applied_plan_ids: Deque[str] = deque(maxlen=4096)
         self._applied_plan_id_set: Set[str] = set()
+        self._applied_plan_hashes: Deque[str] = deque(maxlen=4096)
+        self._applied_plan_hash_set: Set[str] = set()
 
         # Section 13.2 / M1005 execution-cost lifecycle feedback loop.
         self._execution_cost_feedback_enabled: bool = True
@@ -656,6 +661,16 @@ class GridExecutorV1:
                 _safe_int(payload.get("last_applied_seq"), self._last_applied_seq),
                 _safe_int(runtime.get("last_applied_seq"), self._last_applied_seq),
             )
+            self._last_applied_valid_for_candle_ts = max(
+                _safe_int(
+                    payload.get("last_applied_valid_for_candle_ts"),
+                    self._last_applied_valid_for_candle_ts,
+                ),
+                _safe_int(
+                    runtime.get("last_applied_valid_for_candle_ts"),
+                    self._last_applied_valid_for_candle_ts,
+                ),
+            )
             last_plan_hash = payload.get("last_plan_hash") or runtime.get("last_plan_hash")
             if last_plan_hash:
                 self._last_applied_plan_hash = str(last_plan_hash)
@@ -663,8 +678,13 @@ class GridExecutorV1:
             for pid in payload.get("applied_plan_ids") or []:
                 if pid is not None:
                     self._remember_applied_plan_id(str(pid))
+            for ph in payload.get("applied_plan_hashes") or []:
+                if ph is not None:
+                    self._remember_applied_plan_hash(str(ph))
             if self._last_applied_plan_id:
                 self._remember_applied_plan_id(self._last_applied_plan_id)
+            if self._last_applied_plan_hash:
+                self._remember_applied_plan_hash(self._last_applied_plan_hash)
 
             loaded_orders: List[RestingOrder] = []
             for row in payload.get("orders") or []:
@@ -742,6 +762,16 @@ class GridExecutorV1:
         self._applied_plan_ids.append(pid)
         self._applied_plan_id_set.add(pid)
 
+    def _remember_applied_plan_hash(self, plan_hash: str) -> None:
+        ph = str(plan_hash or "").strip()
+        if not ph or ph in self._applied_plan_hash_set:
+            return
+        if len(self._applied_plan_hashes) >= self._applied_plan_hashes.maxlen:
+            oldest = self._applied_plan_hashes.popleft()
+            self._applied_plan_hash_set.discard(oldest)
+        self._applied_plan_hashes.append(ph)
+        self._applied_plan_hash_set.add(ph)
+
     def _record_applied_plan(self, plan: Dict) -> None:
         plan_id = str(plan.get("plan_id") or "").strip()
         if plan_id:
@@ -751,8 +781,18 @@ class GridExecutorV1:
             self._last_applied_seq = max(int(plan.get("decision_seq") or 0), self._last_applied_seq)
         except Exception:
             pass
+        try:
+            valid_for_candle_ts = int(plan.get("valid_for_candle_ts") or 0)
+            if valid_for_candle_ts > 0:
+                self._last_applied_valid_for_candle_ts = max(
+                    valid_for_candle_ts,
+                    self._last_applied_valid_for_candle_ts,
+                )
+        except Exception:
+            pass
         plan_hash = str(plan.get("plan_hash") or "").strip()
         if plan_hash:
+            self._remember_applied_plan_hash(plan_hash)
             self._last_applied_plan_hash = plan_hash
 
     def _reject_plan_intake(self, plan: Dict, code: str, reason: str) -> None:
@@ -767,6 +807,7 @@ class GridExecutorV1:
             code=code,
             reason=reason,
             last_applied_seq=int(self._last_applied_seq),
+            last_applied_valid_for_candle_ts=int(self._last_applied_valid_for_candle_ts),
             last_applied_plan_id=self._last_applied_plan_id,
         )
 
@@ -785,6 +826,15 @@ class GridExecutorV1:
             schema_errors.append("missing:range_grid")
         if schema_errors:
             self._reject_plan_intake(plan, "EXEC_PLAN_SCHEMA_INVALID", ",".join(schema_errors))
+            return False, "EXEC_PLAN_SCHEMA_INVALID"
+
+        plan_symbol = plan_pair(plan)
+        if self.symbol and plan_symbol and (str(plan_symbol) != str(self.symbol)):
+            self._reject_plan_intake(
+                plan,
+                "EXEC_PLAN_SCHEMA_INVALID",
+                f"pair_mismatch expected={self.symbol} got={plan_symbol}",
+            )
             return False, "EXEC_PLAN_SCHEMA_INVALID"
 
         expected_hash = compute_plan_hash(plan)
@@ -806,6 +856,10 @@ class GridExecutorV1:
             self._reject_plan_intake(plan, "EXEC_PLAN_DUPLICATE_IGNORED", "duplicate_plan_id")
             return False, "EXEC_PLAN_DUPLICATE_IGNORED"
 
+        if provided_hash and (provided_hash in self._applied_plan_hash_set):
+            self._reject_plan_intake(plan, "EXEC_PLAN_DUPLICATE_IGNORED", "duplicate_plan_hash_seen")
+            return False, "EXEC_PLAN_DUPLICATE_IGNORED"
+
         try:
             decision_seq = int(plan.get("decision_seq") or 0)
         except Exception:
@@ -815,6 +869,37 @@ class GridExecutorV1:
                 plan,
                 "EXEC_PLAN_STALE_SEQ_IGNORED",
                 f"decision_seq={decision_seq} last_applied_seq={self._last_applied_seq}",
+            )
+            return False, "EXEC_PLAN_STALE_SEQ_IGNORED"
+
+        try:
+            valid_for_candle_ts = int(plan.get("valid_for_candle_ts") or 0)
+        except Exception:
+            valid_for_candle_ts = 0
+        if valid_for_candle_ts <= int(self._last_applied_valid_for_candle_ts):
+            self._reject_plan_intake(
+                plan,
+                "EXEC_PLAN_STALE_SEQ_IGNORED",
+                (
+                    "stale_valid_for_candle_ts="
+                    f"{valid_for_candle_ts} last_valid_for_candle_ts={self._last_applied_valid_for_candle_ts}"
+                ),
+            )
+            return False, "EXEC_PLAN_STALE_SEQ_IGNORED"
+
+        supersedes_plan_id = str(plan.get("supersedes_plan_id") or "").strip()
+        if (
+            supersedes_plan_id
+            and self._last_applied_plan_id
+            and supersedes_plan_id != str(self._last_applied_plan_id)
+        ):
+            self._reject_plan_intake(
+                plan,
+                "EXEC_PLAN_STALE_SEQ_IGNORED",
+                (
+                    "supersedes_mismatch="
+                    f"{supersedes_plan_id} last_applied_plan_id={self._last_applied_plan_id}"
+                ),
             )
             return False, "EXEC_PLAN_STALE_SEQ_IGNORED"
 
@@ -2699,6 +2784,7 @@ class GridExecutorV1:
             "state_recovery_error": self._recovery_error,
             "last_applied_plan_id": self._last_applied_plan_id,
             "last_applied_seq": int(self._last_applied_seq),
+            "last_applied_valid_for_candle_ts": int(self._last_applied_valid_for_candle_ts),
             "last_plan_hash": self._last_applied_plan_hash,
             "executor_state_machine": executor_state_machine,
         }
@@ -2713,6 +2799,7 @@ class GridExecutorV1:
             mode=self.mode,
             last_applied_plan_id=self._last_applied_plan_id,
             last_applied_seq=int(self._last_applied_seq),
+            last_applied_valid_for_candle_ts=int(self._last_applied_valid_for_candle_ts),
             last_plan_hash=self._last_applied_plan_hash,
             executor_state_machine=executor_state_machine,
 
@@ -2732,6 +2819,7 @@ class GridExecutorV1:
             runtime=runtime,
             orders=[asdict(o) for o in self._orders],
             applied_plan_ids=list(self._applied_plan_ids),
+            applied_plan_hashes=list(self._applied_plan_hashes),
         )
         write_json(self.state_out, asdict(payload))
 
