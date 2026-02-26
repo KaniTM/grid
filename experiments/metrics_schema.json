@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "required_root_fields": [
+    "created_utc",
+    "run_id",
+    "experiments_total",
+    "experiments",
+    "promotions",
+    "strict_failures"
+  ],
+  "required_experiment_fields": [
+    "experiment_id",
+    "run_id",
+    "slot",
+    "status",
+    "metrics",
+    "oos_gate",
+    "ablation_gate",
+    "chaos_gate",
+    "rank_stability_gate",
+    "promoted"
+  ],
+  "required_metrics_fields": [
+    "windows_ok",
+    "windows_failed",
+    "sum_pnl_quote",
+    "avg_pnl_pct",
+    "win_rate",
+    "profit_factor",
+    "churn_events_per_window",
+    "false_start_rate",
+    "stop_events_per_window",
+    "rank_stability_jaccard"
+  ],
+  "required_gate_fields": [
+    "passed",
+    "checks"
+  ]
+}

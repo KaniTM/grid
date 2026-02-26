@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "defaults": {
+    "baseline_run_id": "",
+    "oos_gates": {
+      "min_oos_windows_ok": 8,
+      "max_failed_windows": 0,
+      "min_sum_pnl_quote": 0.0,
+      "min_avg_pnl_pct": 0.0,
+      "min_win_rate_pct": 45.0,
+      "min_profit_factor": 1.05,
+      "max_churn_degradation_pct": 20.0,
+      "max_false_start_degradation_pct": 25.0
+    },
+    "ablation_gates": {
+      "enabled": true,
+      "min_required": 1,
+      "max_avg_pnl_pct_drop": 4.0
+    },
+    "chaos_gates": {
+      "enabled": true,
+      "min_profiles": 1,
+      "max_failed_windows": 0,
+      "max_avg_pnl_pct_degradation": 3.0,
+      "max_stop_events_multiplier": 1.5
+    },
+    "rank_stability": {
+      "enabled": true,
+      "top_k": 3,
+      "min_jaccard": 0.20
+    },
+    "promotion": {
+      "objective_metric": "avg_pnl_pct",
+      "objective_improvement_min": 0.05,
+      "require_chaos_pass": true,
+      "require_ablation_pass": true,
+      "require_rank_stability_pass": true
+    }
+  },
+  "experiments": [
+    {
+      "id": "candidate_placeholder",
+      "enabled": false,
+      "slot": "GridBrainV1|ETH/USDT|15m",
+      "walkforward": {
+        "run_id": "wf_candidate_placeholder"
+      },
+      "baseline": {
+        "run_id": "wf_baseline_placeholder"
+      },
+      "ablations": [
+        {
+          "id": "ablation_no_meta_drift",
+          "run_id": "wf_candidate_placeholder_no_meta_drift",
+          "required": true
+        }
+      ],
+      "chaos": {
+        "profiles": [
+          {
+            "name": "latency_spread_shock",
+            "run_id": "wf_candidate_placeholder_chaos_ls",
+            "required": true
+          }
+        ]
+      }
+    }
+  ]
+}
