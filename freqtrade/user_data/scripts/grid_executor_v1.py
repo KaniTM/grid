@@ -2,10 +2,11 @@ import argparse
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -261,6 +262,32 @@ def _safe_float(x, default=None):
         return default
 
 
+def _safe_int(x, default: int) -> int:
+    try:
+        if x is None:
+            return int(default)
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def _safe_bool(x, default: bool) -> bool:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, str):
+        v = x.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off"):
+            return False
+    if x is None:
+        return bool(default)
+    try:
+        return bool(x)
+    except Exception:
+        return bool(default)
+
+
 def _extract_rung_weights(plan: Dict, n_levels: int) -> Optional[List[float]]:
     try:
         g = plan.get("grid", {}) or {}
@@ -415,6 +442,46 @@ class GridExecutorV1:
         self._fill_guard_bar_seq: int = 0
         self._fill_guard_last_clock_ts: Optional[int] = None
         self._tick_size: Optional[float] = None
+        self._runtime_warnings: List[str] = []
+        self._runtime_exec_events: List[str] = []
+        self._runtime_pause_reasons: List[str] = []
+        self._runtime_confirm: Dict[str, object] = {}
+
+        # Step-12 hardening defaults; can be overridden per-plan.
+        self._post_only_place_attempts: int = max(int(self.ccxt_retries), 3)
+        self._post_only_backoff_ms: int = 120
+        self._post_only_backoff_max_ms: int = 1200
+        self._post_only_reprice_ticks: int = 1
+        self._post_only_reject_window_s: int = 120
+        self._post_only_reject_warn_count: int = 4
+        self._post_only_reject_hard_count: int = 8
+        self._post_only_reject_times: Deque[float] = deque()
+        self._post_only_reject_streak: int = 0
+        self._post_only_retry_count_total: int = 0
+        self._post_only_reprice_count_total: int = 0
+        self._post_only_burst_hard_active: bool = False
+
+        self._confirm_entry_enabled: bool = True
+        self._confirm_exit_enabled: bool = True
+        self._confirm_rebuild_enabled: bool = True
+        self._confirm_spread_max: Optional[float] = None
+        self._confirm_depth_thinning_max: Optional[float] = None
+        self._confirm_jump_max: Optional[float] = 0.01
+
+        self._reconcile_price_tol_ticks: int = 1
+        self._reconcile_price_tol_frac: float = 0.00025
+        self._reconcile_qty_tol_frac: float = 0.02
+        self._reconcile_max_actions_per_tick: int = 100
+        self._last_reconcile_summary: Dict[str, int] = {}
+        self._last_reconcile_skipped_due_cap: bool = False
+
+        self._ccxt_error_streak: int = 0
+        self._ccxt_backoff_base_ms: int = 250
+        self._ccxt_backoff_max_ms: int = 5_000
+        self._ccxt_backoff_until_ts: float = 0.0
+        self._last_ccxt_error: Optional[str] = None
+        self._recovery_loaded: bool = False
+        self._recovery_error: Optional[str] = None
 
         if self.mode == "ccxt":
             if ccxt is None:
@@ -437,6 +504,8 @@ class GridExecutorV1:
 
             if sandbox and hasattr(self.exchange, "set_sandbox_mode"):
                 self.exchange.set_sandbox_mode(True)
+
+        self._recover_state_from_disk()
 
     # ---------- balances / reserves ----------
     def _reserved_balances_intent(self) -> Tuple[float, float]:
@@ -488,16 +557,415 @@ class GridExecutorV1:
             # best-effort only
             pass
 
+    def _recover_state_from_disk(self) -> None:
+        if not self.state_out:
+            return
+        if not os.path.exists(self.state_out):
+            return
+        try:
+            payload = load_json(self.state_out)
+            if not isinstance(payload, dict):
+                return
+
+            qt = _safe_float(payload.get("quote_total"), default=None)
+            bt = _safe_float(payload.get("base_total"), default=None)
+            if qt is not None:
+                self.quote_total = float(qt)
+            if bt is not None:
+                self.base_total = float(bt)
+
+            runtime = payload.get("runtime", {}) or {}
+            self._last_trade_ms = _safe_int(runtime.get("last_trade_ms"), 0) or None
+            self._fill_guard_bar_seq = _safe_int(runtime.get("fill_guard_bar_seq"), self._fill_guard_bar_seq)
+            last_clock = _safe_float(runtime.get("fill_guard_last_clock_ts"), default=None)
+            self._fill_guard_last_clock_ts = int(last_clock) if last_clock is not None else self._fill_guard_last_clock_ts
+            self._post_only_retry_count_total = _safe_int(
+                runtime.get("post_only_retry_count_total"),
+                self._post_only_retry_count_total,
+            )
+            self._post_only_reprice_count_total = _safe_int(
+                runtime.get("post_only_reprice_count_total"),
+                self._post_only_reprice_count_total,
+            )
+
+            loaded_orders: List[RestingOrder] = []
+            for row in payload.get("orders") or []:
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("status", "open")).lower()
+                if status not in ("open", "partial"):
+                    continue
+                loaded_orders.append(
+                    RestingOrder(
+                        side=str(row.get("side", "")),
+                        price=float(row.get("price") or 0.0),
+                        qty_base=float(row.get("qty_base") or 0.0),
+                        level_index=int(row.get("level_index") or 0),
+                        order_id=(str(row.get("order_id")) if row.get("order_id") is not None else None),
+                        status=status,
+                        filled_base=float(row.get("filled_base") or 0.0),
+                    )
+                )
+            if loaded_orders:
+                self._orders = loaded_orders
+
+            self._recovery_loaded = True
+            self._recovery_error = None
+        except Exception as exc:
+            self._recovery_error = str(exc)
+            log_event(
+                "warning",
+                "state_recovery_failed",
+                state_out=self.state_out,
+                error=str(exc),
+            )
+
+    def _reset_runtime_diagnostics(self) -> None:
+        self._runtime_warnings = []
+        self._runtime_exec_events = []
+        self._runtime_pause_reasons = []
+        self._runtime_confirm = {}
+        self._last_reconcile_summary = {}
+        self._last_reconcile_skipped_due_cap = False
+
+    def _append_runtime_warning(self, code: str) -> None:
+        c = str(code).strip()
+        if c and c not in self._runtime_warnings:
+            self._runtime_warnings.append(c)
+
+    def _append_runtime_exec_event(self, code: str) -> None:
+        c = str(code).strip()
+        if c and c not in self._runtime_exec_events:
+            self._runtime_exec_events.append(c)
+
+    def _append_runtime_pause_reason(self, code: str) -> None:
+        c = str(code).strip()
+        if c and c not in self._runtime_pause_reasons:
+            self._runtime_pause_reasons.append(c)
+
+    def _execution_cfg(self, plan: Dict) -> Dict:
+        candidates = [
+            plan.get("execution_hardening"),
+            (plan.get("executor") or {}).get("hardening"),
+            plan.get("executor_hardening"),
+            (plan.get("grid") or {}).get("execution_hardening"),
+            (plan.get("runtime_state") or {}).get("execution_hardening"),
+        ]
+        for c in candidates:
+            if isinstance(c, dict):
+                return c
+        return {}
+
+    def _apply_execution_hardening_config(self, plan: Dict) -> None:
+        cfg = self._execution_cfg(plan)
+        post_cfg = cfg.get("post_only", {}) if isinstance(cfg.get("post_only"), dict) else {}
+        conf_cfg = cfg.get("confirm_hooks", {}) if isinstance(cfg.get("confirm_hooks"), dict) else {}
+        rec_cfg = cfg.get("reconcile", {}) if isinstance(cfg.get("reconcile"), dict) else {}
+        ccxt_cfg = cfg.get("ccxt", {}) if isinstance(cfg.get("ccxt"), dict) else {}
+
+        self._post_only_place_attempts = max(
+            _safe_int(post_cfg.get("max_attempts"), self._post_only_place_attempts),
+            1,
+        )
+        self._post_only_backoff_ms = max(
+            _safe_int(post_cfg.get("backoff_ms"), self._post_only_backoff_ms),
+            0,
+        )
+        self._post_only_backoff_max_ms = max(
+            _safe_int(post_cfg.get("backoff_max_ms"), self._post_only_backoff_max_ms),
+            self._post_only_backoff_ms,
+        )
+        self._post_only_reprice_ticks = max(
+            _safe_int(post_cfg.get("reprice_ticks"), self._post_only_reprice_ticks),
+            0,
+        )
+        self._post_only_reject_window_s = max(
+            _safe_int(post_cfg.get("reject_window_s"), self._post_only_reject_window_s),
+            1,
+        )
+        self._post_only_reject_warn_count = max(
+            _safe_int(post_cfg.get("reject_warn_count"), self._post_only_reject_warn_count),
+            1,
+        )
+        self._post_only_reject_hard_count = max(
+            _safe_int(post_cfg.get("reject_hard_count"), self._post_only_reject_hard_count),
+            self._post_only_reject_warn_count,
+        )
+
+        self._confirm_entry_enabled = _safe_bool(
+            conf_cfg.get("confirm_entry_enabled"),
+            self._confirm_entry_enabled,
+        )
+        self._confirm_exit_enabled = _safe_bool(
+            conf_cfg.get("confirm_exit_enabled"),
+            self._confirm_exit_enabled,
+        )
+        self._confirm_rebuild_enabled = _safe_bool(
+            conf_cfg.get("confirm_rebuild_enabled"),
+            self._confirm_rebuild_enabled,
+        )
+        spread_max = _safe_float(conf_cfg.get("spread_max"), default=self._confirm_spread_max)
+        self._confirm_spread_max = spread_max if spread_max is not None and spread_max > 0 else None
+        depth_max = _safe_float(
+            conf_cfg.get("depth_thinning_max"),
+            default=self._confirm_depth_thinning_max,
+        )
+        self._confirm_depth_thinning_max = depth_max if depth_max is not None and depth_max > 0 else None
+        jump_max = _safe_float(conf_cfg.get("jump_max"), default=self._confirm_jump_max)
+        self._confirm_jump_max = jump_max if jump_max is not None and jump_max > 0 else None
+
+        self._reconcile_price_tol_ticks = max(
+            _safe_int(rec_cfg.get("price_tol_ticks"), self._reconcile_price_tol_ticks),
+            0,
+        )
+        self._reconcile_price_tol_frac = max(
+            _safe_float(rec_cfg.get("price_tol_frac"), default=self._reconcile_price_tol_frac) or 0.0,
+            0.0,
+        )
+        self._reconcile_qty_tol_frac = max(
+            _safe_float(rec_cfg.get("qty_tol_frac"), default=self._reconcile_qty_tol_frac) or 0.0,
+            0.0,
+        )
+        self._reconcile_max_actions_per_tick = max(
+            _safe_int(rec_cfg.get("max_actions_per_tick"), self._reconcile_max_actions_per_tick),
+            1,
+        )
+
+        self._ccxt_backoff_base_ms = max(
+            _safe_int(ccxt_cfg.get("backoff_base_ms"), self._ccxt_backoff_base_ms),
+            0,
+        )
+        self._ccxt_backoff_max_ms = max(
+            _safe_int(ccxt_cfg.get("backoff_max_ms"), self._ccxt_backoff_max_ms),
+            self._ccxt_backoff_base_ms,
+        )
+
+    def _prune_post_only_reject_window(self, now_ts: float) -> None:
+        cutoff = float(now_ts) - float(self._post_only_reject_window_s)
+        while self._post_only_reject_times and float(self._post_only_reject_times[0]) < cutoff:
+            self._post_only_reject_times.popleft()
+
+    def _register_post_only_reject(self, error: str) -> None:
+        now_ts = float(time.time())
+        self._post_only_reject_streak = int(self._post_only_reject_streak + 1)
+        self._post_only_retry_count_total = int(self._post_only_retry_count_total + 1)
+        self._post_only_reject_times.append(now_ts)
+        self._prune_post_only_reject_window(now_ts)
+
+        reject_count = int(len(self._post_only_reject_times))
+        if reject_count >= self._post_only_reject_warn_count:
+            self._append_runtime_warning("WARN_EXEC_POST_ONLY_RETRY_HIGH")
+        if reject_count >= self._post_only_reject_hard_count:
+            if not self._post_only_burst_hard_active:
+                self._append_runtime_exec_event("EVENT_POST_ONLY_REJECT_BURST")
+            self._post_only_burst_hard_active = True
+            self._append_runtime_pause_reason("PAUSE_EXECUTION_UNSAFE")
+
+        log_event(
+            "warning",
+            "post_only_reject",
+            error=str(error),
+            reject_count=reject_count,
+            reject_window_s=self._post_only_reject_window_s,
+            reject_streak=self._post_only_reject_streak,
+        )
+
+    def _post_only_burst_status(self) -> Dict[str, object]:
+        now_ts = float(time.time())
+        self._prune_post_only_reject_window(now_ts)
+        reject_count = int(len(self._post_only_reject_times))
+        if reject_count == 0:
+            self._post_only_reject_streak = 0
+        warn_active = reject_count >= self._post_only_reject_warn_count
+        hard_active = reject_count >= self._post_only_reject_hard_count
+        self._post_only_burst_hard_active = bool(hard_active)
+        if warn_active:
+            self._append_runtime_warning("WARN_EXEC_POST_ONLY_RETRY_HIGH")
+        if hard_active:
+            self._append_runtime_pause_reason("PAUSE_EXECUTION_UNSAFE")
+        return {
+            "reject_count": reject_count,
+            "warn_active": bool(warn_active),
+            "hard_active": bool(hard_active),
+            "window_s": int(self._post_only_reject_window_s),
+        }
+
+    def _is_post_only_reject_error(self, error: Exception) -> bool:
+        msg = str(error or "").lower()
+        if not msg:
+            return False
+        hints = (
+            "post only",
+            "postonly",
+            "maker",
+            "would be taker",
+            "immediate-or-cancel",
+            "not post only",
+            "post-only",
+        )
+        return any(h in msg for h in hints)
+
+    def _tick_for_price(self, price: float) -> float:
+        if self._tick_size is not None and self._tick_size > 0:
+            return float(self._tick_size)
+        p = abs(float(price))
+        return max(p * 0.0001, 1e-8)
+
+    def _reprice_post_only_price(self, side: str, price: float, attempt: int) -> float:
+        if self._post_only_reprice_ticks <= 0:
+            return float(price)
+        tick = self._tick_for_price(price)
+        delta = float(max(attempt, 1) * self._post_only_reprice_ticks) * tick
+        if str(side).lower() == "buy":
+            return float(max(float(price) - delta, tick))
+        return float(float(price) + delta)
+
+    def _confirm_metrics(
+        self,
+        plan: Dict,
+        ref_price: Optional[float],
+        prev_mark_price: Optional[float],
+    ) -> Dict[str, Optional[float]]:
+        grid = plan.get("grid", {}) or {}
+        runtime = plan.get("runtime_state", {}) or {}
+        signals = plan.get("signals", {}) or {}
+        spread_pct = _safe_float(runtime.get("spread_pct"), default=None)
+        if spread_pct is None:
+            spread_pct = _safe_float(grid.get("est_spread_pct"), default=None)
+        depth_thinning = _safe_float(runtime.get("depth_thinning_score"), default=None)
+        if depth_thinning is None:
+            depth_thinning = _safe_float(signals.get("depth_thinning_score"), default=None)
+        jump_pct = _safe_float(runtime.get("jump_pct"), default=None)
+        if jump_pct is None and ref_price is not None and prev_mark_price not in (None, 0):
+            prev = float(prev_mark_price or 0.0)
+            if prev > 0:
+                jump_pct = abs(float(ref_price) - prev) / prev
+        return {
+            "spread_pct": spread_pct,
+            "depth_thinning_score": depth_thinning,
+            "jump_pct": jump_pct,
+        }
+
+    def _run_confirm_hook(
+        self,
+        phase: str,
+        plan: Dict,
+        ref_price: Optional[float],
+        prev_mark_price: Optional[float],
+    ) -> Dict[str, object]:
+        ph = str(phase or "").lower()
+        enabled = True
+        if ph == "entry":
+            enabled = self._confirm_entry_enabled
+        elif ph == "rebuild":
+            enabled = self._confirm_rebuild_enabled
+        elif ph == "exit":
+            enabled = self._confirm_exit_enabled
+
+        metrics = self._confirm_metrics(plan, ref_price, prev_mark_price)
+        reasons: List[str] = []
+        burst = self._post_only_burst_status()
+
+        if not enabled:
+            return {
+                "enabled": False,
+                "ok": True,
+                "phase": ph,
+                "reasons": reasons,
+                "metrics": metrics,
+                "post_only_burst": burst,
+            }
+
+        if bool(burst.get("hard_active")):
+            reasons.append("PAUSE_EXECUTION_UNSAFE")
+
+        spread_pct = metrics.get("spread_pct")
+        if self._confirm_spread_max is not None and spread_pct is not None:
+            if float(spread_pct) > float(self._confirm_spread_max):
+                reasons.append("PAUSE_EXECUTION_UNSAFE")
+                self._append_runtime_exec_event("EVENT_SPREAD_SPIKE")
+
+        depth_thinning = metrics.get("depth_thinning_score")
+        if self._confirm_depth_thinning_max is not None and depth_thinning is not None:
+            if float(depth_thinning) > float(self._confirm_depth_thinning_max):
+                reasons.append("PAUSE_EXECUTION_UNSAFE")
+                self._append_runtime_exec_event("EVENT_DEPTH_THIN")
+
+        jump_pct = metrics.get("jump_pct")
+        if self._confirm_jump_max is not None and jump_pct is not None:
+            if float(jump_pct) > float(self._confirm_jump_max):
+                reasons.append("PAUSE_EXECUTION_UNSAFE")
+                self._append_runtime_exec_event("EVENT_JUMP_DETECTED")
+
+        ok = len(reasons) == 0
+        if not ok:
+            self._append_runtime_pause_reason("PAUSE_EXECUTION_UNSAFE")
+
+        return {
+            "enabled": True,
+            "ok": bool(ok),
+            "phase": ph,
+            "reasons": sorted(set([str(x) for x in reasons])),
+            "metrics": metrics,
+            "post_only_burst": burst,
+        }
+
+    def _order_match_tolerant(
+        self,
+        desired: RestingOrder,
+        live: Dict,
+    ) -> bool:
+        if str(live.get("side", "")).lower() != str(desired.side).lower():
+            return False
+        live_px = _safe_float(live.get("price"), default=None)
+        live_qty = _safe_float(live.get("amount"), default=None)
+        if live_px is None or live_qty is None:
+            return False
+        if live_px <= 0 or live_qty <= 0:
+            return False
+
+        tick_tol = 0.0
+        if self._reconcile_price_tol_ticks > 0:
+            tick_tol = float(self._tick_for_price(desired.price) * self._reconcile_price_tol_ticks)
+        frac_tol = abs(float(desired.price)) * float(self._reconcile_price_tol_frac)
+        px_tol = max(tick_tol, frac_tol)
+        if abs(float(desired.price) - float(live_px)) > px_tol:
+            return False
+
+        qty_tol = max(abs(float(desired.qty_base)) * float(self._reconcile_qty_tol_frac), 1e-12)
+        if abs(float(desired.qty_base) - float(live_qty)) > qty_tol:
+            return False
+        return True
+
     # ---------- ccxt call wrapper ----------
     def _ccxt_call(self, fn, *args, **kwargs):
         if self.exchange is None:
             return None
+        now_ts = float(time.time())
+        if now_ts < self._ccxt_backoff_until_ts:
+            sleep_s = min(self._ccxt_backoff_until_ts - now_ts, 1.0)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
         last_err = None
         for _ in range(max(self.ccxt_retries, 1)):
             try:
-                return fn(*args, **kwargs)
+                res = fn(*args, **kwargs)
+                self._ccxt_error_streak = 0
+                self._ccxt_backoff_until_ts = 0.0
+                self._last_ccxt_error = None
+                return res
             except Exception as e:
                 last_err = e
+                self._last_ccxt_error = str(e)
+                self._ccxt_error_streak = int(self._ccxt_error_streak + 1)
+                base_ms = max(int(self._ccxt_backoff_base_ms), 0)
+                max_ms = max(int(self._ccxt_backoff_max_ms), base_ms)
+                backoff_ms = base_ms * (2 ** max(self._ccxt_error_streak - 1, 0))
+                backoff_ms = min(backoff_ms, max_ms)
+                self._ccxt_backoff_until_ts = max(
+                    self._ccxt_backoff_until_ts,
+                    float(time.time()) + (float(backoff_ms) / 1000.0),
+                )
                 time.sleep(0.2)
         if last_err:
             raise last_err
@@ -598,14 +1066,79 @@ class GridExecutorV1:
         if self.post_only:
             params["postOnly"] = True
 
-        try:
-            if side == "buy":
-                res = self._ccxt_call(self.exchange.create_limit_buy_order, symbol, qt, px, params=params)
-            else:
-                res = self._ccxt_call(self.exchange.create_limit_sell_order, symbol, qt, px, params=params)
-            return (res or {}).get("id")
-        except Exception:
-            return None
+        max_attempts = max(
+            int(self._post_only_place_attempts if self.post_only else self.ccxt_retries),
+            1,
+        )
+        curr_px = float(px)
+        last_err: Optional[str] = None
+
+        for attempt in range(max_attempts):
+            curr_px = float(quantize_price(self.exchange, symbol, curr_px))
+            if curr_px <= 0:
+                return None
+            if not passes_min_notional(limits, curr_px, qt):
+                return None
+
+            try:
+                if side == "buy":
+                    res = self.exchange.create_limit_buy_order(symbol, qt, curr_px, params=params)
+                else:
+                    res = self.exchange.create_limit_sell_order(symbol, qt, curr_px, params=params)
+                self._ccxt_error_streak = 0
+                self._ccxt_backoff_until_ts = 0.0
+                self._last_ccxt_error = None
+                self._post_only_reject_streak = 0
+                return (res or {}).get("id")
+            except Exception as exc:
+                last_err = str(exc)
+                self._last_ccxt_error = str(exc)
+                self._ccxt_error_streak = int(self._ccxt_error_streak + 1)
+                base_ms = max(int(self._ccxt_backoff_base_ms), 0)
+                max_ms = max(int(self._ccxt_backoff_max_ms), base_ms)
+                err_backoff_ms = min(
+                    base_ms * (2 ** max(self._ccxt_error_streak - 1, 0)),
+                    max_ms,
+                )
+                self._ccxt_backoff_until_ts = max(
+                    self._ccxt_backoff_until_ts,
+                    float(time.time()) + (float(err_backoff_ms) / 1000.0),
+                )
+                is_post_only_reject = bool(self.post_only and self._is_post_only_reject_error(exc))
+                if not is_post_only_reject:
+                    # Unknown venue error; let retry loop handle bounded retries.
+                    if attempt < (max_attempts - 1):
+                        time.sleep(0.1)
+                        continue
+                    break
+
+                self._register_post_only_reject(str(exc))
+                self._append_runtime_exec_event("EXEC_POST_ONLY_RETRY")
+                if attempt >= (max_attempts - 1):
+                    break
+
+                if self._post_only_reprice_ticks > 0:
+                    curr_px = self._reprice_post_only_price(side, curr_px, attempt + 1)
+                    self._post_only_reprice_count_total = int(self._post_only_reprice_count_total + 1)
+                    self._append_runtime_exec_event("EXEC_POST_ONLY_FALLBACK_REPRICE")
+
+                backoff_ms = self._post_only_backoff_ms * (2 ** attempt)
+                backoff_ms = min(backoff_ms, self._post_only_backoff_max_ms)
+                if backoff_ms > 0:
+                    time.sleep(float(backoff_ms) / 1000.0)
+
+        if last_err is not None:
+            log_event(
+                "warning",
+                "place_limit_failed",
+                side=side,
+                symbol=symbol,
+                qty=qt,
+                price=curr_px,
+                attempts=max_attempts,
+                error=last_err,
+            )
+        return None
 
     def _ccxt_reconcile_set(self, desired: List[RestingOrder], symbol: str, limits: Dict) -> None:
         """
@@ -614,42 +1147,114 @@ class GridExecutorV1:
         - place missing desired orders
         """
         open_live = self._ccxt_fetch_open_orders(symbol)
-
-        live_map: Dict[Tuple, str] = {}  # key -> order_id
+        live_rows: List[Dict[str, object]] = []
         for o in open_live:
             try:
-                side = str(o.get("side")).lower()
+                oid = str(o.get("id") or "").strip()
+                if not oid:
+                    continue
+                side = str(o.get("side") or "").lower().strip()
+                if side not in ("buy", "sell"):
+                    continue
                 price = float(o.get("price"))
                 amount = float(o.get("amount") or o.get("remaining") or 0.0)
-                oid = str(o.get("id") or "")
-                if oid:
-                    live_map[_key_for(side, price, amount)] = oid
+                if price <= 0 or amount <= 0:
+                    continue
+                live_rows.append(
+                    {
+                        "order_id": oid,
+                        "side": side,
+                        "price": float(price),
+                        "amount": float(amount),
+                    }
+                )
             except Exception:
                 continue
 
-        desired_map: Dict[Tuple, RestingOrder] = {}
-        for ro in desired:
-            desired_map[_key_for(ro.side, ro.price, ro.qty_base)] = ro
+        unmatched_live = set(range(len(live_rows)))
+        matched_live_by_desired_idx: Dict[int, int] = {}
 
-        # cancel stale
-        for k, oid in live_map.items():
-            if k not in desired_map:
-                self._ccxt_cancel_order(oid, symbol)
+        for idx, ro in enumerate(desired):
+            best_j: Optional[int] = None
+            best_score: Optional[float] = None
+            for j in list(unmatched_live):
+                live = live_rows[j]
+                if not self._order_match_tolerant(ro, live):
+                    continue
+                px_den = max(abs(float(ro.price)), 1e-12)
+                qty_den = max(abs(float(ro.qty_base)), 1e-12)
+                score = (
+                    abs(float(ro.price) - float(live["price"])) / px_den
+                    + abs(float(ro.qty_base) - float(live["amount"])) / qty_den
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_j = j
+            if best_j is not None:
+                matched_live_by_desired_idx[idx] = int(best_j)
+                unmatched_live.discard(int(best_j))
 
-        # place missing
+        action_budget = max(int(self._reconcile_max_actions_per_tick), 1)
+        cancel_count = 0
+        place_count = 0
+        kept_count = 0
+        skipped_due_cap = False
+
+        # Cancel stale live orders first to reduce accidental over-allocation risk.
+        for j in sorted(unmatched_live):
+            if action_budget <= 0:
+                skipped_due_cap = True
+                break
+            oid = str(live_rows[j].get("order_id") or "").strip()
+            if not oid:
+                continue
+            self._ccxt_cancel_order(oid, symbol)
+            action_budget -= 1
+            cancel_count += 1
+
         new_orders: List[RestingOrder] = []
-        for k, ro in desired_map.items():
-            if k in live_map:
-                ro.order_id = live_map[k]
+        for idx, ro in enumerate(desired):
+            if idx in matched_live_by_desired_idx:
+                matched_live = live_rows[matched_live_by_desired_idx[idx]]
+                ro.order_id = str(matched_live.get("order_id") or "")
                 ro.status = "open"
+                kept_count += 1
                 new_orders.append(ro)
-            else:
-                oid = self._ccxt_place_limit(ro.side, symbol, ro.qty_base, ro.price, limits)
-                ro.order_id = oid
-                ro.status = "open" if oid else "rejected"
+                continue
+
+            if action_budget <= 0:
+                ro.order_id = None
+                ro.status = "rejected"
+                skipped_due_cap = True
                 new_orders.append(ro)
+                continue
+
+            oid = self._ccxt_place_limit(ro.side, symbol, ro.qty_base, ro.price, limits)
+            ro.order_id = oid
+            ro.status = "open" if oid else "rejected"
+            place_count += 1
+            action_budget -= 1
+            new_orders.append(ro)
 
         self._orders = new_orders
+        self._last_reconcile_summary = {
+            "live_open_orders": int(len(live_rows)),
+            "desired_orders": int(len(desired)),
+            "kept_orders": int(kept_count),
+            "cancelled_orders": int(cancel_count),
+            "placed_orders": int(place_count),
+        }
+        self._last_reconcile_skipped_due_cap = bool(skipped_due_cap)
+
+        if cancel_count > 0 or place_count > 0:
+            self._append_runtime_exec_event("EXEC_ORDER_CANCEL_REPLACE_APPLIED")
+        if skipped_due_cap:
+            log_event(
+                "warning",
+                "reconcile_action_cap_reached",
+                action_cap=self._reconcile_max_actions_per_tick,
+                reconcile_summary=self._last_reconcile_summary,
+            )
 
     # ---------- fill ingestion ----------
     def _levels_for_index(self, levels: np.ndarray, idx: int) -> Optional[float]:
@@ -820,6 +1425,8 @@ class GridExecutorV1:
     def step(self, plan: Dict) -> None:
         if "range" not in plan or "grid" not in plan:
             raise KeyError("Plan schema mismatch: expected keys ['range','grid'].")
+        self._reset_runtime_diagnostics()
+        self._apply_execution_hardening_config(plan)
 
         raw_action = str(plan.get("action", "HOLD")).upper()
         if raw_action not in ("START", "HOLD", "STOP"):
@@ -861,6 +1468,7 @@ class GridExecutorV1:
             except Exception:
                 pass
 
+        prev_mark_price = self._last_mark_price
         tp_price, sl_price = self._extract_exit_levels(plan)
         self._last_mark_price = _safe_float(ref_price, default=None)
         self._last_tp_price = _safe_float(tp_price, default=None)
@@ -903,6 +1511,9 @@ class GridExecutorV1:
         active_orders = [o for o in self._orders if o.status in ("open", "partial")]
         has_active_orders = len(active_orders) > 0
         plan_sig = plan_signature(plan)
+        self._runtime_confirm["runtime"] = {
+            "post_only_burst": self._post_only_burst_status(),
+        }
 
         effective_action = raw_action
         suppression_reason: Optional[str] = None
@@ -919,6 +1530,49 @@ class GridExecutorV1:
                     # Duplicate STOP on already-cleared state: suppress churn.
                     effective_action = "HOLD"
                     suppression_reason = "duplicate_stop_already_cleared"
+
+        if effective_action == "START":
+            confirm_phase = "rebuild" if (rebuild and has_active_orders) else "entry"
+            confirm_res = self._run_confirm_hook(
+                confirm_phase,
+                plan,
+                ref_price,
+                prev_mark_price,
+            )
+            self._runtime_confirm[confirm_phase] = confirm_res
+            if not bool(confirm_res.get("ok")):
+                effective_action = "HOLD"
+                if confirm_phase == "rebuild":
+                    suppression_reason = "confirm_rebuild_failed"
+                    self._append_runtime_exec_event("EXEC_CONFIRM_REBUILD_FAILED")
+                else:
+                    suppression_reason = "confirm_start_failed"
+                    self._append_runtime_exec_event("EXEC_CONFIRM_START_FAILED")
+                log_event(
+                    "warning",
+                    "confirm_hook_blocked_start",
+                    confirm_phase=confirm_phase,
+                    reasons=confirm_res.get("reasons"),
+                    metrics=confirm_res.get("metrics"),
+                )
+
+        if effective_action == "STOP":
+            confirm_exit = self._run_confirm_hook(
+                "exit",
+                plan,
+                ref_price,
+                prev_mark_price,
+            )
+            self._runtime_confirm["exit"] = confirm_exit
+            if not bool(confirm_exit.get("ok")):
+                self._last_stop_reason = "STOP_EXEC_CONFIRM_EXIT_FAILSAFE"
+                self._append_runtime_exec_event("EXEC_CONFIRM_EXIT_FAILSAFE")
+                log_event(
+                    "warning",
+                    "confirm_hook_exit_failsafe",
+                    reasons=confirm_exit.get("reasons"),
+                    metrics=confirm_exit.get("metrics"),
+                )
 
         self._last_raw_action = raw_action
         self._last_effective_action = effective_action
@@ -1053,6 +1707,23 @@ class GridExecutorV1:
             "fill_no_repeat_lsi_guard": self._fill_no_repeat_lsi_guard,
             "fill_cooldown_bars": int(self._fill_cooldown_bars),
             "tick_size": self._tick_size,
+            "warnings": [str(x) for x in self._runtime_warnings],
+            "exec_events": [str(x) for x in self._runtime_exec_events],
+            "pause_reasons": [str(x) for x in self._runtime_pause_reasons],
+            "confirm": self._runtime_confirm,
+            "post_only_retry_count_total": int(self._post_only_retry_count_total),
+            "post_only_reprice_count_total": int(self._post_only_reprice_count_total),
+            "post_only_reject_streak": int(self._post_only_reject_streak),
+            "post_only_reject_window_count": int(len(self._post_only_reject_times)),
+            "reconcile_summary": self._last_reconcile_summary,
+            "reconcile_skipped_due_cap": bool(self._last_reconcile_skipped_due_cap),
+            "fill_guard_bar_seq": int(self._fill_guard_bar_seq),
+            "fill_guard_last_clock_ts": self._fill_guard_last_clock_ts,
+            "ccxt_error_streak": int(self._ccxt_error_streak),
+            "ccxt_backoff_until_ts": float(self._ccxt_backoff_until_ts),
+            "last_ccxt_error": self._last_ccxt_error,
+            "state_recovery_loaded": bool(self._recovery_loaded),
+            "state_recovery_error": self._recovery_error,
         }
 
         payload = ExecutorState(
