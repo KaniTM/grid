@@ -305,13 +305,29 @@ def test_start_stability_state_supports_k_of_n_and_score() -> None:
 def test_box_quality_metrics_and_straddle_helpers() -> None:
     strategy = object.__new__(GridBrainV1Core)
     # Setup necessary attributes
+    strategy.box_quality_log_space = True
+    strategy.box_quality_extension_factor = 1.386
     strategy._breakout_levels_by_pair = {"PAIR/STR": {"up": 105.0, "dn": 95.0}}
     strategy._breakout_bars_since_by_pair = {"PAIR/STR": 1}
     diag = strategy._update_box_quality("PAIR/STR", 90.0, 110.0, 1.0, 96, pd.DataFrame())
-    assert diag["q2"] == pytest.approx(100.0)
-    assert diag["extension_hi"] == pytest.approx(113.86, rel=1e-3)
+    assert diag["quartile_space"] == "log"
+    assert diag["q2"] == pytest.approx(99.4987, rel=1e-4)
+    assert diag["extension_hi"] == pytest.approx(118.8591, rel=1e-4)
     assert strategy._is_level_near_box(109.6, 90.0, 110.0, 0.5, 0.25)
     assert strategy._box_straddles_level("PAIR/STR", 109.7, 90.0, 110.0, 0.5, 0.25)
+
+
+def test_box_quality_levels_linear_fallback_when_nonpositive_bounds() -> None:
+    strategy = object.__new__(GridBrainV1Core)
+    strategy.box_quality_log_space = True
+    strategy.box_quality_extension_factor = 1.386
+    levels = strategy._box_quality_levels(-10.0, 20.0)
+    assert levels["space"] == "linear_fallback"
+    assert levels["q1"] == pytest.approx(-2.5)
+    assert levels["q2"] == pytest.approx(5.0)
+    assert levels["q3"] == pytest.approx(12.5)
+    assert levels["extension_lo"] == pytest.approx(-21.58, rel=1e-4)
+    assert levels["extension_hi"] == pytest.approx(31.58, rel=1e-4)
 
 
 def test_poc_acceptance_handles_multiple_candidates() -> None:

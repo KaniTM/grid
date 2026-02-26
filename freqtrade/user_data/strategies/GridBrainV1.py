@@ -932,6 +932,8 @@ class GridBrainV1Core(IStrategy):
     fvg_vp_enabled = False
     sl_lvn_avoid_steps = 0.25
     sl_fvg_buffer_steps = 0.10
+    box_quality_log_space = True
+    box_quality_extension_factor = 1.386
 
     # Shared fill semantics metadata (Section 13.7).
     fill_confirmation_mode = "Touch"  # Touch | Reverse
@@ -2860,6 +2862,62 @@ class GridBrainV1Core(IStrategy):
         )
         return bool(min_dist < float(step_price))
 
+    def _box_quality_levels(self, lo_p: float, hi_p: float) -> Dict[str, float]:
+        lo = float(lo_p)
+        hi = float(hi_p)
+        if hi < lo:
+            lo, hi = hi, lo
+        span = hi - lo
+        ext_factor = max(float(getattr(self, "box_quality_extension_factor", 1.386)), 1.0)
+        ext_delta = ext_factor - 1.0
+
+        if span <= 0.0:
+            return {
+                "q1": lo,
+                "q2": lo,
+                "q3": lo,
+                "extension_lo": lo,
+                "extension_hi": hi,
+                "space": "degenerate",
+                "extension_factor": float(ext_factor),
+            }
+
+        use_log = bool(getattr(self, "box_quality_log_space", True)) and lo > 0.0 and hi > 0.0
+        if use_log:
+            lo_log = math.log(lo)
+            hi_log = math.log(hi)
+            log_span = hi_log - lo_log
+            if log_span > 0.0:
+                q1 = math.exp(lo_log + 0.25 * log_span)
+                q2 = math.exp(lo_log + 0.50 * log_span)
+                q3 = math.exp(lo_log + 0.75 * log_span)
+                ext_lo = math.exp(lo_log - ext_delta * log_span)
+                ext_hi = math.exp(hi_log + ext_delta * log_span)
+                return {
+                    "q1": float(q1),
+                    "q2": float(q2),
+                    "q3": float(q3),
+                    "extension_lo": float(ext_lo),
+                    "extension_hi": float(ext_hi),
+                    "space": "log",
+                    "extension_factor": float(ext_factor),
+                }
+
+        q1 = lo + 0.25 * span
+        q2 = lo + 0.50 * span
+        q3 = lo + 0.75 * span
+        ext_lo = lo - ext_delta * span
+        ext_hi = hi + ext_delta * span
+        return {
+            "q1": float(q1),
+            "q2": float(q2),
+            "q3": float(q3),
+            "extension_lo": float(ext_lo),
+            "extension_hi": float(ext_hi),
+            "space": "linear_fallback",
+            "extension_factor": float(ext_factor),
+        }
+
     def _update_box_quality(
         self,
         pair: str,
@@ -2872,23 +2930,19 @@ class GridBrainV1Core(IStrategy):
         mid = (hi_p + lo_p) / 2.0 if (hi_p + lo_p) else 0.0
         width_pct = (hi_p - lo_p) / mid if mid > 0 else 0.0
         pad_pct = (pad / mid) if (mid > 0) else 0.0
-        quartile_span = hi_p - lo_p
-        q1 = lo_p + 0.25 * quartile_span
-        q2 = lo_p + 0.50 * quartile_span
-        q3 = lo_p + 0.75 * quartile_span
-        ext_factor = 1.386
-        ext_lo = lo_p - 0.5 * (ext_factor - 1.0) * quartile_span
-        ext_hi = hi_p + 0.5 * (ext_factor - 1.0) * quartile_span
+        levels = self._box_quality_levels(lo_p, hi_p)
         diagnostics = {
             "lookback_bars": int(lookback),
             "width_pct": float(width_pct),
             "pad": float(pad),
             "pad_pct": float(pad_pct),
-            "q1": float(q1),
-            "q2": float(q2),
-            "q3": float(q3),
-            "extension_lo": float(ext_lo),
-            "extension_hi": float(ext_hi),
+            "q1": float(levels["q1"]),
+            "q2": float(levels["q2"]),
+            "q3": float(levels["q3"]),
+            "extension_lo": float(levels["extension_lo"]),
+            "extension_hi": float(levels["extension_hi"]),
+            "quartile_space": str(levels["space"]),
+            "extension_factor": float(levels["extension_factor"]),
         }
         self._box_quality_by_pair[pair] = diagnostics
         return diagnostics
@@ -5552,11 +5606,16 @@ class GridBrainV1Core(IStrategy):
         poc_candidates = [x for x in (final_vrvp_poc,) if x is not None]
         poc_acceptance_satisfied = self._poc_acceptance_status(pair, dataframe, poc_candidates)
 
-        # Quartiles
+        # Box quality levels (M209): log-space quartiles + 1.386 extensions.
         width_pct = (hi_p - lo_p) / mid if mid > 0 else 0.0
-        q1 = lo_p + 0.25 * (hi_p - lo_p)
-        q2 = mid
-        q3 = lo_p + 0.75 * (hi_p - lo_p)
+        box_quality_levels = self._box_quality_levels(lo_p, hi_p)
+        q1 = float(box_quality_levels["q1"])
+        q2 = float(box_quality_levels["q2"])
+        q3 = float(box_quality_levels["q3"])
+        ext_lo = float(box_quality_levels["extension_lo"])
+        ext_hi = float(box_quality_levels["extension_hi"])
+        quartile_space = str(box_quality_levels["space"])
+        extension_factor = float(box_quality_levels["extension_factor"])
 
         # ---- Grid sizing (cost-aware + empirical floor) ----
         cost_floor = self._effective_cost_floor(pair, last, close)
@@ -5939,6 +5998,7 @@ class GridBrainV1Core(IStrategy):
             "box_default_tp": float(tp_price),
             "quartile_q1": float(q1),
             "quartile_q3": float(q3),
+            "extension_1386_hi": float(ext_hi),
             "vrvp_poc": self._safe_float(vrvp_poc),
             "mrvd_day_poc": mrvd_day_poc,
             "mrvd_week_poc": mrvd_week_poc,
@@ -5984,6 +6044,7 @@ class GridBrainV1Core(IStrategy):
             "box_default_tp": float(tp_price),
             "quartile_q1": float(q1),
             "quartile_q3": float(q3),
+            "extension_1386_hi": float(ext_hi),
             "vrvp_poc": self._safe_float(vrvp_poc),
             "imfvg_avg_bull": self._safe_float(fvg_state.get("imfvg_avg_bull")),
             "imfvg_avg_bear": self._safe_float(fvg_state.get("imfvg_avg_bear")),
@@ -6757,6 +6818,12 @@ class GridBrainV1Core(IStrategy):
                 "lookback_bars_used": int(used_lb),
                 "width_pct": float(width_pct),
                 "quartiles": {"q1": float(q1), "q2": float(q2), "q3": float(q3)},
+                "extensions": {
+                    "x1386_lo": float(ext_lo),
+                    "x1386_hi": float(ext_hi),
+                    "space": str(quartile_space),
+                    "factor": float(extension_factor),
+                },
                 "volume_profile": {
                     "lookback_bars": int(self.vrvp_lookback_bars),
                     "bins": int(self.vrvp_bins),
@@ -7679,6 +7746,12 @@ class GridBrainV1Core(IStrategy):
             "lookback_bars_used": int(used_lb),
             "pad": float(pad),
             "box_block_reasons": [str(x) for x in box_block_reasons],
+            "quartile_space": str(quartile_space),
+            "extension_factor": float(extension_factor),
+            "extension_1386": {
+                "lo": float(ext_lo),
+                "hi": float(ext_hi),
+            },
             "breakout_fresh_block_active": bool(breakout_fresh_block_active),
             "breakout_levels": {
                 "up": float(breakout_up_level),
@@ -7693,6 +7766,12 @@ class GridBrainV1Core(IStrategy):
             "lookback_bars_used": int(used_lb),
             "pad": float(pad),
             "quartiles": {"q1": float(q1), "q2": float(q2), "q3": float(q3)},
+            "extensions": {
+                "x1386_lo": float(ext_lo),
+                "x1386_hi": float(ext_hi),
+                "space": str(quartile_space),
+                "factor": float(extension_factor),
+            },
         }
         plan["signals_snapshot"] = dict(plan.get("signals", {}))
         plan["runtime_hints"] = {
