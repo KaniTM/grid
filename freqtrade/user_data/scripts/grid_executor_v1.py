@@ -164,6 +164,39 @@ def build_levels(
     return levels
 
 
+def _levels_validation_error(levels: np.ndarray, expected_count: int, eps: float = 1e-12) -> Optional[str]:
+    if not isinstance(levels, np.ndarray):
+        return "levels_not_array"
+    if levels.ndim != 1:
+        return "levels_not_vector"
+    if len(levels) != int(expected_count):
+        return "levels_count_mismatch"
+    if len(levels) < 2:
+        return "levels_too_few"
+    if not np.all(np.isfinite(levels)):
+        return "levels_non_finite"
+    diffs = np.diff(levels.astype(float))
+    if np.any(diffs <= float(eps)):
+        return "levels_non_increasing_or_duplicate"
+    return None
+
+
+def _validate_grid_level_geometry(
+    box_low: float,
+    box_high: float,
+    n_levels: int,
+    tick_size: Optional[float],
+) -> Optional[str]:
+    if int(n_levels) <= 0:
+        return "invalid_n_levels"
+    if not np.isfinite(float(box_low)) or not np.isfinite(float(box_high)):
+        return "invalid_box_bounds_non_finite"
+    if float(box_high) <= float(box_low):
+        return "invalid_box_bounds_order"
+    levels = build_levels(float(box_low), float(box_high), int(n_levels), tick_size=tick_size)
+    return _levels_validation_error(levels, int(n_levels) + 1)
+
+
 def plan_signature(plan: Dict) -> Tuple:
     """
     Signature used to detect material plan changes.
@@ -826,6 +859,29 @@ class GridExecutorV1:
             schema_errors.append("missing:range_grid")
         if schema_errors:
             self._reject_plan_intake(plan, "EXEC_PLAN_SCHEMA_INVALID", ",".join(schema_errors))
+            return False, "EXEC_PLAN_SCHEMA_INVALID"
+
+        range_block = plan.get("range") if isinstance(plan.get("range"), dict) else {}
+        grid_block = plan.get("grid") if isinstance(plan.get("grid"), dict) else {}
+        try:
+            box_low = float(range_block.get("low"))
+            box_high = float(range_block.get("high"))
+            n_levels = int(grid_block.get("n_levels"))
+            tick_size = _safe_float(grid_block.get("tick_size"), default=None)
+        except Exception:
+            self._append_runtime_warning("BLOCK_N_LEVELS_INVALID")
+            self._reject_plan_intake(plan, "EXEC_PLAN_SCHEMA_INVALID", "invalid_levels:parse_error")
+            return False, "EXEC_PLAN_SCHEMA_INVALID"
+
+        level_error = _validate_grid_level_geometry(
+            box_low=box_low,
+            box_high=box_high,
+            n_levels=n_levels,
+            tick_size=tick_size,
+        )
+        if level_error:
+            self._append_runtime_warning("BLOCK_N_LEVELS_INVALID")
+            self._reject_plan_intake(plan, "EXEC_PLAN_SCHEMA_INVALID", f"invalid_levels:{level_error}")
             return False, "EXEC_PLAN_SCHEMA_INVALID"
 
         plan_symbol = plan_pair(plan)
@@ -2361,8 +2417,10 @@ class GridExecutorV1:
         rung_weights = _extract_rung_weights(plan, n_levels)
 
         levels = build_levels(box_low, box_high, n_levels, tick_size=self._tick_size)
-        if len(levels) < 2:
-            raise ValueError("Not enough levels (n_levels must be >= 1).")
+        level_error = _levels_validation_error(levels, n_levels + 1)
+        if level_error:
+            self._append_runtime_warning("BLOCK_N_LEVELS_INVALID")
+            raise ValueError(f"invalid_levels:{level_error}")
 
         limits = market_limits(self.exchange, symbol)
 

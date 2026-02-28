@@ -396,3 +396,30 @@ def test_execution_cost_feedback_writes_artifact_and_lifecycle_logs(tmp_path: Pa
 
     artifact_payload = json.loads(Path(paths["artifact_latest"]).read_text(encoding="utf-8"))
     assert validate_schema(artifact_payload, "execution_cost_calibration.schema.json") == []
+
+
+def test_levels_validation_flags_duplicate_prices_after_tick_rounding() -> None:
+    levels = grid_executor_v1.build_levels(100.0, 100.2, n_levels=4, tick_size=1.0)
+    err = grid_executor_v1._levels_validation_error(levels, expected_count=5)
+    assert err == "levels_non_increasing_or_duplicate"
+
+
+def test_plan_intake_rejects_invalid_level_geometry(tmp_path: Path) -> None:
+    ex = _executor(tmp_path)
+    plan = _base_plan("START")
+    plan["range"] = {"low": 100.0, "high": 100.2}
+    plan["grid"]["n_levels"] = 4
+    plan["grid"]["step_price"] = 0.05
+    plan["grid"]["tick_size"] = 1.0
+    plan["plan_hash"] = compute_plan_hash(plan)
+
+    ex.step(plan)
+
+    state = grid_executor_v1.load_json(ex.state_out)
+    runtime = state["runtime"]
+    assert runtime["raw_action"] == "HOLD"
+    assert runtime["effective_action"] == "HOLD"
+    assert runtime["action_suppression_reason"] == "plan_rejected:EXEC_PLAN_SCHEMA_INVALID"
+    assert "EXEC_PLAN_SCHEMA_INVALID" in runtime["exec_events"]
+    assert "BLOCK_N_LEVELS_INVALID" in runtime["warnings"]
+    assert state["orders"] == []
