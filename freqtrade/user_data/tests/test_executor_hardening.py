@@ -8,8 +8,10 @@ from uuid import uuid4
 
 import pytest
 
+from core.enums import WarningCode, is_canonical_code
 from core.plan_signature import compute_plan_hash
 from core.schema_validation import validate_schema
+from execution.capacity_guard import compute_dynamic_capacity_state
 from freqtrade.user_data.scripts import grid_executor_v1
 
 
@@ -398,6 +400,96 @@ def test_execution_cost_feedback_writes_artifact_and_lifecycle_logs(tmp_path: Pa
 
     artifact_payload = json.loads(Path(paths["artifact_latest"]).read_text(encoding="utf-8"))
     assert validate_schema(artifact_payload, "execution_cost_calibration.schema.json") == []
+
+
+def test_execution_cost_feedback_schema_error_emits_canonical_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ex = _executor(tmp_path)
+    plan = _base_plan(
+        "START",
+        runtime_state={"clock_ts": 1_700_000_000, "spread_pct": 0.002},
+        execution_hardening={
+            "execution_cost_feedback": {
+                "enabled": True,
+                "window": 16,
+                "percentile": 90.0,
+                "min_samples": 1,
+                "stale_steps": 32,
+            }
+        },
+    )
+    plan["capital_policy"] = {"grid_budget_pct": 1.0}
+    plan["plan_hash"] = compute_plan_hash(plan)
+
+    original_validate = grid_executor_v1.validate_schema
+
+    def _fake_validate(payload: dict, schema_name: str) -> list[str]:
+        if schema_name == "execution_cost_calibration.schema.json":
+            return ["forced_schema_error"]
+        return original_validate(payload, schema_name)
+
+    monkeypatch.setattr(grid_executor_v1, "validate_schema", _fake_validate)
+    ex.step(plan)
+    state = grid_executor_v1.load_json(ex.state_out)
+    warnings = [str(x) for x in state["runtime"]["warnings"]]
+
+    assert str(WarningCode.WARN_FEATURE_FALLBACK_USED) in warnings
+    assert all(is_canonical_code(code) for code in warnings)
+    assert "WARN_COST_ARTIFACT_SCHEMA_INVALID" not in warnings
+
+
+def test_capacity_guard_hard_zero_remains_blocked() -> None:
+    state = compute_dynamic_capacity_state(
+        max_orders_per_side=0,
+        n_levels=0,
+        quote_total=1000.0,
+        grid_budget_pct=1.0,
+        preferred_rung_cap=None,
+        runtime_spread_pct=0.05,
+        runtime_depth_thinning_score=0.9,
+        top_book_notional=100.0,
+        runtime_capacity_ok=True,
+        runtime_reasons=[],
+        spread_wide_threshold=0.001,
+        depth_thin_threshold=0.5,
+        spread_cap_multiplier=0.5,
+        depth_cap_multiplier=0.5,
+        min_rung_cap=1,
+        top_book_safety_fraction=0.5,
+        delay_replenish_on_thin=True,
+    )
+
+    assert state["base_rung_cap"] == 0
+    assert state["applied_rung_cap"] == 0
+    assert state["capacity_ok"] is False
+    assert "BLOCK_CAPACITY_THIN" in state["reasons"]
+
+
+def test_capacity_guard_never_increases_on_multiplier_over_one() -> None:
+    state = compute_dynamic_capacity_state(
+        max_orders_per_side=3,
+        n_levels=4,
+        quote_total=1000.0,
+        grid_budget_pct=1.0,
+        preferred_rung_cap=None,
+        runtime_spread_pct=0.02,
+        runtime_depth_thinning_score=0.9,
+        top_book_notional=200.0,
+        runtime_capacity_ok=True,
+        runtime_reasons=[],
+        spread_wide_threshold=0.001,
+        depth_thin_threshold=0.5,
+        spread_cap_multiplier=2.0,
+        depth_cap_multiplier=2.0,
+        min_rung_cap=1,
+        top_book_safety_fraction=0.5,
+        delay_replenish_on_thin=False,
+    )
+
+    assert state["base_rung_cap"] == 3
+    assert state["applied_rung_cap"] <= state["base_rung_cap"]
+    assert state["capacity_ok"] is True
 
 
 def test_levels_validation_flags_duplicate_prices_after_tick_rounding() -> None:

@@ -1,0 +1,74 @@
+{
+  "c0_tag": "c0_20260228T192027Z",
+  "generated_utc": "2026-02-28T19:40:05.524890+00:00",
+  "runs": {
+    "backtest": {
+      "command": "./scripts/docker_env.sh backtest --config /freqtrade/user_data/config.json --strategy GridBrainV1 --strategy-path /freqtrade/user_data/strategies --timerange 20260209-20260210 --timeframe 15m --datadir /freqtrade/user_data/data/binance --export trades --export-filename /freqtrade/user_data/baselines/<C0_TAG>/metrics/backtest.json",
+      "log_path": "freqtrade/user_data/baselines/c0_20260228T192027Z/logs/backtest.log",
+      "meta_path": "freqtrade/user_data/baselines/c0_20260228T192027Z/metrics/backtest.meta.json",
+      "metrics": {
+        "draws": 0,
+        "losses": 0,
+        "max_drawdown": null,
+        "profit_factor": 0.0,
+        "profit_total": 0.0,
+        "profit_total_abs": 0,
+        "total_trades": 0,
+        "winrate": 0,
+        "wins": 0
+      },
+      "status": "ok",
+      "zip_path": "freqtrade/user_data/baselines/c0_20260228T192027Z/metrics/backtest.zip"
+    },
+    "regression_behavior_direct": {
+      "command": "./scripts/docker_env.sh cmd \"python /freqtrade/user_data/scripts/user_regression_suite.py --plan '/freqtrade/user_data/grid_plans/binance/ETH_USDT/grid_plan.latest.json' --state-out '/freqtrade/user_data/baselines/<C0_TAG>/metrics/grid_executor_v1.regression.state.json'\"",
+      "log_path": "freqtrade/user_data/baselines/c0_20260228T192027Z/logs/regression_behavior_direct.log",
+      "reason": "no recent plan snapshots found in plan directory",
+      "status": "fail"
+    },
+    "regression_wrapper": {
+      "command": "./scripts/docker_env.sh regression",
+      "log_path": "freqtrade/user_data/baselines/c0_20260228T192027Z/logs/regression.log",
+      "reason": "compile gate failed (check-user-work lint/type checks)",
+      "ruff_errors": 970,
+      "status": "fail"
+    },
+    "walkforward": {
+      "aggregate": {
+        "avg_pnl_pct": 0.0,
+        "profit_factor": null,
+        "sum_pnl_quote": 0.0,
+        "top_start_blocker": "BLOCK_ADX_HIGH:96",
+        "top_stop_reason": "os_dev_trend_stop:56",
+        "win_rate": 0.0,
+        "windows_failed": 0,
+        "windows_ok": 1,
+        "windows_total": 1
+      },
+      "command": "./scripts/docker_env.sh walkforward --timerange 20260209-20260210 --window-days 1 --step-days 1 --min-window-days 1 --pair ETH/USDT --run-id <C0_TAG>_wf --fail-on-window-error",
+      "log_path": "freqtrade/user_data/baselines/c0_20260228T192027Z/logs/walkforward.log",
+      "run_id": "c0_20260228T192027Z_wf",
+      "status": "ok",
+      "summary_path": "freqtrade/user_data/walkforward/c0_20260228T192027Z_wf/summary.json",
+      "window_001": {
+        "action_hold": 47,
+        "action_start": 0,
+        "action_stop": 49,
+        "fills": 0,
+        "pnl_pct": 0.0,
+        "pnl_quote": 0.0,
+        "rebuild_events": 0,
+        "seed_events": 0,
+        "soft_adjust_events": 0,
+        "stop_events": 49
+      },
+      "windows_path": "freqtrade/user_data/walkforward/c0_20260228T192027Z_wf/windows.csv"
+    }
+  },
+  "scope": {
+    "docker_wrapper": "./scripts/docker_env.sh",
+    "pair": "ETH/USDT",
+    "timeframe": "15m",
+    "timerange": "20260209-20260210"
+  }
+}

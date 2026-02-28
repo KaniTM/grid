@@ -87,22 +87,43 @@ def compute_dynamic_capacity_state(
     min_cap = max(int(min_rung_cap), 1)
     if preferred_rung_cap is not None and int(preferred_rung_cap) > 0:
         base_cap = min(base_cap, int(preferred_rung_cap))
-    applied_cap = int(max(base_cap, 0))
-
+    effective_min_cap = int(max(min(min_cap, max(base_cap, 0)), 0))
     reasons = [str(x) for x in runtime_reasons if str(x).strip()]
     spread_pct = _as_float(runtime_spread_pct, default=None)
     depth_thinning = _as_float(runtime_depth_thinning_score, default=None)
     top_notional = _as_float(top_book_notional, default=None)
+    applied_cap = int(max(base_cap, 0))
+
+    # Hard-zero configuration must stay blocked, regardless of runtime multipliers.
+    if applied_cap <= 0:
+        if "BLOCK_CAPACITY_THIN" not in reasons:
+            reasons.append("BLOCK_CAPACITY_THIN")
+        return {
+            "capacity_ok": False,
+            "max_safe_active_rungs": 0,
+            "max_safe_rung_notional": None,
+            "reasons": reasons,
+            "delay_replenishment": bool(delay_replenish_on_thin),
+            "preferred_rung_cap": _as_int(preferred_rung_cap, default=None),
+            "base_rung_cap": int(base_cap),
+            "applied_rung_cap": 0,
+            "rung_cap_applied": False,
+            "spread_pct": spread_pct,
+            "depth_thinning_score": depth_thinning,
+            "top_book_notional": top_notional,
+        }
 
     if spread_pct is not None and spread_pct > float(max(spread_wide_threshold, 0.0)):
         reduced = int(math.floor(float(applied_cap) * float(max(spread_cap_multiplier, 0.0))))
-        applied_cap = max(min_cap, reduced)
+        reduced = min(applied_cap, reduced)
+        applied_cap = max(effective_min_cap, reduced)
         if "SPREAD_WIDE" not in reasons:
             reasons.append("SPREAD_WIDE")
 
     if depth_thinning is not None and depth_thinning > float(max(depth_thin_threshold, 0.0)):
         reduced = int(math.floor(float(applied_cap) * float(max(depth_cap_multiplier, 0.0))))
-        applied_cap = max(min_cap, reduced)
+        reduced = min(applied_cap, reduced)
+        applied_cap = max(effective_min_cap, reduced)
         if "DEPTH_THIN_AT_TOP" not in reasons:
             reasons.append("DEPTH_THIN_AT_TOP")
 
@@ -112,7 +133,7 @@ def compute_dynamic_capacity_state(
         quote_budget = max(float(quote_total) * float(grid_budget_pct), 0.0)
         if max_safe_rung_notional > 0 and quote_budget > 0:
             notional_cap = int(math.floor(quote_budget / max_safe_rung_notional))
-            notional_cap = max(min_cap, notional_cap)
+            notional_cap = max(effective_min_cap, notional_cap)
             if notional_cap < applied_cap:
                 applied_cap = int(notional_cap)
                 if "TOP_BOOK_NOTIONAL_LIMIT" not in reasons:
@@ -122,7 +143,7 @@ def compute_dynamic_capacity_state(
         if "BLOCK_CAPACITY_THIN" not in reasons:
             reasons.append("BLOCK_CAPACITY_THIN")
 
-    capacity_ok = bool(runtime_capacity_ok) and bool(applied_cap >= min_cap)
+    capacity_ok = bool(runtime_capacity_ok) and bool(applied_cap >= effective_min_cap)
     delay_replenishment = bool(delay_replenish_on_thin and ("DEPTH_THIN_AT_TOP" in reasons or not capacity_ok))
 
     return {

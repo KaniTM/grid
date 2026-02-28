@@ -10,6 +10,7 @@ from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from core.atomic_json import write_json_atomic
+from core.enums import WarningCode
 from core.plan_signature import compute_plan_hash, plan_is_expired, plan_pair, validate_signature_fields
 from core.schema_validation import validate_schema
 from analytics.execution_cost_calibrator import EmpiricalCostCalibrator
@@ -1718,7 +1719,7 @@ class GridExecutorV1:
         }
         schema_errors = validate_schema(artifact, "execution_cost_calibration.schema.json")
         if schema_errors:
-            self._append_runtime_warning("WARN_COST_ARTIFACT_SCHEMA_INVALID")
+            self._append_runtime_warning(str(WarningCode.WARN_FEATURE_FALLBACK_USED))
             log_event(
                 "warning",
                 "execution_cost_artifact_schema_invalid",

@@ -3281,14 +3281,14 @@ Generated: 2026-02-28 11:54:37 UTC
 
 ## 10) Consolidated TODO Backlog (Priority Ordered)
 ### P0 (Immediate, Execution-Critical)
-1. `P0-1` Full git-history archaeology for removed/replaced features.
-- Acceptance: produce a Removed Feature Relevance Ledger with `RESTORE` / `KEEP_REMOVED` / `INVESTIGATE` for each candidate.
-2. `P0-2` Registry-only lifecycle triage for all `83` codes in Section 7.
-- Acceptance: every code classified as `ACTIVE` / `RETIRED` / `PARKED_FUTURE`, with owner, rationale, and target checkpoint.
-3. `P0-3` Baseline code review (quality, logic faults, bug risk, security posture).
-- Acceptance: severity-ranked findings list and fix queue.
-4. `P0-4` Baseline frozen metrics snapshot before behavior changes (`C0`).
-- Acceptance: regression + backtest + walkforward snapshot stored as comparison baseline.
+1. `P0-1` Full git-history archaeology for removed/replaced features. `Status`: DONE (`docs/REMOVED_FEATURE_RELEVANCE_LEDGER.md`).
+- Acceptance: produce a Removed Feature Relevance Ledger with `RESTORE` / `KEEP_REMOVED` / `INVESTIGATE` for each candidate. `Completed`: 2026-02-28.
+2. `P0-2` Registry-only lifecycle triage for all `83` codes in Section 7. `Status`: DONE (`docs/REGISTRY_LIFECYCLE_TRIAGE.md`).
+- Acceptance: every code classified as `ACTIVE` / `RETIRED` / `PARKED_FUTURE`, with owner, rationale, and target checkpoint. `Completed`: 2026-02-28.
+3. `P0-3` Baseline code review (quality, logic faults, bug risk, security posture). `Status`: DONE (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
+- Acceptance: severity-ranked findings list and fix queue. `Completed`: 2026-02-28.
+4. `P0-4` Baseline frozen metrics snapshot before behavior changes (`C0`). `Status`: DONE (`docs/C0_BASELINE_SNAPSHOT.md`).
+- Acceptance: regression + backtest + walkforward snapshot stored as comparison baseline. `Completed`: 2026-02-28.
 5. `P0-5` Implement `M306` Directional skip-one rule.
 - Acceptance: simulator/executor parity + deterministic tests.
 6. `P0-6` Checkpoint `C1` after `M306`.
@@ -3322,10 +3322,10 @@ Generated: 2026-02-28 11:54:37 UTC
 5. Keep `AH-*` modules preserved unless a replacement is approved and checkpoint-validated.
 
 ## 12) Immediate Next Sprint Cut (Recommended)
-1. Start `P0-1` removed/replaced feature archaeology and produce the first relevance ledger draft.
-2. Execute `P0-2` lifecycle triage for all `83` registry-only codes using `ACTIVE` / `RETIRED` / `PARKED_FUTURE`.
-3. Run `P0-3` baseline code review and `P0-4` baseline frozen metrics snapshot (`C0`).
-4. After `C0` is frozen, implement `P0-5` (`M306`) and move to checkpoint `C1`.
+1. `P0-3` high-severity fixes (`F-001`, `F-002`) implemented with tests. `Status`: DONE (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
+2. Close `INVESTIGATE` setup from `P0-1` (`RF-002`, `RF-003`, `RF-004`, `RF-023`, `RF-024`) by defining checkpoint experiments.
+3. Resolve known `C0` red gates (regression compile gate + regression recency assertion) before `C1`.
+4. Implement `P0-5` (`M306`) and move to checkpoint `C1`.
 
 ## 13) Milestone Log (2026-02-28)
 ### ML-001 — Canonical Docker Runtime Wiring
@@ -3365,16 +3365,80 @@ Generated: 2026-02-28 11:54:37 UTC
 - Command: `./scripts/docker_env.sh walkforward --timerange 20260209-20260210 --window-days 1 --step-days 1 --min-window-days 1 --pair ETH/USDT --run-id smoke_wf_fix3 --fail-on-window-error`
 - Result: `RUN_COMPLETE return_code=0`; extraction produced plans and simulation completed.
 
+### ML-003 — Registry Lifecycle Triage Finalization (P0-2)
+`Status`: DONE
+
+`What Was Locked`
+1. Final lifecycle classification for all `83` Section-7 registry-only codes.
+2. No inventory drift: `83/83` parity check with no missing/extra triage entries.
+3. Execution-ready ACTIVE wiring queue by checkpoint wave.
+
+`Evidence Anchors`
+- `docs/REGISTRY_LIFECYCLE_TRIAGE.md:1`
+- `docs/REGISTRY_LIFECYCLE_TRIAGE.md:10`
+- `docs/REGISTRY_LIFECYCLE_TRIAGE.md:35`
+- `docs/REGISTRY_LIFECYCLE_TRIAGE.md:148`
+- `docs/REGISTRY_LIFECYCLE_TRIAGE.md:154`
+
+### ML-004 — Baseline Code Review Completion (P0-3)
+`Status`: DONE
+
+`What Was Locked`
+1. Static baseline review completed with severity-ranked findings and explicit fix queue.
+2. High-severity issues isolated before further behavior-expansion work.
+3. Review closure gate defined for transition into `C0` baseline freeze.
+
+`Evidence Anchors`
+- `docs/P0_3_BASELINE_CODE_REVIEW.md:1`
+- `docs/P0_3_BASELINE_CODE_REVIEW.md:21`
+- `docs/P0_3_BASELINE_CODE_REVIEW.md:131`
+- `docs/P0_3_BASELINE_CODE_REVIEW.md:138`
+
+### ML-005 — C0 Baseline Freeze Completion (P0-4)
+`Status`: DONE
+
+`What Was Locked`
+1. `C0` baseline run executed for regression/backtest/walkforward using canonical Docker wrapper.
+2. Baseline artifacts frozen with machine-readable manifest + human-readable snapshot.
+3. Known red gates captured explicitly as baseline facts (not ignored).
+
+`Evidence Anchors`
+- `docs/C0_BASELINE_SNAPSHOT.md:1`
+- `docs/C0_BASELINE_SNAPSHOT.md:30`
+- `docs/C0_BASELINE_SNAPSHOT.md:72`
+- `freqtrade/user_data/baselines/c0_20260228T192027Z/metrics/c0_snapshot.json:1`
+
+### ML-006 — High-Severity Fix Batch (`F-001` + `F-002`)
+`Status`: DONE
+
+`What Was Locked`
+1. Executor warning emission path no longer emits non-canonical warning strings.
+2. Capacity guard enforces hard-zero cap blocking and prevents multiplier-driven cap increases.
+3. Targeted hardening suite validates the new behavior.
+
+`Evidence Anchors`
+- `freqtrade/user_data/scripts/grid_executor_v1.py:13`
+- `freqtrade/user_data/scripts/grid_executor_v1.py:1722`
+- `execution/capacity_guard.py:91`
+- `execution/capacity_guard.py:117`
+- `freqtrade/user_data/tests/test_executor_hardening.py:367`
+- `freqtrade/user_data/tests/test_executor_hardening.py:412`
+
 ## 14) Next Step (Low-Cost) + Plan
 `Next Logical Step`
-- Execute `P0-1` as an inventory-first archaeology pass (no heavy runtime jobs): identify potentially valuable removed/replaced features from git history.
+- `P0-1` is complete (`docs/REMOVED_FEATURE_RELEVANCE_LEDGER.md`).
+- `P0-2` is complete (`docs/REGISTRY_LIFECYCLE_TRIAGE.md`).
+- `P0-3` is complete (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
+- `P0-4` is complete (`docs/C0_BASELINE_SNAPSHOT.md`).
+- High-severity fix batch (`F-001`, `F-002`) is complete.
+- Next step: clear `C0` red gates, then execute `P0-5` (`M306`) and checkpoint `C1`.
 
 `Execution Plan`
-1. Build a deleted/moved feature candidate list from git history for strategy/planner/core/execution/data/script paths.
-2. Build an enum/emitter change list focused on `core/enums.py` and runtime code emitters.
-3. Create the first `Removed Feature Relevance Ledger` draft with fields: `candidate`, `last_seen_commit`, `why_removed`, `current_replacement`, `classification`.
-4. Classify top-priority candidates as `RESTORE`, `KEEP_REMOVED`, or `INVESTIGATE`.
-5. Stop after inventory + first classification pass (no backtests, no walkforward reruns).
+1. Resolve compile/lint gate failures tracked in `C0` baseline (`970` findings snapshot) by priority bucket.
+2. Resolve regression recency assertion failure (`no recent plan snapshots found`) with deterministic plan-source setup.
+3. Re-run baseline regression command path and verify both red gates are green.
+4. Start `P0-5` (`M306`) only after gate closure evidence is stored.
 
 `Acceptance`
-- Ledger draft exists with at least top 20 candidates and evidence (`commit`, `path`, `rationale`) for each.
+- `C0` red gates are closed with command evidence (`regression` + direct regression suite).
+- `C0` remains the fixed comparison baseline for upcoming `C1+` deltas.
