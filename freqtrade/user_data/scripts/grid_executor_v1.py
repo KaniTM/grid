@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from core.atomic_json import write_json_atomic
 from core.plan_signature import compute_plan_hash, plan_is_expired, plan_pair, validate_signature_fields
 from core.schema_validation import validate_schema
 from analytics.execution_cost_calibrator import EmpiricalCostCalibrator
@@ -133,11 +134,7 @@ def load_json(path: str) -> Dict:
 
 
 def write_json(path: str, payload: Dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    os.replace(tmp, path)
+    write_json_atomic(path, payload)
 
 
 def _round_to_tick(price: float, tick_size: Optional[float]) -> float:
