@@ -12,8 +12,10 @@ For each window:
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
+import math
 import os
 import re
 import shlex
@@ -34,6 +36,7 @@ from long_run_monitor import LongRunMonitor, MonitorConfig
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FREQTRADE_ROOT = REPO_ROOT / "freqtrade"
 DEFAULT_USER_DATA = FREQTRADE_ROOT / "user_data"
+DEFAULT_COMPOSE_FILE = REPO_ROOT / "docker-compose.grid.yml"
 
 
 @dataclass
@@ -153,6 +156,213 @@ def _resolve_repo_path(value: str) -> Path:
     return (REPO_ROOT / candidate).resolve()
 
 
+def _resolve_host_and_container_path(value: str) -> Tuple[Path, str]:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Path value cannot be empty.")
+
+    # Accept already-containerized paths and map them back to host for validation.
+    if text == "/freqtrade" or text.startswith("/freqtrade/"):
+        rel = Path(text).relative_to("/freqtrade")
+        return (FREQTRADE_ROOT / rel).resolve(), text
+    if text == "/workspace" or text.startswith("/workspace/"):
+        rel = Path(text).relative_to("/workspace")
+        return (REPO_ROOT / rel).resolve(), text
+
+    host_path = _resolve_repo_path(text)
+    host_resolved = host_path.resolve()
+    repo_root_resolved = REPO_ROOT.resolve()
+    freqtrade_root_resolved = FREQTRADE_ROOT.resolve()
+    try:
+        rel = host_resolved.relative_to(freqtrade_root_resolved)
+        return host_resolved, f"/freqtrade/{rel.as_posix()}"
+    except Exception:
+        pass
+    try:
+        rel = host_resolved.relative_to(repo_root_resolved)
+        return host_resolved, f"/workspace/{rel.as_posix()}"
+    except Exception:
+        pass
+    raise ValueError(
+        f"Path is not mounted into container (expected under {freqtrade_root_resolved} or {repo_root_resolved}): {host_resolved}"
+    )
+
+
+def _timeframe_to_minutes(timeframe: str) -> int:
+    text = str(timeframe or "").strip().lower()
+    match = re.fullmatch(r"(\d+)([mhdw])", text)
+    if not match:
+        raise ValueError(f"Unsupported timeframe format: {timeframe!r} (expected like 15m, 1h, 4h, 1d)")
+    value = int(match.group(1))
+    unit = str(match.group(2))
+    unit_minutes = {
+        "m": 1,
+        "h": 60,
+        "d": 60 * 24,
+        "w": 60 * 24 * 7,
+    }
+    return int(max(value, 1) * unit_minutes[unit])
+
+
+def _ast_numeric_value(node: ast.AST) -> Optional[float]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        raw = _ast_numeric_value(node.operand)
+        if raw is None:
+            return None
+        return float(raw) if isinstance(node.op, ast.UAdd) else -float(raw)
+    if isinstance(node, ast.BinOp):
+        left = _ast_numeric_value(node.left)
+        right = _ast_numeric_value(node.right)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return float(left + right)
+        if isinstance(node.op, ast.Sub):
+            return float(left - right)
+        if isinstance(node.op, ast.Mult):
+            return float(left * right)
+        if isinstance(node.op, ast.Div):
+            if float(right) == 0.0:
+                return None
+            return float(left / right)
+        if isinstance(node.op, ast.FloorDiv):
+            if float(right) == 0.0:
+                return None
+            return float(left // right)
+        if isinstance(node.op, ast.Mod):
+            if float(right) == 0.0:
+                return None
+            return float(left % right)
+    return None
+
+
+def _extract_class_numeric_assignments(class_node: ast.ClassDef) -> Dict[str, float]:
+    attrs: Dict[str, float] = {}
+    for stmt in class_node.body:
+        target_name: Optional[str] = None
+        value_node: Optional[ast.AST] = None
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            target_name = str(stmt.targets[0].id)
+            value_node = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            target_name = str(stmt.target.id)
+            value_node = stmt.value
+        if not target_name or value_node is None:
+            continue
+        raw = _ast_numeric_value(value_node)
+        if raw is None:
+            continue
+        attrs[target_name] = float(raw)
+    return attrs
+
+
+def _extract_lookback_suffixes(tree: ast.Module) -> Tuple[str, ...]:
+    default_suffixes = ("_bars", "_lookback", "_window", "_period")
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        if str(stmt.targets[0].id) != "LOOKBACK_SUFFIXES":
+            continue
+        value = stmt.value
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            continue
+        out: List[str] = []
+        for item in value.elts:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                text = str(item.value).strip()
+                if text:
+                    out.append(text)
+        if out:
+            return tuple(out)
+    return default_suffixes
+
+
+def _collect_class_attrs_recursive(
+    class_name: str,
+    class_nodes: Dict[str, ast.ClassDef],
+    cache: Dict[str, Dict[str, float]],
+    visiting: Optional[set] = None,
+) -> Dict[str, float]:
+    if class_name in cache:
+        return dict(cache[class_name])
+    if visiting is None:
+        visiting = set()
+    if class_name in visiting:
+        return {}
+    node = class_nodes.get(class_name)
+    if node is None:
+        return {}
+    visiting.add(class_name)
+    merged: Dict[str, float] = {}
+    for base in node.bases:
+        base_name: Optional[str] = None
+        if isinstance(base, ast.Name):
+            base_name = str(base.id)
+        elif isinstance(base, ast.Attribute):
+            base_name = str(base.attr)
+        if base_name and base_name in class_nodes:
+            merged.update(_collect_class_attrs_recursive(base_name, class_nodes, cache, visiting))
+    merged.update(_extract_class_numeric_assignments(node))
+    visiting.remove(class_name)
+    cache[class_name] = dict(merged)
+    return dict(merged)
+
+
+def _estimate_strategy_startup_candles(strategy_file: Path, strategy_name: str) -> Optional[int]:
+    try:
+        source = strategy_file.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    try:
+        tree = ast.parse(source, filename=str(strategy_file))
+    except Exception:
+        return None
+    class_nodes = {
+        str(node.name): node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    }
+    if strategy_name not in class_nodes:
+        return None
+    attrs = _collect_class_attrs_recursive(strategy_name, class_nodes, cache={})
+    suffixes = _extract_lookback_suffixes(tree)
+
+    lookback_values: List[int] = []
+    for key, raw_value in attrs.items():
+        if not isinstance(raw_value, (int, float)):
+            continue
+        key_s = str(key)
+        if not any(key_s.endswith(s) for s in suffixes):
+            continue
+        lookback_values.append(int(math.ceil(float(raw_value))))
+
+    lookback_buffer = int(max(0, math.ceil(float(attrs.get("lookback_buffer", 0.0)))))
+    startup_attr = int(max(0, math.ceil(float(attrs.get("startup_candle_count", 0.0)))))
+    required_from_lookbacks = (max(lookback_values) + lookback_buffer) if lookback_values else 0
+    required = int(max(startup_attr, required_from_lookbacks))
+    return required if required > 0 else None
+
+
+def _locate_strategy_source_file(strategy_path: Path, strategy_name: str) -> Optional[Path]:
+    direct = strategy_path / f"{strategy_name}.py"
+    if direct.is_file():
+        return direct.resolve()
+
+    class_pat = re.compile(rf"^\s*class\s+{re.escape(str(strategy_name))}\b", re.MULTILINE)
+    for candidate in sorted(strategy_path.glob("*.py")):
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if class_pat.search(text):
+            return candidate.resolve()
+    return None
+
+
 def emit_run_marker(label: str, **meta: object) -> None:
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -186,6 +396,7 @@ def _collect_resume_mismatches(
         "reverse_fill",
         "regime_threshold_profile",
         "mode_thresholds_path",
+        "backtest_warmup_candles",
         "backtesting_extra",
         "sim_extra",
     )
@@ -384,8 +595,19 @@ def _probe_path_sizes(paths: Dict[str, Path]) -> Dict[str, object]:
     return out
 
 
+def _compose_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    try:
+        env.setdefault("GRID_UID", str(os.getuid()))
+        env.setdefault("GRID_GID", str(os.getgid()))
+    except Exception:
+        pass
+    return env
+
+
 def run_compose_inner(
-    root_dir: Path,
+    project_dir: Path,
+    compose_file: Path,
     service: str,
     inner_cmd: str,
     env_exports: Optional[List[str]] = None,
@@ -399,15 +621,27 @@ def run_compose_inner(
         exports = [str(x).strip() for x in env_exports if str(x).strip()]
         if exports:
             inner_cmd = f"{'; '.join(exports)}; {inner_cmd}"
-    cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_file),
+        "run",
+        "--rm",
+        "--entrypoint",
+        "bash",
+        service,
+        "-lc",
+        inner_cmd,
+    ]
     print(f"[walkforward] $ {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
     if dry_run:
         return
     hb = int(heartbeat_sec)
     if hb <= 0:
-        subprocess.run(cmd, cwd=str(root_dir), check=True)
+        subprocess.run(cmd, cwd=str(project_dir), env=_compose_env(), check=True)
         return
-    proc = subprocess.Popen(cmd, cwd=str(root_dir))
+    proc = subprocess.Popen(cmd, cwd=str(project_dir), env=_compose_env())
     started = time.time()
     label = str(progress_label).strip() or "compose"
     last_probe: Dict[str, object] = {}
@@ -907,12 +1141,29 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--strategy", default="GridBrainV1")
     ap.add_argument("--strategy-path", default=str(DEFAULT_USER_DATA / "strategies"))
     ap.add_argument("--data-dir", default=str(DEFAULT_USER_DATA / "data" / "binance"))
+    ap.add_argument("--user-data", default=str(DEFAULT_USER_DATA), help="Local user_data directory path.")
 
     ap.add_argument("--run-id", default=None, help="Output subdir under user_data/walkforward")
     ap.add_argument("--service", default="freqtrade", help="docker compose service")
+    ap.add_argument(
+        "--compose-file",
+        default=str(DEFAULT_COMPOSE_FILE),
+        help="docker compose file path (defaults to repo-level docker-compose.grid.yml)",
+    )
+    ap.add_argument(
+        "--project-dir",
+        default=str(REPO_ROOT),
+        help="docker compose project directory (defaults to repo root).",
+    )
     ap.add_argument("--regime-threshold-profile", default=None, help="Override profile via GRID_REGIME_THRESHOLD_PROFILE")
     ap.add_argument("--mode-thresholds-path", default=None, help="Path to mode threshold overrides json (sets GRID_MODE_THRESHOLDS_PATH)")
     ap.add_argument("--skip-backtesting", action="store_true")
+    ap.add_argument(
+        "--backtest-warmup-candles",
+        type=int,
+        default=-1,
+        help="Warmup candles prepended to each backtesting window (-1=auto from strategy lookbacks, 0=disable).",
+    )
     ap.add_argument("--backtesting-extra", default="", help="Extra args appended to freqtrade backtesting command")
     ap.add_argument("--sim-extra", default="", help="Extra args appended to simulator command")
     ap.add_argument("--dry-run", action="store_true")
@@ -981,9 +1232,14 @@ def main() -> int:
             "Use --allow-overlap to override."
         )
 
-    freqtrade_root = Path(__file__).resolve().parents[1]
-    root_dir = freqtrade_root
-    user_data_dir = DEFAULT_USER_DATA
+    freqtrade_root = FREQTRADE_ROOT
+    project_dir = _resolve_repo_path(args.project_dir)
+    compose_file = _resolve_repo_path(args.compose_file)
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"Compose project directory missing (--project-dir): {project_dir}")
+    if not compose_file.is_file():
+        raise FileNotFoundError(f"Compose file missing (--compose-file): {compose_file}")
+    user_data_dir = _resolve_repo_path(args.user_data)
     if not user_data_dir.is_dir():
         raise FileNotFoundError(f"user_data directory not found: {user_data_dir}")
 
@@ -991,15 +1247,46 @@ def main() -> int:
     windows = iter_windows(start, end, args.window_days, args.step_days, args.min_window_days)
     if not windows:
         raise ValueError("No windows produced. Adjust timerange/window-days/step-days.")
-    config_path = _resolve_repo_path(args.config_path)
-    strategy_path = _resolve_repo_path(args.strategy_path)
-    data_dir = _resolve_repo_path(args.data_dir)
+    config_path, config_path_container = _resolve_host_and_container_path(args.config_path)
+    strategy_path, strategy_path_container = _resolve_host_and_container_path(args.strategy_path)
+    data_dir, data_dir_container = _resolve_host_and_container_path(args.data_dir)
     if not config_path.is_file():
         raise FileNotFoundError(f"Config file missing (--config-path): {config_path}")
     if not strategy_path.is_dir():
         raise FileNotFoundError(f"Strategy path missing or invalid (--strategy-path): {strategy_path}")
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Data directory missing (--data-dir): {data_dir}")
+    if int(args.backtest_warmup_candles) < -1:
+        raise ValueError(
+            f"backtest-warmup-candles must be >= -1 (got {args.backtest_warmup_candles})"
+        )
+
+    timeframe_minutes = _timeframe_to_minutes(args.timeframe)
+    warmup_source = "explicit"
+    resolved_backtest_warmup_candles = int(args.backtest_warmup_candles)
+    strategy_source_path: Optional[Path] = None
+    if resolved_backtest_warmup_candles < 0:
+        warmup_source = "auto"
+        strategy_source_path = _locate_strategy_source_file(strategy_path, args.strategy)
+        if strategy_source_path is not None:
+            estimated = _estimate_strategy_startup_candles(strategy_source_path, args.strategy)
+            if estimated is not None:
+                resolved_backtest_warmup_candles = int(estimated)
+            else:
+                resolved_backtest_warmup_candles = 0
+                warmup_source = "auto_unavailable"
+        else:
+            resolved_backtest_warmup_candles = 0
+            warmup_source = "auto_unavailable"
+    if resolved_backtest_warmup_candles < 0:
+        resolved_backtest_warmup_candles = 0
+    resolved_backtest_warmup_days = (
+        int(math.ceil((float(resolved_backtest_warmup_candles) * float(timeframe_minutes)) / 1440.0))
+        if resolved_backtest_warmup_candles > 0
+        else 0
+    )
+    if int(args.backtest_warmup_candles) < 0:
+        args.backtest_warmup_candles = int(resolved_backtest_warmup_candles)
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("wf_%Y%m%dT%H%M%SZ")
     out_dir = user_data_dir / "walkforward" / run_id
@@ -1026,6 +1313,9 @@ def main() -> int:
             pct_complete=_format_pct(0, len(windows)),
             dry_run=int(bool(args.dry_run)),
             runtime_plans_root_rel=str(plan_root_rel),
+            backtest_warmup_candles=int(resolved_backtest_warmup_candles),
+            backtest_warmup_days=int(resolved_backtest_warmup_days),
+            backtest_warmup_source=str(warmup_source),
         )
         run_state.event(
             "RUN_START",
@@ -1033,6 +1323,9 @@ def main() -> int:
             timerange=str(args.timerange),
             windows_total=int(len(windows)),
             runtime_plans_root_rel=str(plan_root_rel),
+            backtest_warmup_candles=int(resolved_backtest_warmup_candles),
+            backtest_warmup_days=int(resolved_backtest_warmup_days),
+            backtest_warmup_source=str(warmup_source),
         )
     monitor_state_dir = out_dir / "_state" if not args.disable_run_state else None
     monitor = LongRunMonitor(
@@ -1054,6 +1347,15 @@ def main() -> int:
         windows_total=len(windows),
         user_data=str(user_data_dir),
         runtime_plans_root_rel=str(plan_root_rel),
+        backtest_warmup_candles=int(resolved_backtest_warmup_candles),
+        backtest_warmup_days=int(resolved_backtest_warmup_days),
+        backtest_warmup_source=str(warmup_source),
+        strategy_source_path=(str(strategy_source_path) if strategy_source_path is not None else ""),
+    )
+    print(
+        f"[walkforward] warmup backtest_candles={int(resolved_backtest_warmup_candles)} "
+        f"backtest_days={int(resolved_backtest_warmup_days)} source={warmup_source}",
+        flush=True,
     )
 
     existing_rows_by_index: Dict[int, WindowResult] = {}
@@ -1136,7 +1438,7 @@ def main() -> int:
         mode_path_out = mode_path_input
         mode_path_local = Path(mode_path_input)
         if not mode_path_local.is_absolute():
-            mode_path_local = (root_dir / mode_path_local).resolve()
+            mode_path_local = (freqtrade_root / mode_path_local).resolve()
         if mode_path_local.exists():
             try:
                 mode_path_out = to_container_user_data_path(mode_path_local, user_data_dir)
@@ -1265,6 +1567,10 @@ def main() -> int:
             end_day=fmt_day(we),
             status="ok",
         )
+        backtest_timerange = timerange
+        if int(resolved_backtest_warmup_days) > 0:
+            backtest_start = ws - timedelta(days=int(resolved_backtest_warmup_days))
+            backtest_timerange = f"{fmt_day(backtest_start)}-{fmt_day(we)}"
 
         window_stage = "init"
         window_stage_cmd = ""
@@ -1275,12 +1581,12 @@ def main() -> int:
                     shutil.rmtree(src_plan_dir)
                 backtesting_inner = (
                 f"freqtrade backtesting "
-                f"--config {q(str(config_path))} "
+                f"--config {q(str(config_path_container))} "
                 f"--strategy {q(args.strategy)} "
-                f"--strategy-path {q(str(strategy_path))} "
-                f"--timerange {q(timerange)} "
+                f"--strategy-path {q(str(strategy_path_container))} "
+                f"--timerange {q(backtest_timerange)} "
                 f"--timeframe {q(args.timeframe)} "
-                f"--datadir {q(str(data_dir))} "
+                f"--datadir {q(str(data_dir_container))} "
                     f"--cache none"
                 )
                 if args.backtesting_extra.strip():
@@ -1289,14 +1595,21 @@ def main() -> int:
                 window_stage_cmd = backtesting_inner
                 backtest_started = time.time()
                 print(
-                    f"[walkforward] window {idx} stage=backtesting status=start timerange={timerange}",
+                    f"[walkforward] window {idx} stage=backtesting status=start "
+                    f"timerange={timerange} backtest_timerange={backtest_timerange}",
                     flush=True,
                 )
                 if run_state is not None:
-                    run_state.event("WINDOW_BACKTEST_START", window_index=int(idx), timerange=timerange)
+                    run_state.event(
+                        "WINDOW_BACKTEST_START",
+                        window_index=int(idx),
+                        timerange=timerange,
+                        backtest_timerange=backtest_timerange,
+                    )
                 backtest_probe = lambda: {"plan_files": int(_count_plan_files(src_plan_dir))}
                 run_compose_inner(
-                    root_dir,
+                    project_dir,
+                    compose_file,
                     args.service,
                     backtesting_inner,
                     env_exports=env_exports,
@@ -1311,7 +1624,19 @@ def main() -> int:
                     flush=True,
                 )
                 if run_state is not None:
-                    run_state.event("WINDOW_BACKTEST_DONE", window_index=int(idx), timerange=timerange)
+                    run_state.event(
+                        "WINDOW_BACKTEST_DONE",
+                        window_index=int(idx),
+                        timerange=timerange,
+                        backtest_timerange=backtest_timerange,
+                    )
+                if (not args.dry_run) and (not src_plan_dir.is_dir()):
+                    raise RuntimeError(
+                        "Plan source directory not found after backtesting: "
+                        f"{src_plan_dir} (backtest_timerange={backtest_timerange}, "
+                        f"warmup_candles={resolved_backtest_warmup_candles}, "
+                        f"warmup_days={resolved_backtest_warmup_days})"
+                    )
 
             window_plan_dir = out_dir / f"window_{idx:03d}_plans"
             min_mtime_epoch = None if args.skip_backtesting else (window_started_epoch - 5.0)
@@ -1340,7 +1665,10 @@ def main() -> int:
                 )
             if plan_count <= 0:
                 raise RuntimeError(
-                    f"No plan snapshots found for window {timerange} under {src_plan_dir}"
+                    f"No plan snapshots found for window {timerange} under {src_plan_dir} "
+                    f"(backtest_timerange={backtest_timerange}, "
+                    f"warmup_candles={resolved_backtest_warmup_candles}, "
+                    f"warmup_days={resolved_backtest_warmup_days})"
                 )
             if plan_count < 2 and not bool(args.allow_single_plan):
                 raise RuntimeError(
@@ -1361,7 +1689,7 @@ def main() -> int:
                 f"python /freqtrade/user_data/scripts/grid_simulator_v1.py "
                 f"--pair {q(args.pair)} "
                 f"--timeframe {q(args.timeframe)} "
-                f"--data-dir {q(str(data_dir))} "
+                f"--data-dir {q(str(data_dir_container))} "
                 f"--plan {q(plan_window_latest_container)} "
                 f"--plans-dir {q(plan_window_dir_container)} "
                 f"--replay-plans "
@@ -1390,7 +1718,8 @@ def main() -> int:
             }
             sim_probe = lambda: _probe_path_sizes(sim_paths)
             run_compose_inner(
-                root_dir,
+                project_dir,
+                compose_file,
                 args.service,
                 sim_inner,
                 env_exports=env_exports,

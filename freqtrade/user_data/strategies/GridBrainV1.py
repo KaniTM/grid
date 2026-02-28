@@ -1104,9 +1104,18 @@ class GridBrainV1Core(IStrategy):
 
     # ========== Informative pairs ==========
     def informative_pairs(self):
-        if not self.dp:
-            return []
-        wl = self.dp.current_whitelist()
+        wl: List[str] = []
+        if getattr(self, "dp", None) is not None:
+            try:
+                wl = list(self.dp.current_whitelist() or [])
+            except Exception:
+                wl = []
+        if not wl:
+            try:
+                cfg_wl = ((self.config or {}).get("exchange") or {}).get("pair_whitelist") or []
+                wl = [str(p) for p in cfg_wl if str(p).strip()]
+            except Exception:
+                wl = []
         out = []
         for p in wl:
             out.append((p, "1h"))
@@ -6018,6 +6027,21 @@ class GridBrainV1Core(IStrategy):
             if frame_end_ts is not None:
                 self._history_emit_end_ts_by_pair[pair] = int(frame_end_ts)
             return dataframe
+
+        # Informative decorator output can include timeframe-suffixed aliases
+        # (e.g. `bb_mid_1h_1h`). Normalize them to canonical keys.
+        alias_columns = {
+            "bb_mid_1h": ("bb_mid_1h_1h",),
+            "bb_mid_4h": ("bb_mid_4h_4h",),
+            "adx_4h": ("adx_4h_4h",),
+        }
+        for canonical, candidates in alias_columns.items():
+            if canonical in dataframe.columns:
+                continue
+            for alt in candidates:
+                if alt in dataframe.columns:
+                    dataframe[canonical] = dataframe[alt]
+                    break
 
         if not self._validate_feature_contract(dataframe, pair):
             return dataframe

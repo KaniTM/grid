@@ -1,0 +1,20 @@
+services:
+  freqtrade:
+    image: grid-ml-system/freqtrade-dev:local
+    build:
+      context: ./freqtrade
+      dockerfile: ./docker/Dockerfile.custom
+    working_dir: /freqtrade
+    user: "${GRID_UID:-1000}:${GRID_GID:-1000}"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: "/workspace:/freqtrade"
+    volumes:
+      - ./freqtrade:/freqtrade
+      - ./:/workspace
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - sleep infinity

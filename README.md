@@ -1,22 +1,35 @@
 # Grid ML System
 
-## Development environment
+## Canonical environment (Docker)
 
-This repo relies on `pytest-xdist` (the `--dist` flag is part of the default pytest config), but the system Python is externally managed, so dependencies cannot be installed globally. To keep every machine working the same way, run:
+Use the repo-level Docker workflow as the single source of truth for tests/backtests/walkforward:
+
+```bash
+# build the env image
+./scripts/docker_env.sh build
+
+# open a shell in the container
+./scripts/docker_env.sh shell
+
+# run tests
+./scripts/docker_env.sh pytest -q freqtrade/user_data/tests
+
+# run regression workflow
+./scripts/docker_env.sh regression
+```
+
+This flow uses `docker-compose.grid.yml` and mounts both:
+- `/freqtrade` -> `./freqtrade`
+- `/workspace` -> repo root (`.`)
+
+So strategy modules in repo root (`core/`, `planner/`, `risk/`, `execution/`, etc.) are available together with Freqtrade runtime paths.
+
+## Local fallback (optional)
+
+If Docker is unavailable, use the local setup helper:
 
 ```bash
 ./scripts/setup_dev_env.sh
-```
-
-That script creates (or reuses) `.venv`, upgrades `pip`, installs the `freqtrade` requirements, and adds `pytest-xdist`. Once it completes, activate the environment and run tests via the bundled tools:
-
-```bash
 source .venv/bin/activate
-.venv/bin/pytest -q freqtrade/user_data/tests/test_phase3_validation.py
+.venv/bin/pytest -q freqtrade/user_data/tests
 ```
-
-You can use the same `.venv` for other commands; just activate it first.
-
-## Running tests
-
-After activating the venv above, continue to run pytest through `.venv/bin/pytest` so the `--dist` flag works without capture errors. This ensures `pytest-xdist` is always available even on new machines.

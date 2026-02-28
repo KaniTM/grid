@@ -2721,10 +2721,12 @@ Generated: 2026-02-28 11:54:37 UTC
 
 `Current Implementation`
 - Implemented behavior today: Automates rolling windows, aggregates metrics, writes summary/csv artifacts, and publishes latest refs for downstream tooling.
+- Runtime hardening added: container-path translation for config/strategy/data paths, warmup-aware backtesting timerange extension (`--backtest-warmup-candles`, auto mode from strategy lookbacks), and explicit diagnostics when plan emission is missing.
+- Reliability fix linked to strategy: informative-pair fallback + informative alias normalization to keep feature contract stable during backtesting runtime merges.
 - Coverage note: No matrix row.
 
 `Evidence Anchors`
-- Code: `freqtrade/scripts/run-user-walkforward.py:3`; `freqtrade/scripts/run-user-walkforward.py:546`; `freqtrade/scripts/run-user-walkforward.py:1691`
+- Code: `freqtrade/scripts/run-user-walkforward.py:159`; `freqtrade/scripts/run-user-walkforward.py:315`; `freqtrade/scripts/run-user-walkforward.py:1162`; `freqtrade/scripts/run-user-walkforward.py:1570`; `freqtrade/scripts/run-user-walkforward.py:1668`; `freqtrade/user_data/strategies/GridBrainV1.py:1106`; `freqtrade/user_data/strategies/GridBrainV1.py:6033`
 - Tests: `freqtrade/user_data/tests/test_tuning_protocol.py:164`
 
 `Canonical Codes`
@@ -3324,3 +3326,55 @@ Generated: 2026-02-28 11:54:37 UTC
 2. Execute `P0-2` lifecycle triage for all `83` registry-only codes using `ACTIVE` / `RETIRED` / `PARKED_FUTURE`.
 3. Run `P0-3` baseline code review and `P0-4` baseline frozen metrics snapshot (`C0`).
 4. After `C0` is frozen, implement `P0-5` (`M306`) and move to checkpoint `C1`.
+
+## 13) Milestone Log (2026-02-28)
+### ML-001 — Canonical Docker Runtime Wiring
+`Status`: DONE
+
+`What Was Locked`
+1. Repo-level compose runtime with shared mounts and deterministic `PYTHONPATH` wiring.
+2. Single entry wrapper for build/shell/pytest/backtest/regression/walkforward/sync/regime workflows.
+3. Orchestrator defaults moved to repo-level compose wiring (`--compose-file`, `--project-dir`, `--user-data` where needed).
+
+`Evidence Anchors`
+- `docker-compose.grid.yml:1`
+- `scripts/docker_env.sh:1`
+- `freqtrade/scripts/run-user-data-sync.py:29`
+- `freqtrade/scripts/run-user-regime-audit.py:23`
+- `freqtrade/scripts/run-user-regression.sh:50`
+- `docs/DOCKER_RUNTIME_WORKFLOW.md:1`
+- `README.md:3`
+
+### ML-002 — Walkforward Docker Reliability Hardening
+`Status`: DONE
+
+`What Was Locked`
+1. Host/container path resolution for walkforward backtesting and simulation inputs.
+2. Warmup-aware backtesting extension (`--backtest-warmup-candles`, auto mode from strategy lookbacks).
+3. Strategy-side informative fallback + alias normalization to avoid false feature-contract failures during backtesting merges.
+
+`Evidence Anchors`
+- `freqtrade/scripts/run-user-walkforward.py:159`
+- `freqtrade/scripts/run-user-walkforward.py:315`
+- `freqtrade/scripts/run-user-walkforward.py:1162`
+- `freqtrade/scripts/run-user-walkforward.py:1570`
+- `freqtrade/user_data/strategies/GridBrainV1.py:1106`
+- `freqtrade/user_data/strategies/GridBrainV1.py:6033`
+
+`Validation Snapshot`
+- Command: `./scripts/docker_env.sh walkforward --timerange 20260209-20260210 --window-days 1 --step-days 1 --min-window-days 1 --pair ETH/USDT --run-id smoke_wf_fix3 --fail-on-window-error`
+- Result: `RUN_COMPLETE return_code=0`; extraction produced plans and simulation completed.
+
+## 14) Next Step (Low-Cost) + Plan
+`Next Logical Step`
+- Execute `P0-1` as an inventory-first archaeology pass (no heavy runtime jobs): identify potentially valuable removed/replaced features from git history.
+
+`Execution Plan`
+1. Build a deleted/moved feature candidate list from git history for strategy/planner/core/execution/data/script paths.
+2. Build an enum/emitter change list focused on `core/enums.py` and runtime code emitters.
+3. Create the first `Removed Feature Relevance Ledger` draft with fields: `candidate`, `last_seen_commit`, `why_removed`, `current_replacement`, `classification`.
+4. Classify top-priority candidates as `RESTORE`, `KEEP_REMOVED`, or `INVESTIGATE`.
+5. Stop after inventory + first classification pass (no backtests, no walkforward reruns).
+
+`Acceptance`
+- Ledger draft exists with at least top 20 candidates and evidence (`commit`, `path`, `rationale`) for each.

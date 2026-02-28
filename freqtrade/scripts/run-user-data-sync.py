@@ -24,6 +24,11 @@ from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
 from long_run_monitor import LongRunMonitor, MonitorConfig
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FREQTRADE_ROOT = REPO_ROOT / "freqtrade"
+DEFAULT_COMPOSE_FILE = REPO_ROOT / "docker-compose.grid.yml"
+DEFAULT_USER_DATA = FREQTRADE_ROOT / "user_data"
+
 
 def q(text: str) -> str:
     return shlex.quote(text)
@@ -40,6 +45,26 @@ def day_now_utc() -> str:
 def add_days(day: str, delta: int) -> str:
     dt = datetime.strptime(day, "%Y%m%d")
     return (dt + timedelta(days=int(delta))).strftime("%Y%m%d")
+
+
+def _resolve_repo_path(value: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        return Path(text)
+    candidate = Path(text)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (REPO_ROOT / candidate).resolve()
+
+
+def _compose_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    try:
+        env.setdefault("GRID_UID", str(os.getuid()))
+        env.setdefault("GRID_GID", str(os.getgid()))
+    except Exception:
+        pass
+    return env
 
 
 def _proc_usage(pid: int) -> Dict[str, object]:
@@ -97,7 +122,8 @@ def _probe_file(path: Optional[Path]) -> Dict[str, object]:
 
 
 def run_compose_inner(
-    root_dir: Path,
+    project_dir: Path,
+    compose_file: Path,
     service: str,
     inner_cmd: str,
     heartbeat_sec: int = 60,
@@ -106,15 +132,27 @@ def run_compose_inner(
     stalled_heartbeats_max: int = 0,
     dry_run: bool = False,
 ) -> None:
-    cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_file),
+        "run",
+        "--rm",
+        "--entrypoint",
+        "bash",
+        service,
+        "-lc",
+        inner_cmd,
+    ]
     print(f"[data-sync] $ {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
     if dry_run:
         return
     hb = int(heartbeat_sec)
     if hb <= 0:
-        subprocess.run(cmd, cwd=str(root_dir), check=True)
+        subprocess.run(cmd, cwd=str(project_dir), env=_compose_env(), check=True)
         return
-    proc = subprocess.Popen(cmd, cwd=str(root_dir))
+    proc = subprocess.Popen(cmd, cwd=str(project_dir), env=_compose_env())
     started = time.time()
     label = str(progress_label).strip() or "compose"
     last_probe: Dict[str, object] = {}
@@ -164,9 +202,21 @@ def run_compose_inner(
             raise
 
 
-def run_compose_capture(root_dir: Path, service: str, inner_cmd: str) -> Tuple[int, str, str]:
-    cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
-    cp = subprocess.run(cmd, cwd=str(root_dir), capture_output=True, text=True)
+def run_compose_capture(project_dir: Path, compose_file: Path, service: str, inner_cmd: str) -> Tuple[int, str, str]:
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_file),
+        "run",
+        "--rm",
+        "--entrypoint",
+        "bash",
+        service,
+        "-lc",
+        inner_cmd,
+    ]
+    cp = subprocess.run(cmd, cwd=str(project_dir), env=_compose_env(), capture_output=True, text=True)
     return int(cp.returncode), str(cp.stdout), str(cp.stderr)
 
 
@@ -178,7 +228,7 @@ def container_to_host_path(container_path: str, user_data_dir: Path) -> Optional
     return (user_data_dir / rel).resolve()
 
 
-def get_coverage(root_dir: Path, service: str, container_file: str) -> Dict[str, object]:
+def get_coverage(project_dir: Path, compose_file: Path, service: str, container_file: str) -> Dict[str, object]:
     inner = (
         "python - <<'PY'\n"
         "import json\n"
@@ -200,7 +250,7 @@ def get_coverage(root_dir: Path, service: str, container_file: str) -> Dict[str,
         "print(json.dumps(out, sort_keys=True))\n"
         "PY"
     )
-    rc, stdout, stderr = run_compose_capture(root_dir, service, inner)
+    rc, stdout, stderr = run_compose_capture(project_dir, compose_file, service, inner)
     text = (stdout or "") + "\n" + (stderr or "")
     payload: Dict[str, object] = {"path": container_file, "exists": False}
     for line in reversed(text.splitlines()):
@@ -220,6 +270,7 @@ def get_coverage(root_dir: Path, service: str, container_file: str) -> Dict[str,
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--user-data", default=str(DEFAULT_USER_DATA), help="Local user_data directory path.")
     ap.add_argument("--pairs", nargs="+", default=["ETH/USDT"])
     ap.add_argument("--timeframes", nargs="+", default=["15m", "1h", "4h"])
     ap.add_argument("--mode", choices=["append", "prepend", "full"], default="append")
@@ -233,6 +284,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--data-dir", default="/freqtrade/user_data/data/binance")
     ap.add_argument("--data-format-ohlcv", default="feather", choices=["json", "jsongz", "feather", "parquet"])
     ap.add_argument("--service", default="freqtrade")
+    ap.add_argument(
+        "--compose-file",
+        default=str(DEFAULT_COMPOSE_FILE),
+        help="docker compose file path (defaults to repo-level docker-compose.grid.yml)",
+    )
+    ap.add_argument(
+        "--project-dir",
+        default=str(REPO_ROOT),
+        help="docker compose project directory (defaults to repo root).",
+    )
     ap.add_argument("--run-id", default=None, help="Run-state id under user_data/run_state/data_sync/")
     ap.add_argument("--trading-mode", default="spot", choices=["spot", "margin", "futures"])
     ap.add_argument("--no-parallel-download", action="store_true")
@@ -272,8 +333,13 @@ def main() -> int:
     if args.mode == "prepend" and not args.start_day:
         raise ValueError("--start-day is required for --mode prepend")
 
-    root_dir = Path(__file__).resolve().parents[1]
-    user_data_dir = root_dir / "user_data"
+    project_dir = _resolve_repo_path(args.project_dir)
+    compose_file = _resolve_repo_path(args.compose_file)
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"Compose project directory missing (--project-dir): {project_dir}")
+    if not compose_file.is_file():
+        raise FileNotFoundError(f"Compose file missing (--compose-file): {compose_file}")
+    user_data_dir = _resolve_repo_path(args.user_data)
     if not user_data_dir.is_dir():
         raise FileNotFoundError(f"user_data directory not found: {user_data_dir}")
 
@@ -347,7 +413,7 @@ def main() -> int:
         container_file = f"{args.data_dir.rstrip('/')}/{file_name}"
         host_file = container_to_host_path(container_file, user_data_dir)
 
-        before = get_coverage(root_dir, args.service, container_file)
+        before = get_coverage(project_dir, compose_file, args.service, container_file)
         before_min = str(before.get("min_day") or "")
         before_max = str(before.get("max_day") or "")
         before_rows = int(before.get("rows") or 0)
@@ -452,7 +518,8 @@ def main() -> int:
         try:
             attempted_work = True
             run_compose_inner(
-                root_dir,
+                project_dir,
+                compose_file,
                 args.service,
                 dl_cmd,
                 heartbeat_sec=int(args.heartbeat_sec),
@@ -461,7 +528,7 @@ def main() -> int:
                 stalled_heartbeats_max=int(args.stalled_heartbeats_max),
                 dry_run=args.dry_run,
             )
-            after = get_coverage(root_dir, args.service, container_file)
+            after = get_coverage(project_dir, compose_file, args.service, container_file)
             after_min = str(after.get("min_day") or "")
             after_max = str(after.get("max_day") or "")
             after_rows = int(after.get("rows") or 0)

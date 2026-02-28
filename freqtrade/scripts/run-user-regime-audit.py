@@ -18,6 +18,11 @@ from typing import Callable, Dict, Optional
 from latest_refs import publish_latest_ref, rel_payload_path
 from run_state import RunStateTracker
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FREQTRADE_ROOT = REPO_ROOT / "freqtrade"
+DEFAULT_COMPOSE_FILE = REPO_ROOT / "docker-compose.grid.yml"
+DEFAULT_USER_DATA = FREQTRADE_ROOT / "user_data"
+
 
 def q(text: str) -> str:
     return shlex.quote(text)
@@ -63,8 +68,29 @@ def _probe_outputs(paths: Dict[str, Path]) -> Dict[str, object]:
     return out
 
 
+def _resolve_repo_path(value: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        return Path(text)
+    candidate = Path(text)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (REPO_ROOT / candidate).resolve()
+
+
+def _compose_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    try:
+        env.setdefault("GRID_UID", str(os.getuid()))
+        env.setdefault("GRID_GID", str(os.getgid()))
+    except Exception:
+        pass
+    return env
+
+
 def run_compose_inner(
-    root_dir: Path,
+    project_dir: Path,
+    compose_file: Path,
     service: str,
     inner_cmd: str,
     heartbeat_sec: int = 60,
@@ -73,15 +99,27 @@ def run_compose_inner(
     stalled_heartbeats_max: int = 0,
     dry_run: bool = False,
 ) -> None:
-    cmd = ["docker", "compose", "run", "--rm", "--entrypoint", "bash", service, "-lc", inner_cmd]
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        str(compose_file),
+        "run",
+        "--rm",
+        "--entrypoint",
+        "bash",
+        service,
+        "-lc",
+        inner_cmd,
+    ]
     print(f"[regime-audit] $ {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
     if dry_run:
         return
     hb = int(heartbeat_sec)
     if hb <= 0:
-        subprocess.run(cmd, cwd=str(root_dir), check=True)
+        subprocess.run(cmd, cwd=str(project_dir), env=_compose_env(), check=True)
         return
-    proc = subprocess.Popen(cmd, cwd=str(root_dir))
+    proc = subprocess.Popen(cmd, cwd=str(project_dir), env=_compose_env())
     started = time.time()
     label = str(progress_label).strip() or "compose"
     last_probe: Dict[str, object] = {}
@@ -133,6 +171,7 @@ def run_compose_inner(
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--user-data", default=str(DEFAULT_USER_DATA), help="Local user_data directory path.")
     ap.add_argument("--pair", default="ETH/USDT")
     ap.add_argument("--timeframe", default="15m")
     ap.add_argument("--data-dir", default="/freqtrade/user_data/data/binance")
@@ -141,6 +180,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--out-dir", default=None, help="Local directory under user_data for outputs")
     ap.add_argument("--service", default="freqtrade")
+    ap.add_argument(
+        "--compose-file",
+        default=str(DEFAULT_COMPOSE_FILE),
+        help="docker compose file path (defaults to repo-level docker-compose.grid.yml)",
+    )
+    ap.add_argument(
+        "--project-dir",
+        default=str(REPO_ROOT),
+        help="docker compose project directory (defaults to repo root).",
+    )
     ap.add_argument("--emit-features-csv", action="store_true")
     ap.add_argument("--emit-verbose", action="store_true", help="Emit per-candle verbose and transition event artifacts")
     ap.add_argument(
@@ -167,8 +216,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    root_dir = Path(__file__).resolve().parents[1]
-    user_data_dir = root_dir / "user_data"
+    project_dir = _resolve_repo_path(args.project_dir)
+    compose_file = _resolve_repo_path(args.compose_file)
+    if not project_dir.is_dir():
+        raise FileNotFoundError(f"Compose project directory missing (--project-dir): {project_dir}")
+    if not compose_file.is_file():
+        raise FileNotFoundError(f"Compose file missing (--compose-file): {compose_file}")
+    user_data_dir = _resolve_repo_path(args.user_data)
     if not user_data_dir.is_dir():
         raise FileNotFoundError(f"user_data directory not found: {user_data_dir}")
 
@@ -176,7 +230,7 @@ def main() -> int:
     if args.out_dir:
         out_dir = Path(args.out_dir)
         if not out_dir.is_absolute():
-            out_dir = (root_dir / out_dir).resolve()
+            out_dir = (user_data_dir / out_dir).resolve()
     else:
         out_dir = (user_data_dir / "regime_audit" / run_id).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -257,7 +311,8 @@ def main() -> int:
         run_state.event("AUDIT_START", run_id=str(run_id))
     try:
         run_compose_inner(
-            root_dir,
+            project_dir,
+            compose_file,
             args.service,
             inner,
             heartbeat_sec=int(args.heartbeat_sec),
