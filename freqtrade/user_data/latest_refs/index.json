@@ -31,11 +31,11 @@
       "updated_utc": "2026-02-15T01:13:18.133605+00:00"
     },
     "walkforward": {
-      "out_dir": "walkforward/wf_ablate_neutral_di_filter_20200101_20260213",
+      "out_dir": "walkforward/c0_20260228T192027Z_wf",
       "ref_file": "walkforward.json",
-      "run_id": "wf_ablate_neutral_di_filter_20200101_20260213",
-      "updated_utc": "2026-02-19T21:29:09.575873+00:00"
+      "run_id": "c0_20260228T192027Z_wf",
+      "updated_utc": "2026-02-28T19:37:35.493666+00:00"
     }
   },
-  "updated_utc": "2026-02-19T21:29:09.575873+00:00"
+  "updated_utc": "2026-02-28T19:37:35.493666+00:00"
 }
