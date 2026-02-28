@@ -173,14 +173,14 @@
   "data_quality": {
     "details": {
       "last_timestamp": "2026-02-10T00:00:00+00:00",
-      "stale_secs": 1627557.501995
+      "stale_secs": 1637758.139914
     },
     "ok": false,
     "reasons": [
       "BLOCK_DATA_GAP"
     ]
   },
-  "decision_seq": 170,
+  "decision_seq": 425,
   "diagnostics": {
     "active_mode": "pause",
     "drawdown_guard": {
@@ -348,12 +348,6 @@
     }
   },
   "event_ids_emitted": [
-    "ETH_USDT-1770681600-4124",
-    "ETH_USDT-1770681600-4125",
-    "ETH_USDT-1770681600-4126",
-    "ETH_USDT-1770681600-4127",
-    "ETH_USDT-1770681600-4128",
-    "ETH_USDT-1770681600-4129",
     "ETH_USDT-1770681600-4130",
     "ETH_USDT-1770681600-4131",
     "ETH_USDT-1770681600-4132",
@@ -385,7 +379,13 @@
     "ETH_USDT-1770681600-4158",
     "ETH_USDT-1770681600-4159",
     "ETH_USDT-1770681600-4160",
-    "ETH_USDT-1770681600-4161"
+    "ETH_USDT-1770681600-4161",
+    "ETH_USDT-1770681600-4162",
+    "ETH_USDT-1770681600-4163",
+    "ETH_USDT-1770681600-4164",
+    "ETH_USDT-1770681600-4165",
+    "ETH_USDT-1770681600-4166",
+    "ETH_USDT-1770681600-4167"
   ],
   "event_signals": {
     "metadata": {},
@@ -494,7 +494,7 @@
     "tp_step_multiple": 0.75
   },
   "expires_at": null,
-  "generated_at": "2026-02-28T20:05:57.684637+00:00",
+  "generated_at": "2026-02-28T22:55:58.391149+00:00",
   "grid": {
     "cost_floor": {
       "chosen_floor_base_pct": 0.006500000000000001,
@@ -989,11 +989,11 @@
   },
   "plan_diff_truncated_fields": 10,
   "plan_guard": {
-    "base_plan_hash": "64ed305ce92ebf8c1bb4895f74bad43319e1580a87cb9ee626da65ab096d48d4",
+    "base_plan_hash": "a73006b36a320079730960bc9604e26cdb6d22e16b7a9cccca9159badf22fd02",
     "decision_count": 85
   },
-  "plan_hash": "64ed305ce92ebf8c1bb4895f74bad43319e1580a87cb9ee626da65ab096d48d4",
-  "plan_id": "ce2b4f3e-ae35-477f-8d63-27b7400a43d2",
+  "plan_hash": "a73006b36a320079730960bc9604e26cdb6d22e16b7a9cccca9159badf22fd02",
+  "plan_id": "8a6fcc2f-e5d1-431c-9acb-61229f6e1f6b",
   "planner_health_state": "quarantine",
   "planner_version": "gridbrain_v1",
   "price_ref": {
@@ -1684,7 +1684,7 @@
       "vrvp_lookback_bars": 96,
       "zigzag_contraction_lookback_bars": 12
     },
-    "timestamp": 1772309135
+    "timestamp": 1772319329
   },
   "runtime_hints": {
     "capacity_hint": {
@@ -1846,8 +1846,8 @@
     "planner_health_ok": false,
     "planner_health_state": "quarantine",
     "reclaim_active": true,
-    "reclaim_until_ts": 1770696000,
-    "reclaim_until_utc": "2026-02-10T04:00:00+00:00",
+    "reclaim_until_ts": 1770710400,
+    "reclaim_until_utc": "2026-02-10T08:00:00+00:00",
     "router_desired_mode": "pause",
     "router_desired_reason": "no_mode_eligible_pause",
     "router_switched": false,
@@ -3019,14 +3019,14 @@
     }
   },
   "start_stability_score": 0.775,
-  "supersedes_plan_id": "0f7b3271-909b-4a9c-bb1d-7ab9482ece6b",
+  "supersedes_plan_id": "33755c25-2676-4099-8d1a-6a2a9bd7b01a",
   "symbol": "ETH/USDT",
   "timeframes": {
     "exec": "15m",
     "regime": "4h",
     "signal": "1h"
   },
-  "ts": "2026-02-28T20:05:57.668598+00:00",
+  "ts": "2026-02-28T22:55:58.370426+00:00",
   "update_policy": {
     "bbwp": {
       "cooloff_release_m": 60.0,
@@ -3319,7 +3319,7 @@
       "min_runtime_hours_base": 3.0,
       "min_runtime_minutes": 225.0,
       "min_runtime_secs": 13500,
-      "reclaim_hours": 4.0
+      "reclaim_hours": 8.0
     },
     "session_sweep": {
       "break_buffer_mode": "step",

@@ -19,6 +19,10 @@ def test_box_signature_is_repeatable() -> None:
     assert ":" in sig
 
 
+def test_reclaim_baseline_default_is_8h() -> None:
+    assert float(GridBrainV1Core.reclaim_hours) == pytest.approx(8.0)
+
+
 def test_poc_cross_detected_when_open_close_bracket_value() -> None:
     df = pd.DataFrame(
         {
@@ -858,7 +862,7 @@ def test_empirical_cost_sample_uses_execution_cost_artifact(tmp_path: Path) -> N
     artifact_path = artifact_dir / "execution_cost_calibration.latest.json"
     artifact_payload = {
         "schema_version": "1.0.0",
-        "generated_at": "2026-02-26T00:00:00+00:00",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "pair": pair,
         "window": 256,
         "sample_count": 64,

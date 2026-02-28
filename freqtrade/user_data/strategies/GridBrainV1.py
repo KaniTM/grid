@@ -787,7 +787,7 @@ class GridBrainV1Core(IStrategy):
     range_shift_stop_pct = 0.007   # 0.7% mid shift vs previous plan
     tp_step_multiple = 0.75
     sl_step_multiple = 1.0
-    reclaim_hours = 4.0
+    reclaim_hours = 8.0
     cooldown_minutes = 90
     min_runtime_hours = 3.0
     neutral_stop_adx_bars = 3

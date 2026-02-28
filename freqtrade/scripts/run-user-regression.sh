@@ -29,6 +29,7 @@ STRATEGY_PATH="${STRATEGY_PATH:-/freqtrade/user_data/strategies}"
 DATA_DIR="${DATA_DIR:-/freqtrade/user_data/data/binance}"
 PLAN_PATH="${PLAN_PATH:-/freqtrade/user_data/grid_plans/${EXCHANGE}/${PAIR_FS}/grid_plan.latest.json}"
 CHECK_USER_WORK_FLAGS="${CHECK_USER_WORK_FLAGS:---no-lint}"
+RECENT_PLAN_SECONDS="${REGRESSION_RECENT_PLAN_SECONDS:-3600}"
 
 echo "[regression] 1/3 compile gate"
 "${compose_cmd[@]}" run --rm --entrypoint bash "${COMPOSE_SERVICE}" -lc \
@@ -40,7 +41,7 @@ echo "[regression] 2/3 run brain via backtesting (plan generation path)"
 
 echo "[regression] 3/3 run behavior assertions (brain+executor+simulator)"
 "${compose_cmd[@]}" run --rm --entrypoint bash "${COMPOSE_SERVICE}" -lc \
-  "python /freqtrade/user_data/scripts/user_regression_suite.py --plan '${PLAN_PATH}'"
+  "python /freqtrade/user_data/scripts/user_regression_suite.py --plan '${PLAN_PATH}' --recent-plan-seconds '${RECENT_PLAN_SECONDS}'"
 
 if [[ "${RUN_WALKFORWARD:-0}" == "1" ]]; then
   echo "[regression] 4/4 walk-forward smoke"

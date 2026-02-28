@@ -1,0 +1,3 @@
+{"event_type": "seeded", "level_index": 0, "mode": "paper", "order_id": null, "pair": "ETH/USDT", "phase": "seed", "price": 2009.3759296475043, "qty_base": 0.03989043583180384, "reason": null, "side": "buy", "timestamp": "2026-02-28T23:11:44.091849+00:00"}
+{"event_type": "seeded", "level_index": 1, "mode": "paper", "order_id": null, "pair": "ETH/USDT", "phase": "seed", "price": 2025.6527699038631, "qty_base": 0.039569901996273076, "reason": null, "side": "buy", "timestamp": "2026-02-28T23:11:44.092811+00:00"}
+{"event_type": "seeded", "level_index": 2, "mode": "paper", "order_id": null, "pair": "ETH/USDT", "phase": "seed", "price": 2041.9296101602222, "qty_base": 0.26396156530158593, "reason": null, "side": "buy", "timestamp": "2026-02-28T23:11:44.092897+00:00"}

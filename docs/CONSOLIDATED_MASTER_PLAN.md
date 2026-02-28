@@ -1401,33 +1401,32 @@ Generated: 2026-02-28 11:54:37 UTC
 - No functional gap is required to keep baseline behavior. Treat this as maintenance + extension guidance.
 
 #### M402 - Reclaim Timer + REBUILD Discipline (8h baseline)
-`Status`: PARTIAL
+`Status`: DONE
 `Source`: BOTH
 `Coverage`: old=Y | new=Y | code=Y
 
 `Purpose`
-- Reclaim Timer + REBUILD Discipline (8h baseline) exists to enforce this contract: Reclaim/cooldown discipline exists, but default reclaim baseline is 4h (not the documented 8h baseline).
+- Reclaim Timer + REBUILD Discipline (8h baseline) exists to enforce this contract: Reclaim/cooldown discipline is wired with 8h baseline default and explicit regression coverage.
 
 `Current Implementation`
-- Implemented behavior today: Reclaim/cooldown discipline exists, but default reclaim baseline is 4h (not the documented 8h baseline).
-- Coverage note: Align reclaim baseline default/documentation (8h vs current 4h) and add explicit acceptance test.
+- Implemented behavior today: reclaim baseline default is aligned to 8h (`reclaim_hours = 8.0`) and covered by explicit test assertion.
+- Coverage note: docs + code + tests now aligned on 8h baseline.
 
 `Evidence Anchors`
-- Code: `freqtrade/user_data/strategies/GridBrainV1.py:7927`; `freqtrade/user_data/strategies/GridBrainV1.py:8095`
-- Tests: `freqtrade/user_data/tests/test_replay_golden_consistency.py:126`
+- Code: `freqtrade/user_data/strategies/GridBrainV1.py:790`; `freqtrade/user_data/strategies/GridBrainV1.py:7933`
+- Tests: `freqtrade/user_data/tests/test_phase3_validation.py:22`
 
 `Canonical Codes`
 - BLOCK_RECLAIM_PENDING
 
 `Implementation Playbook`
-1. Implement missing scope first: Align reclaim baseline default/documentation (8h vs current 4h) and add explicit acceptance test.
-2. Add/adjust runtime logic in `freqtrade/user_data/strategies/GridBrainV1.py` and dependent modules listed in evidence anchors.
-3. Emit/align canonical codes (`BLOCK_RECLAIM_PENDING`) so behavior is externally observable.
-4. Add deterministic tests for missing paths and extend suites at: `freqtrade/user_data/tests/test_replay_golden_consistency.py:126`
-5. Promote PARTIAL to DONE only when both behavior and tests are complete.
+1. Keep 8h reclaim baseline as canonical default unless explicitly superseded by a documented policy decision.
+2. If reclaim logic changes, preserve/adjust canonical code behavior (`BLOCK_RECLAIM_PENDING`) and payload compatibility.
+3. Keep explicit acceptance test coverage for reclaim baseline default.
+4. Promote future status changes only after synchronized doc+code+test updates.
 
 `Gap / Action`
-- Align reclaim baseline default/documentation (8h vs current 4h) and add explicit acceptance test.
+- No functional gap is open for this module.
 
 #### M406 - Structured Event Bus / Taxonomy
 `Status`: PARTIAL
@@ -3291,10 +3290,10 @@ Generated: 2026-02-28 11:54:37 UTC
 - Acceptance: regression + backtest + walkforward snapshot stored as comparison baseline. `Completed`: 2026-02-28.
 5. `P0-5` Implement `M306` Directional skip-one rule. `Status`: DONE.
 - Acceptance: simulator/executor parity + deterministic tests. `Completed`: 2026-02-28.
-6. `P0-6` Checkpoint `C1` after `M306`. `Status`: PARTIAL (`docs/C1_CHECKPOINT_DELTA.md`).
-- Acceptance: rerun regression + backtest + walkforward; produce delta report vs `C0`; run focused review. `Current`: NOT_GREEN (regression gate still failing on missing recent plan snapshots).
-7. `P0-7` Align `M402` reclaim baseline policy (4h vs 8h) across docs/config/tests.
-- Acceptance: one canonical baseline value and synchronized assertions.
+6. `P0-6` Checkpoint `C1` after `M306`. `Status`: DONE (`docs/C1_CHECKPOINT_DELTA.md`).
+- Acceptance: rerun regression + backtest + walkforward; produce delta report vs `C0`; run focused review. `Completed`: 2026-03-01 (`C1` GREEN).
+7. `P0-7` Align `M402` reclaim baseline policy (4h vs 8h) across docs/config/tests. `Status`: DONE.
+- Acceptance: one canonical baseline value and synchronized assertions. `Completed`: 2026-03-01.
 8. `P0-8` Checkpoint `C2` after `M402`.
 - Acceptance: rerun regression + backtest + walkforward; produce delta report vs `C0`; run focused review.
 9. `P0-9` Implement `M903` + `M904`.
@@ -3325,7 +3324,8 @@ Generated: 2026-02-28 11:54:37 UTC
 1. `P0-3` high-severity fixes (`F-001`, `F-002`) implemented with tests. `Status`: DONE (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
 2. Close `INVESTIGATE` setup from `P0-1` (`RF-002`, `RF-003`, `RF-004`, `RF-023`, `RF-024`) by defining checkpoint experiments.
 3. Resolve known `C0` red gates (regression compile gate + regression recency assertion) before `C1`. `Status`: DONE (`docs/C0_RED_GATES_CLOSURE.md`).
-4. Close regression plan-history coverage gate, then rerun checkpoint `C1` to GREEN.
+4. Close regression plan-history coverage gate, then rerun checkpoint `C1` to GREEN. `Status`: DONE (`docs/C1_CHECKPOINT_DELTA.md`).
+5. Execute `P0-8` checkpoint `C2` after `M402` and freeze `C2 vs C0` manifest.
 
 ## 13) Milestone Log (2026-02-28)
 ### ML-001 — Canonical Docker Runtime Wiring
@@ -3456,18 +3456,19 @@ Generated: 2026-02-28 11:54:37 UTC
 - `freqtrade/user_data/tests/test_executor_hardening.py:392`
 
 ### ML-009 — `C1` Checkpoint Execution (`P0-6`)
-`Status`: PARTIAL (NOT_GREEN)
+`Status`: DONE (GREEN)
 
 `What Was Locked`
 1. Executed full `C1` checkpoint scope against `C0`-matched timerange/pair.
 2. Froze machine-readable snapshot and delta manifest.
-3. Confirmed behavior metrics parity vs `C0`; regression gate remains red.
+3. Confirmed behavior metrics parity vs `C0`; regression/backtest/walkforward/direct-regression gates are green.
 
 `Evidence Anchors`
 - `docs/C1_CHECKPOINT_DELTA.md:1`
-- `freqtrade/user_data/baselines/c1_20260228T221054Z/metrics/c1_snapshot.json:1`
-- `freqtrade/user_data/baselines/c1_20260228T221054Z/logs/regression.log:1`
-- `freqtrade/user_data/baselines/c1_20260228T221054Z/logs/walkforward.log:1`
+- `docs/C2_CHECKPOINT_DELTA.md:1`
+- `freqtrade/user_data/baselines/c1_20260228T225504Z/metrics/c1_snapshot.json:1`
+- `freqtrade/user_data/baselines/c1_20260228T225504Z/logs/regression.log:1`
+- `freqtrade/user_data/baselines/c1_20260228T225504Z/logs/walkforward.log:1`
 
 ## 14) Next Step (Low-Cost) + Plan
 `Next Logical Step`
@@ -3478,15 +3479,21 @@ Generated: 2026-02-28 11:54:37 UTC
 - High-severity fix batch (`F-001`, `F-002`) is complete.
 - `C0` red gates are closed (`docs/C0_RED_GATES_CLOSURE.md`).
 - `P0-5` (`M306`) is complete with simulator/executor parity tests.
-- `P0-6` (`C1`) executed; outcome is NOT_GREEN (`docs/C1_CHECKPOINT_DELTA.md`).
-- Next step: close regression plan-history coverage gate and rerun `C1` to GREEN.
+- `P0-6` (`C1`) is complete and GREEN (`docs/C1_CHECKPOINT_DELTA.md`).
+- `P0-7` (`M402`) is complete (8h reclaim baseline aligned in docs/code/tests).
+- Next step: execute `P0-8` checkpoint `C2` after `M402`.
 
 `Execution Plan`
-1. Resolve `user_regression_suite.py` recent-plan-history prerequisite (no recent plan snapshot assertion).
-2. Rerun checkpoint `C1` full scope (`regression`, `backtest`, `walkforward`, direct behavior regression).
-3. Refresh `C1 vs C0` delta manifest and verify all required gates are green.
-4. Proceed to `P0-7` (`M402`) only after `C1` is GREEN.
+1. Execute checkpoint `C2` full scope (`regression`, `backtest`, `walkforward`, direct behavior regression) on current `M402` baseline.
+2. Freeze `C2` machine-readable snapshot and `C2 vs C0` delta manifest.
+3. Run focused review for reclaim-timer policy surface (`M402`) and confirm no regressions.
+4. Proceed to `P0-9` (`M903` + `M904`) only after `C2` is GREEN.
+
+`C2 Run (One Command)`
+1. `./scripts/run_c2_checkpoint.sh`
+2. Optional overrides: `CHECKPOINT_TAG=...`, `PAIR=...`, `TIMEFRAME=...`, `TIMERANGE=...`, `RECENT_PLAN_SECONDS=...`.
+3. Fill `docs/C2_CHECKPOINT_DELTA.md` using `freqtrade/user_data/baselines/<C2_TAG>/metrics/c2_snapshot.json`.
 
 `Acceptance`
-- `M306` behavior is implemented with simulator/executor parity evidence and passing tests.
-- `C1` checkpoint artifacts include delta comparison against fixed `C0` baseline and green regression gates.
+- `C1` checkpoint artifacts are green and frozen with delta comparison against `C0`.
+- `C2` checkpoint scope and acceptance criteria are explicit and execution-ready.

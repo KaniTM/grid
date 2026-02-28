@@ -1,0 +1,126 @@
+{
+  "c1_tag": "c1_20260228T225504Z",
+  "generated_utc": "2026-02-28T23:13:10.336997+00:00",
+  "based_on_c0_tag": "c0_20260228T192027Z",
+  "scope": {
+    "pair": "ETH/USDT",
+    "timeframe": "15m",
+    "timerange": "20260209-20260210",
+    "docker_wrapper": "./scripts/docker_env.sh"
+  },
+  "runs": {
+    "regression_wrapper": {
+      "status": "ok",
+      "reason": null,
+      "ruff_errors": null,
+      "command": "./scripts/docker_env.sh regression",
+      "log_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/logs/regression.log"
+    },
+    "backtest": {
+      "status": "ok",
+      "command": "./scripts/docker_env.sh backtest --config /freqtrade/user_data/config.json --strategy GridBrainV1 --strategy-path /freqtrade/user_data/strategies --timerange 20260209-20260210 --timeframe 15m --datadir /freqtrade/user_data/data/binance --export trades --export-filename /freqtrade/user_data/baselines/<C1_TAG>/metrics/backtest.json",
+      "log_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/logs/backtest.log",
+      "zip_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/metrics/backtest.zip",
+      "meta_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/metrics/backtest.meta.json",
+      "metrics": {
+        "total_trades": 0,
+        "profit_total": 0.0,
+        "profit_total_abs": 0.0,
+        "profit_factor": 0.0,
+        "max_drawdown": 0.0,
+        "wins": 0,
+        "draws": 0,
+        "losses": 0,
+        "winrate": 0.0
+      }
+    },
+    "walkforward": {
+      "status": "ok",
+      "reason": null,
+      "run_id": "c1_20260228T225504Z_wf",
+      "command": "./scripts/docker_env.sh walkforward --timerange 20260209-20260210 --window-days 1 --step-days 1 --min-window-days 1 --pair ETH/USDT --run-id <C1_TAG>_wf --fail-on-window-error",
+      "log_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/logs/walkforward.log",
+      "summary_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/metrics/walkforward.summary.json",
+      "windows_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/metrics/walkforward.windows.csv",
+      "aggregate": {
+        "windows_total": 1,
+        "windows_ok": 1,
+        "windows_failed": 0,
+        "sum_pnl_quote": 0.0,
+        "avg_pnl_pct": 0.0,
+        "profit_factor": null,
+        "win_rate": 0.0,
+        "top_start_blocker": "BLOCK_ADX_HIGH:96",
+        "top_stop_reason": "os_dev_trend_stop:56"
+      },
+      "window_001": {
+        "fills": 0,
+        "stop_events": 49,
+        "action_start": 0,
+        "action_hold": 47,
+        "action_stop": 49,
+        "pnl_pct": 0.0,
+        "pnl_quote": 0.0,
+        "seed_events": 0,
+        "rebuild_events": 0,
+        "soft_adjust_events": 0
+      }
+    },
+    "regression_behavior_direct": {
+      "status": "ok",
+      "reason": null,
+      "command": "./scripts/docker_env.sh cmd \"python /freqtrade/user_data/scripts/user_regression_suite.py --plan '/freqtrade/user_data/grid_plans/binance/ETH_USDT/grid_plan.latest.json' --state-out '/freqtrade/user_data/baselines/<C1_TAG>/metrics/grid_executor_v1.regression.state.json' --recent-plan-seconds 3600\"",
+      "log_path": "freqtrade/user_data/baselines/c1_20260228T225504Z/logs/regression_behavior_direct.log"
+    }
+  },
+  "delta_vs_c0": {
+    "status": {
+      "regression_wrapper": {
+        "c0": "fail",
+        "c1": "ok"
+      },
+      "backtest": {
+        "c0": "ok",
+        "c1": "ok"
+      },
+      "walkforward": {
+        "c0": "ok",
+        "c1": "ok"
+      },
+      "regression_behavior_direct": {
+        "c0": "fail",
+        "c1": "ok"
+      }
+    },
+    "backtest": {
+      "total_trades_delta": 0.0,
+      "profit_total_delta": 0.0,
+      "profit_total_abs_delta": 0.0,
+      "profit_factor_delta": 0.0,
+      "max_drawdown_delta": null
+    },
+    "walkforward_aggregate": {
+      "windows_total_delta": 0.0,
+      "windows_ok_delta": 0.0,
+      "windows_failed_delta": 0.0,
+      "sum_pnl_quote_delta": 0.0,
+      "avg_pnl_pct_delta": 0.0,
+      "win_rate_delta": 0.0,
+      "top_start_blocker_changed": false,
+      "top_stop_reason_changed": false,
+      "top_start_blocker_c0": "BLOCK_ADX_HIGH:96",
+      "top_start_blocker_c1": "BLOCK_ADX_HIGH:96",
+      "top_stop_reason_c0": "os_dev_trend_stop:56",
+      "top_stop_reason_c1": "os_dev_trend_stop:56"
+    },
+    "walkforward_window_001": {
+      "fills_delta": 0.0,
+      "stop_events_delta": 0.0,
+      "action_start_delta": 0.0,
+      "action_hold_delta": 0.0,
+      "action_stop_delta": 0.0,
+      "pnl_pct_delta": 0.0,
+      "pnl_quote_delta": 0.0
+    }
+  }
+}

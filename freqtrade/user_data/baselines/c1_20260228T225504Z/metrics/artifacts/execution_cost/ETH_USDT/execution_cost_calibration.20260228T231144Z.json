@@ -1,0 +1,24 @@
+{
+  "adverse_selection_pct": 0.0,
+  "cost_model_source": "static",
+  "generated_at": "2026-02-28T23:11:44.165104+00:00",
+  "missed_fill_opportunity_rate": 0.0,
+  "notes": {
+    "capacity_replenish_skipped_total": 0,
+    "capacity_rung_cap_applied_total": 0,
+    "fills_step": 0,
+    "missed_fill_opportunities_step": 0,
+    "orders_canceled_step": 0,
+    "orders_placed_step": 0,
+    "orders_rejected_step": 0,
+    "orders_repriced_step": 0
+  },
+  "pair": "ETH/USDT",
+  "percentile": 90.0,
+  "post_only_retry_reject_rate": 0.0,
+  "realized_spread_pct": 0.0005,
+  "recommended_cost_floor_bps": 5.0,
+  "sample_count": 5,
+  "schema_version": "1.0.0",
+  "window": 256
+}

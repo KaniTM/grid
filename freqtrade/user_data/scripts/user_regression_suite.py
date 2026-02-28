@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -217,6 +218,27 @@ def check_plan_schema_and_feature_outputs(plan: dict) -> None:
     print("[regression] check: plan schema + feature outputs OK")
 
 
+def resolve_recent_plan_seconds(cli_value: int | None) -> int:
+    if cli_value is not None:
+        value = int(cli_value)
+        if value <= 0:
+            raise ValueError("--recent-plan-seconds must be > 0")
+        return value
+
+    raw = str(os.getenv("REGRESSION_RECENT_PLAN_SECONDS", "")).strip()
+    if not raw:
+        return 600
+
+    try:
+        env_value = int(raw)
+    except Exception as exc:
+        raise ValueError("REGRESSION_RECENT_PLAN_SECONDS must be an integer > 0") from exc
+
+    if env_value <= 0:
+        raise ValueError("REGRESSION_RECENT_PLAN_SECONDS must be > 0")
+    return env_value
+
+
 def check_recent_plan_history(plan_path: Path, recent_seconds: int = 600) -> None:
     print("[regression] check: per-candle plan history coverage")
     plan_dir = plan_path.parent
@@ -233,7 +255,10 @@ def check_recent_plan_history(plan_path: Path, recent_seconds: int = 600) -> Non
         except Exception:
             continue
 
-    _require(len(recent_files) > 0, "no recent plan snapshots found in plan directory")
+    _require(
+        len(recent_files) > 0,
+        f"no recent plan snapshots found in plan directory (window={int(recent_seconds)}s)",
+    )
 
     unique_candle_ts = set()
     for p in recent_files:
@@ -770,6 +795,12 @@ def main() -> None:
     ap.add_argument("--state-out", default="/tmp/grid_executor_v1.regression.state.json")
     ap.add_argument("--quote-budget", type=float, default=1000.0)
     ap.add_argument("--maker-fee-pct", type=float, default=0.10)
+    ap.add_argument(
+        "--recent-plan-seconds",
+        type=int,
+        default=None,
+        help="Recency window for plan-history snapshots (defaults: env REGRESSION_RECENT_PLAN_SECONDS or 600).",
+    )
     args = ap.parse_args()
 
     plan_path = Path(args.plan)
@@ -779,7 +810,8 @@ def main() -> None:
     with plan_path.open("r", encoding="utf-8") as f:
         plan = json.load(f)
 
-    check_recent_plan_history(plan_path)
+    recent_plan_seconds = resolve_recent_plan_seconds(args.recent_plan_seconds)
+    check_recent_plan_history(plan_path, recent_seconds=recent_plan_seconds)
     check_plan_schema_and_feature_outputs(plan)
     check_ml_overlay_behavior()
     check_adx_hysteresis_behavior()
