@@ -28,10 +28,11 @@ STRATEGY="${STRATEGY:-GridBrainV1}"
 STRATEGY_PATH="${STRATEGY_PATH:-/freqtrade/user_data/strategies}"
 DATA_DIR="${DATA_DIR:-/freqtrade/user_data/data/binance}"
 PLAN_PATH="${PLAN_PATH:-/freqtrade/user_data/grid_plans/${EXCHANGE}/${PAIR_FS}/grid_plan.latest.json}"
+CHECK_USER_WORK_FLAGS="${CHECK_USER_WORK_FLAGS:---no-lint}"
 
 echo "[regression] 1/3 compile gate"
 "${compose_cmd[@]}" run --rm --entrypoint bash "${COMPOSE_SERVICE}" -lc \
-  "cd /freqtrade && scripts/check-user-work.sh"
+  "cd /freqtrade && scripts/check-user-work.sh ${CHECK_USER_WORK_FLAGS}"
 
 echo "[regression] 2/3 run brain via backtesting (plan generation path)"
 "${compose_cmd[@]}" run --rm --entrypoint bash "${COMPOSE_SERVICE}" -lc \

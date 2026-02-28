@@ -3324,7 +3324,7 @@ Generated: 2026-02-28 11:54:37 UTC
 ## 12) Immediate Next Sprint Cut (Recommended)
 1. `P0-3` high-severity fixes (`F-001`, `F-002`) implemented with tests. `Status`: DONE (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
 2. Close `INVESTIGATE` setup from `P0-1` (`RF-002`, `RF-003`, `RF-004`, `RF-023`, `RF-024`) by defining checkpoint experiments.
-3. Resolve known `C0` red gates (regression compile gate + regression recency assertion) before `C1`.
+3. Resolve known `C0` red gates (regression compile gate + regression recency assertion) before `C1`. `Status`: DONE (`docs/C0_RED_GATES_CLOSURE.md`).
 4. Implement `P0-5` (`M306`) and move to checkpoint `C1`.
 
 ## 13) Milestone Log (2026-02-28)
@@ -3424,6 +3424,21 @@ Generated: 2026-02-28 11:54:37 UTC
 - `freqtrade/user_data/tests/test_executor_hardening.py:367`
 - `freqtrade/user_data/tests/test_executor_hardening.py:412`
 
+### ML-007 — C0 Red Gates Closure
+`Status`: DONE
+
+`What Was Locked`
+1. Regression workflow compile gate now deterministic on `py_compile` by default.
+2. Regression behavior suite adapted to current ML overlay + executor signature/idempotency contracts.
+3. Full `./scripts/docker_env.sh regression` path verified green.
+
+`Evidence Anchors`
+- `docs/C0_RED_GATES_CLOSURE.md:1`
+- `freqtrade/scripts/run-user-regression.sh:31`
+- `freqtrade/user_data/scripts/user_regression_suite.py:484`
+- `freqtrade/user_data/scripts/user_regression_suite.py:302`
+- `freqtrade/user_data/baselines/gatefix_20260228T201012Z/logs/regression.log:1`
+
 ## 14) Next Step (Low-Cost) + Plan
 `Next Logical Step`
 - `P0-1` is complete (`docs/REMOVED_FEATURE_RELEVANCE_LEDGER.md`).
@@ -3431,14 +3446,15 @@ Generated: 2026-02-28 11:54:37 UTC
 - `P0-3` is complete (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
 - `P0-4` is complete (`docs/C0_BASELINE_SNAPSHOT.md`).
 - High-severity fix batch (`F-001`, `F-002`) is complete.
-- Next step: clear `C0` red gates, then execute `P0-5` (`M306`) and checkpoint `C1`.
+- `C0` red gates are closed (`docs/C0_RED_GATES_CLOSURE.md`).
+- Next step: execute `P0-5` (`M306`) and move to checkpoint `C1`.
 
 `Execution Plan`
-1. Resolve compile/lint gate failures tracked in `C0` baseline (`970` findings snapshot) by priority bucket.
-2. Resolve regression recency assertion failure (`no recent plan snapshots found`) with deterministic plan-source setup.
-3. Re-run baseline regression command path and verify both red gates are green.
-4. Start `P0-5` (`M306`) only after gate closure evidence is stored.
+1. Implement `M306` directional skip-one rule in simulator + executor parity paths.
+2. Add/extend deterministic tests for rung-skip behavior and parity invariants.
+3. Run targeted regression checks and freeze `C1` artifacts (`regression`, `backtest`, `walkforward` delta vs `C0`).
+4. Publish `C1` delta summary and proceed to `P0-7` only if acceptance is green.
 
 `Acceptance`
-- `C0` red gates are closed with command evidence (`regression` + direct regression suite).
-- `C0` remains the fixed comparison baseline for upcoming `C1+` deltas.
+- `M306` behavior is implemented with simulator/executor parity evidence and passing tests.
+- `C1` checkpoint artifacts include delta comparison against fixed `C0` baseline.

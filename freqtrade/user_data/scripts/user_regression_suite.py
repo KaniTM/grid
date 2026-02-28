@@ -14,9 +14,11 @@ import json
 from pathlib import Path
 import sys
 import time
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+from core.plan_signature import compute_plan_hash
 
 # Import sibling scripts directly from user_data/scripts.
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -293,16 +295,58 @@ def check_executor_action_semantics(plan: dict, state_out: str, quote_budget: fl
     start_plan = _force_ref_inside_box(plan)
     hold_plan = _force_ref_inside_box(plan)
     stop_plan = _force_ref_inside_box(plan)
+    seq_base = int(_plan_get(plan, "decision_seq", default=1) or 1)
+    valid_base = int(_plan_get(plan, "valid_for_candle_ts", default=1) or 1)
+
     start_plan["action"] = "START"
+    start_plan["plan_id"] = str(uuid4())
+    start_plan["decision_seq"] = int(seq_base + 1)
+    start_plan["valid_for_candle_ts"] = int(valid_base + 1)
+    start_plan["supersedes_plan_id"] = None
+    start_plan["plan_hash"] = compute_plan_hash(start_plan)
+
     hold_plan["action"] = "HOLD"
+    hold_plan["plan_id"] = str(uuid4())
+    hold_plan["decision_seq"] = int(seq_base + 3)
+    hold_plan["valid_for_candle_ts"] = int(valid_base + 3)
+
     stop_plan["action"] = "STOP"
+    stop_plan["plan_id"] = str(uuid4())
+    stop_plan["decision_seq"] = int(seq_base + 4)
+    stop_plan["valid_for_candle_ts"] = int(valid_base + 4)
+
+    start_plan_dup = copy.deepcopy(start_plan)
+    start_plan_dup["replan_reasons"] = list(start_plan_dup.get("replan_reasons") or []) + [
+        "REPLAN_TEST_DUP_START"
+    ]
+    start_plan_dup["plan_id"] = str(uuid4())
+    start_plan_dup["decision_seq"] = int(seq_base + 2)
+    start_plan_dup["valid_for_candle_ts"] = int(valid_base + 2)
+
+    stop_plan_dup = copy.deepcopy(stop_plan)
+    stop_plan_dup["replan_reasons"] = list(stop_plan_dup.get("replan_reasons") or []) + [
+        "REPLAN_TEST_DUP_STOP"
+    ]
+    stop_plan_dup["plan_id"] = str(uuid4())
+    stop_plan_dup["decision_seq"] = int(seq_base + 5)
+    stop_plan_dup["valid_for_candle_ts"] = int(valid_base + 5)
+
+    start_plan_dup["supersedes_plan_id"] = start_plan["plan_id"]
+    hold_plan["supersedes_plan_id"] = start_plan_dup["plan_id"]
+    stop_plan["supersedes_plan_id"] = hold_plan["plan_id"]
+    stop_plan_dup["supersedes_plan_id"] = stop_plan["plan_id"]
+
+    hold_plan["plan_hash"] = compute_plan_hash(hold_plan)
+    stop_plan["plan_hash"] = compute_plan_hash(stop_plan)
+    start_plan_dup["plan_hash"] = compute_plan_hash(start_plan_dup)
+    stop_plan_dup["plan_hash"] = compute_plan_hash(stop_plan_dup)
 
     ex = _base_paper_executor(state_out, quote_budget, maker_fee_pct)
     ex.step(start_plan)
     start_orders = [o for o in ex._orders if o.status in ("open", "partial")]
     _require(len(start_orders) > 0, "START must seed orders")
 
-    ex.step(start_plan)
+    ex.step(start_plan_dup)
     dup_start_orders = [o for o in ex._orders if o.status in ("open", "partial")]
     _require(
         len(dup_start_orders) == len(start_orders),
@@ -323,7 +367,7 @@ def check_executor_action_semantics(plan: dict, state_out: str, quote_budget: fl
     _require(len(ex._orders) == 0, "STOP must clear all orders")
     _require(ex._last_effective_action == "STOP", "first STOP should execute STOP semantics")
 
-    ex.step(stop_plan)
+    ex.step(stop_plan_dup)
     _require(ex._last_raw_action == "STOP", "duplicate STOP should preserve raw action context")
     _require(ex._last_effective_action == "HOLD", "duplicate STOP on cleared ladder should suppress to HOLD")
     _require(
@@ -491,6 +535,7 @@ def check_ml_overlay_behavior() -> None:
             "freqai": {"enabled": False},
         }
     )
+    brain.freqai_overlay_enabled = True
 
     row_prob = pd.Series({"do_predict": 1, "p_range": 0.8, "p_breakout": 0.2, "ml_confidence": 0.9})
     st_prob = brain._freqai_overlay_state(
