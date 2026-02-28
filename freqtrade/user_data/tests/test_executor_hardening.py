@@ -448,3 +448,7 @@ def test_polling_loop_aborts_after_max_consecutive_errors(tmp_path: Path, monkey
 
     payload = json.loads(state_out.read_text(encoding="utf-8"))
     assert payload["consecutive_errors"] == 2
+
+
+def test_default_state_out_path_is_relative() -> None:
+    assert Path(grid_executor_v1.DEFAULT_STATE_OUT).is_absolute() is False

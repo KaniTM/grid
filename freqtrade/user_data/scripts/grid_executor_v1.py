@@ -22,6 +22,7 @@ except Exception:
 
 SOURCE_PATH = Path(__file__).resolve()
 MODULE_NAME = "grid_executor_v1"
+DEFAULT_STATE_OUT = "freqtrade/user_data/grid_executor_v1.state.json"
 
 
 def log_event(level: str, message: str, plan: Optional[Dict] = None, **meta: object) -> None:
@@ -2924,7 +2925,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help="Path to grid_plan.latest.json")
     ap.add_argument("--mode", default="paper", choices=["paper", "ccxt"])
-    ap.add_argument("--state-out", default="/freqtrade/user_data/grid_executor_v1.state.json")
+    ap.add_argument("--state-out", default=DEFAULT_STATE_OUT)
     ap.add_argument("--poll-seconds", type=float, default=5.0)
     ap.add_argument(
         "--max-consecutive-errors",
