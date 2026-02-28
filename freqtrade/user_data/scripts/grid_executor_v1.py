@@ -2884,12 +2884,63 @@ class GridExecutorV1:
         write_json(self.state_out, asdict(payload))
 
 
+def _run_polling_loop(
+    ex: "GridExecutorV1",
+    *,
+    plan_path: str,
+    state_out: str,
+    poll_seconds: float,
+    max_consecutive_errors: int,
+    error_backoff_seconds: float,
+) -> None:
+    poll_delay = max(float(poll_seconds), 0.0)
+    error_delay = max(float(error_backoff_seconds), 0.0)
+    consecutive_errors = 0
+
+    while True:
+        try:
+            plan = load_json(plan_path)
+            plan["_plan_path"] = plan_path
+            ex.step(plan)
+            consecutive_errors = 0
+        except Exception as exc:
+            consecutive_errors += 1
+            write_json(
+                state_out,
+                {
+                    "error": str(exc),
+                    "ts": time.time(),
+                    "consecutive_errors": int(consecutive_errors),
+                },
+            )
+            if int(max_consecutive_errors) > 0 and consecutive_errors >= int(max_consecutive_errors):
+                raise RuntimeError(f"max_consecutive_errors_reached:{consecutive_errors}") from exc
+            if error_delay > 0:
+                time.sleep(error_delay)
+            continue
+
+        if poll_delay > 0:
+            time.sleep(poll_delay)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help="Path to grid_plan.latest.json")
     ap.add_argument("--mode", default="paper", choices=["paper", "ccxt"])
     ap.add_argument("--state-out", default="/freqtrade/user_data/grid_executor_v1.state.json")
     ap.add_argument("--poll-seconds", type=float, default=5.0)
+    ap.add_argument(
+        "--max-consecutive-errors",
+        type=int,
+        default=20,
+        help="Abort polling loop after this many consecutive step errors (<=0 disables).",
+    )
+    ap.add_argument(
+        "--error-backoff-seconds",
+        type=float,
+        default=1.0,
+        help="Sleep time after an error before retrying.",
+    )
     ap.add_argument("--once", action="store_true", help="Run a single tick and exit (testing)")
 
     ap.add_argument("--quote-budget", type=float, default=1000.0)
@@ -2946,14 +2997,14 @@ def main():
         ex.step(plan)
         return
 
-    while True:
-        try:
-            plan = load_json(args.plan)
-            plan["_plan_path"] = args.plan
-            ex.step(plan)
-        except Exception as e:
-            write_json(args.state_out, {"error": str(e), "ts": time.time()})
-        time.sleep(args.poll_seconds)
+    _run_polling_loop(
+        ex=ex,
+        plan_path=args.plan,
+        state_out=args.state_out,
+        poll_seconds=args.poll_seconds,
+        max_consecutive_errors=args.max_consecutive_errors,
+        error_backoff_seconds=args.error_backoff_seconds,
+    )
 
 
 if __name__ == "__main__":

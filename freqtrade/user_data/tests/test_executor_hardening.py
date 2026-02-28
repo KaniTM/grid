@@ -6,6 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from core.plan_signature import compute_plan_hash
 from core.schema_validation import validate_schema
 from freqtrade.user_data.scripts import grid_executor_v1
@@ -423,3 +425,26 @@ def test_plan_intake_rejects_invalid_level_geometry(tmp_path: Path) -> None:
     assert "EXEC_PLAN_SCHEMA_INVALID" in runtime["exec_events"]
     assert "BLOCK_N_LEVELS_INVALID" in runtime["warnings"]
     assert state["orders"] == []
+
+
+def test_polling_loop_aborts_after_max_consecutive_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _AlwaysFailExecutor:
+        def step(self, _plan: dict) -> None:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(grid_executor_v1, "load_json", lambda _path: {"action": "HOLD"})
+    monkeypatch.setattr(grid_executor_v1.time, "sleep", lambda _seconds: None)
+
+    state_out = tmp_path / "loop_error_state.json"
+    with pytest.raises(RuntimeError, match="max_consecutive_errors_reached:2"):
+        grid_executor_v1._run_polling_loop(
+            ex=_AlwaysFailExecutor(),
+            plan_path=str(tmp_path / "plan.json"),
+            state_out=str(state_out),
+            poll_seconds=0.0,
+            max_consecutive_errors=2,
+            error_backoff_seconds=0.0,
+        )
+
+    payload = json.loads(state_out.read_text(encoding="utf-8"))
+    assert payload["consecutive_errors"] == 2
