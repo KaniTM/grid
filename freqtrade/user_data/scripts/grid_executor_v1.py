@@ -394,6 +394,68 @@ def _normalized_side_weights(indices: List[int], rung_weights: Optional[List[flo
     return [float(v / s) for v in vals]
 
 
+def _extract_directional_skip_one_enabled(plan: Dict) -> bool:
+    grid_cfg = plan.get("grid", {}) or {}
+    cfg = grid_cfg.get("directional_skip_one")
+    if isinstance(cfg, dict):
+        return _safe_bool(cfg.get("enabled"), default=True)
+    if isinstance(cfg, bool):
+        return bool(cfg)
+    return True
+
+
+def _extract_directional_state(plan: Dict) -> int:
+    signals = plan.get("signals", {}) or {}
+    runtime_state = plan.get("runtime_state", {}) or {}
+    snapshot = plan.get("signals_snapshot", {}) or {}
+    for src in (
+        signals.get("os_dev_state"),
+        runtime_state.get("os_dev_state"),
+        snapshot.get("os_dev_state"),
+    ):
+        val = _safe_int(src, default=None)
+        if val is None:
+            continue
+        if val > 0:
+            return 1
+        if val < 0:
+            return -1
+        return 0
+    return 0
+
+
+def _resolve_replenish_level_index(
+    fill_side: str,
+    *,
+    level_index: int,
+    n_levels: int,
+    directional_state: int,
+    directional_skip_one_enabled: bool,
+) -> Tuple[Optional[int], bool, bool]:
+    side = str(fill_side).lower()
+    idx = int(level_index)
+    max_idx = int(n_levels)
+    base_step = 1
+    step = base_step
+    skip_applied = False
+    if directional_skip_one_enabled:
+        if side == "buy" and int(directional_state) > 0:
+            step = 2
+            skip_applied = True
+        elif side == "sell" and int(directional_state) < 0:
+            step = 2
+            skip_applied = True
+
+    target = idx + step if side == "buy" else idx - step
+    fallback_adjacent = False
+    if target < 0 or target > max_idx:
+        target = idx + base_step if side == "buy" else idx - base_step
+        if target < 0 or target > max_idx:
+            return None, bool(skip_applied), False
+        fallback_adjacent = bool(skip_applied)
+    return int(target), bool(skip_applied), bool(fallback_adjacent)
+
+
 class FillCooldownGuard:
     def __init__(self, cooldown_bars: int, no_repeat_lsi_guard: bool = True) -> None:
         self.cooldown_bars = max(int(cooldown_bars), 0)
@@ -511,6 +573,10 @@ class GridExecutorV1:
         self._capacity_guard_state: Dict[str, object] = {}
         self._capacity_rung_cap_applied_total: int = 0
         self._capacity_replenish_skipped_total: int = 0
+        self._directional_state_last: int = 0
+        self._directional_skip_one_enabled_last: bool = True
+        self._directional_skip_one_applied_total: int = 0
+        self._directional_skip_one_fallback_adjacent_total: int = 0
 
         # Step-12 hardening defaults; can be overridden per-plan.
         self._post_only_place_attempts: int = max(int(self.ccxt_retries), 3)
@@ -2205,6 +2271,8 @@ class GridExecutorV1:
         fill_bar_index: int,
         ref_price: Optional[float],
         capacity_state: Dict[str, object],
+        directional_state: int,
+        directional_skip_one_enabled: bool,
     ) -> None:
         """
         Fetch user trades since last_trade_ms and:
@@ -2317,48 +2385,56 @@ class GridExecutorV1:
                             phase="replenish",
                         )
                         continue
-                    if ro.side == "buy":
-                        next_idx = ro.level_index + 1
-                        px = self._levels_for_index(levels, next_idx)
+                    next_idx, skip_applied, skip_fallback = _resolve_replenish_level_index(
+                        ro.side,
+                        level_index=ro.level_index,
+                        n_levels=len(levels) - 1,
+                        directional_state=int(directional_state),
+                        directional_skip_one_enabled=bool(directional_skip_one_enabled),
+                    )
+                    if skip_applied:
+                        self._directional_skip_one_applied_total = int(
+                            self._directional_skip_one_applied_total + 1
+                        )
+                    if skip_fallback:
+                        self._directional_skip_one_fallback_adjacent_total = int(
+                            self._directional_skip_one_fallback_adjacent_total + 1
+                        )
+                    if next_idx is not None:
+                        px = self._levels_for_index(levels, int(next_idx))
                         if px is not None:
                             new_px = float(quantize_price(self.exchange, symbol, px))
                             new_qty = float(quantize_amount(self.exchange, symbol, filled_qty))
                             if new_qty > 0 and passes_min_notional(limits, new_px, new_qty):
                                 action_attempted = True
-                                new_oid = self._ccxt_place_limit("sell", symbol, new_qty, new_px, limits)
-                                self._orders.append(RestingOrder("sell", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
-                                if new_oid is not None:
-                                    self._record_order_lifecycle_event(
-                                        symbol=symbol,
-                                        event_type="replenished",
-                                        side="sell",
-                                        price=new_px,
-                                        qty_base=new_qty,
-                                        level_index=next_idx,
-                                        order_id=str(new_oid),
-                                        reason="replace_on_fill",
-                                        phase="replenish",
+                                reason = "replace_on_fill_skip_one" if skip_applied else "replace_on_fill"
+                                new_oid = self._ccxt_place_limit(
+                                    replenish_side,
+                                    symbol,
+                                    new_qty,
+                                    new_px,
+                                    limits,
+                                )
+                                self._orders.append(
+                                    RestingOrder(
+                                        replenish_side,
+                                        new_px,
+                                        new_qty,
+                                        int(next_idx),
+                                        order_id=new_oid,
+                                        status="open" if new_oid else "rejected",
                                     )
-                    else:
-                        next_idx = ro.level_index - 1
-                        px = self._levels_for_index(levels, next_idx)
-                        if px is not None:
-                            new_px = float(quantize_price(self.exchange, symbol, px))
-                            new_qty = float(quantize_amount(self.exchange, symbol, filled_qty))
-                            if new_qty > 0 and passes_min_notional(limits, new_px, new_qty):
-                                action_attempted = True
-                                new_oid = self._ccxt_place_limit("buy", symbol, new_qty, new_px, limits)
-                                self._orders.append(RestingOrder("buy", new_px, new_qty, next_idx, order_id=new_oid, status="open" if new_oid else "rejected"))
+                                )
                                 if new_oid is not None:
                                     self._record_order_lifecycle_event(
                                         symbol=symbol,
                                         event_type="replenished",
-                                        side="buy",
+                                        side=replenish_side,
                                         price=new_px,
                                         qty_base=new_qty,
-                                        level_index=next_idx,
+                                        level_index=int(next_idx),
                                         order_id=str(new_oid),
-                                        reason="replace_on_fill",
+                                        reason=reason,
                                         phase="replenish",
                                     )
                     if action_attempted:
@@ -2414,6 +2490,10 @@ class GridExecutorV1:
         fill_bar_index = self._next_fill_bar_index(plan)
         self._tick_size = _safe_float((plan.get("grid", {}) or {}).get("tick_size"), default=None)
         rung_weights = _extract_rung_weights(plan, n_levels)
+        directional_state = int(_extract_directional_state(plan))
+        directional_skip_one_enabled = bool(_extract_directional_skip_one_enabled(plan))
+        self._directional_state_last = int(directional_state)
+        self._directional_skip_one_enabled_last = bool(directional_skip_one_enabled)
 
         levels = build_levels(box_low, box_high, n_levels, tick_size=self._tick_size)
         level_error = _levels_validation_error(levels, n_levels + 1)
@@ -2469,6 +2549,8 @@ class GridExecutorV1:
                     fill_bar_index=fill_bar_index,
                     ref_price=ref_price,
                     capacity_state=capacity_state,
+                    directional_state=directional_state,
+                    directional_skip_one_enabled=directional_skip_one_enabled,
                 )
 
         rebuild = False
@@ -2830,6 +2912,12 @@ class GridExecutorV1:
             "capacity_guard": dict(self._capacity_guard_state or {}),
             "capacity_rung_cap_applied_total": int(self._capacity_rung_cap_applied_total),
             "capacity_replenish_skipped_total": int(self._capacity_replenish_skipped_total),
+            "directional_state": int(self._directional_state_last),
+            "directional_skip_one_enabled": bool(self._directional_skip_one_enabled_last),
+            "directional_skip_one_applied_total": int(self._directional_skip_one_applied_total),
+            "directional_skip_one_fallback_adjacent_total": int(
+                self._directional_skip_one_fallback_adjacent_total
+            ),
             "execution_cost_feedback_enabled": bool(self._execution_cost_feedback_enabled),
             "execution_cost_step_metrics": dict(self._execution_cost_step_metrics or {}),
             "execution_cost_artifact": dict(self._execution_cost_last_artifact or {}),

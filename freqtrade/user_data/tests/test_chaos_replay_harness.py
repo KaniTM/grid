@@ -63,6 +63,92 @@ def _simulate(df: pd.DataFrame, profile: dict | None) -> dict:
     )
 
 
+def test_directional_skip_one_replay_applies_bullish_skip_on_buy_replenish() -> None:
+    dates = pd.date_range("2026-01-01 00:00:00", periods=2, freq="15min")
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [99.0, 99.0],
+            "high": [100.0, 99.0],
+            "low": [97.0, 99.0],
+            "close": [99.0, 99.0],
+        }
+    )
+    plan = {
+        "_plan_time": pd.Timestamp(df["date"].iloc[0]),
+        "ts": pd.Timestamp(df["date"].iloc[0]).isoformat(),
+        "action": "START",
+        "symbol": "PAIR/CHAOS",
+        "range": {"low": 96.0, "high": 104.0},
+        "grid": {
+            "n_levels": 4,
+            "step_price": 2.0,
+            "directional_skip_one": {"enabled": True},
+        },
+        "price_ref": {"close": 99.0},
+        "signals": {"os_dev_state": 1},
+        "runtime_state": {"clock_ts": int(pd.Timestamp(df["date"].iloc[0]).timestamp())},
+        "diagnostics": {},
+    }
+
+    res = grid_simulator_v1.simulate_grid_replay(
+        df=df,
+        plans=[plan],
+        start_quote=1000.0,
+        start_base=0.0,
+        maker_fee_pct=0.10,
+        touch_fill=True,
+    )
+    open_orders = res["open_orders"]
+    assert any(
+        str(o.get("side")) == "sell" and int(o.get("level_index", -1)) == 3 for o in open_orders
+    )
+    assert res["summary"]["directional_skip_one_applied_total"] >= 1
+
+
+def test_directional_skip_one_replay_can_be_disabled() -> None:
+    dates = pd.date_range("2026-01-01 00:00:00", periods=2, freq="15min")
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [99.0, 99.0],
+            "high": [100.0, 99.0],
+            "low": [97.0, 99.0],
+            "close": [99.0, 99.0],
+        }
+    )
+    plan = {
+        "_plan_time": pd.Timestamp(df["date"].iloc[0]),
+        "ts": pd.Timestamp(df["date"].iloc[0]).isoformat(),
+        "action": "START",
+        "symbol": "PAIR/CHAOS",
+        "range": {"low": 96.0, "high": 104.0},
+        "grid": {
+            "n_levels": 4,
+            "step_price": 2.0,
+            "directional_skip_one": {"enabled": False},
+        },
+        "price_ref": {"close": 99.0},
+        "signals": {"os_dev_state": 1},
+        "runtime_state": {"clock_ts": int(pd.Timestamp(df["date"].iloc[0]).timestamp())},
+        "diagnostics": {},
+    }
+
+    res = grid_simulator_v1.simulate_grid_replay(
+        df=df,
+        plans=[plan],
+        start_quote=1000.0,
+        start_base=0.0,
+        maker_fee_pct=0.10,
+        touch_fill=True,
+    )
+    open_orders = res["open_orders"]
+    assert any(
+        str(o.get("side")) == "sell" and int(o.get("level_index", -1)) == 2 for o in open_orders
+    )
+    assert res["summary"]["directional_skip_one_applied_total"] == 0
+
+
 def test_chaos_profile_is_deterministic_and_reports_delta() -> None:
     df = _build_replay_df(rows=8)
     profile = _base_profile("stress-deterministic", seed=17)

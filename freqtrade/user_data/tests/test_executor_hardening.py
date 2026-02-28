@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import pytest
 
 from core.enums import WarningCode, is_canonical_code
@@ -97,6 +98,20 @@ class _ReconcileExchange:
 
     def fetch_open_orders(self, _symbol: str) -> list[dict]:
         return list(self._open_orders)
+
+
+class _TradesExchange:
+    def __init__(self, trades: list[dict]) -> None:
+        self._trades = list(trades)
+
+    def fetch_my_trades(self, _symbol: str, _since: int) -> list[dict]:
+        return list(self._trades)
+
+    def price_to_precision(self, _symbol: str, price: float) -> float:
+        return float(price)
+
+    def amount_to_precision(self, _symbol: str, qty: float) -> float:
+        return float(qty)
 
 
 def _executor(tmp_path: Path) -> grid_executor_v1.GridExecutorV1:
@@ -364,6 +379,85 @@ def test_capacity_hard_block_prevents_start(tmp_path: Path) -> None:
     assert runtime["action_suppression_reason"] == "capacity_thin_block"
     assert "BLOCK_CAPACITY_THIN" in runtime["warnings"]
     assert state["orders"] == []
+
+
+@pytest.mark.parametrize(
+    "fill_side,directional_state,directional_skip_one_enabled,expected_level_index,expected_side",
+    [
+        ("buy", 1, True, 3, "sell"),
+        ("buy", 1, False, 2, "sell"),
+        ("sell", -1, True, 1, "buy"),
+    ],
+)
+def test_replenish_directional_skip_one_parity(
+    tmp_path: Path,
+    fill_side: str,
+    directional_state: int,
+    directional_skip_one_enabled: bool,
+    expected_level_index: int,
+    expected_side: str,
+) -> None:
+    ex = _executor(tmp_path)
+    levels = np.array([96.0, 98.0, 100.0, 102.0, 104.0], dtype=float)
+    if fill_side == "buy":
+        order_price = 98.0
+        order_level_index = 1
+    else:
+        order_price = 102.0
+        order_level_index = 3
+
+    ex._orders = [
+        grid_executor_v1.RestingOrder(
+            fill_side,
+            order_price,
+            1.0,
+            order_level_index,
+            order_id="orig-order-1",
+            status="open",
+            filled_base=0.0,
+        )
+    ]
+    ex.exchange = _TradesExchange(
+        [
+            {
+                "id": "trade-1",
+                "timestamp": 1_700_000_100_000,
+                "order": "orig-order-1",
+                "side": fill_side,
+                "amount": 1.0,
+                "price": order_price,
+            }
+        ]
+    )
+    placed: list[tuple[str, float, float]] = []
+    ex._ccxt_place_limit = (  # type: ignore[method-assign]
+        lambda side, _symbol, qty, price, _limits: placed.append((str(side), float(qty), float(price)))
+        or "new-order-1"
+    )
+
+    ex._ingest_trades_and_replenish(
+        symbol="ETH/USDT",
+        levels=levels,
+        limits={},
+        fill_bar_index=1,
+        ref_price=100.0,
+        capacity_state={"applied_rung_cap": 20, "delay_replenishment": False},
+        directional_state=directional_state,
+        directional_skip_one_enabled=directional_skip_one_enabled,
+    )
+
+    assert placed
+    assert placed[0][0] == expected_side
+    assert placed[0][2] == float(levels[expected_level_index])
+    replenished_orders = [o for o in ex._orders if str(o.order_id) == "new-order-1"]
+    assert replenished_orders
+    assert replenished_orders[0].side == expected_side
+    assert replenished_orders[0].level_index == expected_level_index
+    should_apply = bool(
+        directional_skip_one_enabled
+        and ((fill_side == "buy" and directional_state > 0) or (fill_side == "sell" and directional_state < 0))
+    )
+    assert ex._directional_skip_one_applied_total == (1 if should_apply else 0)
 
 
 def test_execution_cost_feedback_writes_artifact_and_lifecycle_logs(tmp_path: Path) -> None:

@@ -385,6 +385,85 @@ def _safe_int(x, default=None):
         return default
 
 
+def _safe_bool(x: object, default: bool = False) -> bool:
+    if isinstance(x, bool):
+        return bool(x)
+    if isinstance(x, str):
+        raw = str(x).strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+    if x is None:
+        return bool(default)
+    try:
+        return bool(x)
+    except Exception:
+        return bool(default)
+
+
+def _extract_directional_skip_one_enabled(plan: Dict) -> bool:
+    grid_cfg = plan.get("grid", {}) or {}
+    cfg = grid_cfg.get("directional_skip_one")
+    if isinstance(cfg, dict):
+        return _safe_bool(cfg.get("enabled"), default=True)
+    if isinstance(cfg, bool):
+        return bool(cfg)
+    return True
+
+
+def _extract_directional_state(plan: Dict) -> int:
+    signals = plan.get("signals", {}) or {}
+    runtime_state = plan.get("runtime_state", {}) or {}
+    snapshot = plan.get("signals_snapshot", {}) or {}
+    for src in (
+        signals.get("os_dev_state"),
+        runtime_state.get("os_dev_state"),
+        snapshot.get("os_dev_state"),
+    ):
+        val = _safe_int(src, default=None)
+        if val is None:
+            continue
+        if val > 0:
+            return 1
+        if val < 0:
+            return -1
+        return 0
+    return 0
+
+
+def _resolve_replenish_level_index(
+    fill_side: str,
+    *,
+    level_index: int,
+    n_levels: int,
+    directional_state: int,
+    directional_skip_one_enabled: bool,
+) -> Tuple[Optional[int], bool, bool]:
+    side = str(fill_side).lower()
+    idx = int(level_index)
+    max_idx = int(n_levels)
+    base_step = 1
+    step = base_step
+    skip_applied = False
+    if directional_skip_one_enabled:
+        if side == "buy" and int(directional_state) > 0:
+            step = 2
+            skip_applied = True
+        elif side == "sell" and int(directional_state) < 0:
+            step = 2
+            skip_applied = True
+
+    target = idx + step if side == "buy" else idx - step
+    fallback_adjacent = False
+    if target < 0 or target > max_idx:
+        target = idx + base_step if side == "buy" else idx - base_step
+        if target < 0 or target > max_idx:
+            return None, bool(skip_applied), False
+        fallback_adjacent = bool(skip_applied)
+    return int(target), bool(skip_applied), bool(fallback_adjacent)
+
+
 def _clamp_probability(x: object, default: float = 0.0) -> float:
     value = _safe_float(x, default=default)
     if value is None:
@@ -978,6 +1057,8 @@ def simulate_grid(
     tp_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     rung_weights: Optional[List[float]] = None,
+    directional_state: int = 0,
+    directional_skip_one_enabled: bool = True,
 ) -> Dict:
     """
     Neutral-ish grid simulation (v1):
@@ -1012,6 +1093,8 @@ def simulate_grid(
     fill_guard = FillCooldownGuard(fill_cooldown_bars, fill_no_repeat_lsi_guard)
 
     curve = []
+    directional_skip_one_applied_total = 0
+    directional_skip_one_fallback_adjacent_total = 0
 
     first_close = float(df.iloc[0]["close"])
     initial_equity = quote + base * first_close
@@ -1171,15 +1254,27 @@ def simulate_grid(
         open_orders = remaining
 
         for od in newly_filled:
-            i = od.level_index
+            next_idx, skip_applied, skip_fallback = _resolve_replenish_level_index(
+                od.side,
+                level_index=od.level_index,
+                n_levels=n_levels,
+                directional_state=int(directional_state),
+                directional_skip_one_enabled=bool(directional_skip_one_enabled),
+            )
+            if skip_applied:
+                directional_skip_one_applied_total = int(directional_skip_one_applied_total + 1)
+            if skip_fallback:
+                directional_skip_one_fallback_adjacent_total = int(
+                    directional_skip_one_fallback_adjacent_total + 1
+                )
+            if next_idx is None:
+                continue
             if od.side == "buy":
-                if i + 1 <= n_levels:
-                    sell_px = float(levels[i + 1])
-                    open_orders.append(OrderSim("sell", sell_px, od.qty_base, i + 1))
+                sell_px = float(levels[next_idx])
+                open_orders.append(OrderSim("sell", sell_px, od.qty_base, int(next_idx)))
             else:
-                if i - 1 >= 0 and i - 1 <= n_levels:
-                    buy_px = float(levels[i - 1])
-                    open_orders.append(OrderSim("buy", buy_px, od.qty_base, i - 1))
+                buy_px = float(levels[next_idx])
+                open_orders.append(OrderSim("buy", buy_px, od.qty_base, int(next_idx)))
 
         curve.append({
             "ts": ts,
@@ -1219,6 +1314,12 @@ def simulate_grid(
             "tick_size": tick_size,
             "tp_price": tp_price,
             "sl_price": sl_price,
+            "directional_state": int(directional_state),
+            "directional_skip_one_enabled": bool(directional_skip_one_enabled),
+            "directional_skip_one_applied_total": int(directional_skip_one_applied_total),
+            "directional_skip_one_fallback_adjacent_total": int(
+                directional_skip_one_fallback_adjacent_total
+            ),
         },
         "fills": [asdict(x) for x in fills],
         "open_orders": [asdict(x) for x in open_orders],
@@ -1295,6 +1396,10 @@ def simulate_grid_replay(
     fill_mode_counts: Dict[str, int] = {}
     fill_mode_side_counts: Dict[str, int] = {}
     selected_plan_snapshots: List[Dict[str, object]] = []
+    directional_state_counts: Dict[str, int] = {"bullish": 0, "bearish": 0, "neutral": 0}
+    directional_skip_one_enabled_bars = 0
+    directional_skip_one_applied_total = 0
+    directional_skip_one_fallback_adjacent_total = 0
     false_start_count = 0
     start_cycle_fill_count_at_start: Optional[int] = None
     last_effective_action_signature: Optional[Tuple] = None
@@ -1341,6 +1446,8 @@ def simulate_grid_replay(
         chaos_data_gap = False
         chaos_missing_candle = False
         chaos_delayed_candle = False
+        directional_state = 0
+        directional_skip_one_enabled = True
 
         if chaos_cfg is not None and chaos_rng is not None:
             if reject_burst_remaining <= 0 and chaos_rng.random() < chaos_cfg.reject_burst_probability:
@@ -1531,6 +1638,16 @@ def simulate_grid_replay(
             default="unknown",
         )
         runtime_state = active_plan.get("runtime_state") or {}
+        directional_state = int(_extract_directional_state(active_plan))
+        directional_skip_one_enabled = bool(_extract_directional_skip_one_enabled(active_plan))
+        if directional_state > 0:
+            directional_state_counts["bullish"] = int(directional_state_counts["bullish"] + 1)
+        elif directional_state < 0:
+            directional_state_counts["bearish"] = int(directional_state_counts["bearish"] + 1)
+        else:
+            directional_state_counts["neutral"] = int(directional_state_counts["neutral"] + 1)
+        if directional_skip_one_enabled:
+            directional_skip_one_enabled_bars = int(directional_skip_one_enabled_bars + 1)
         mode_at_entry = runtime_state.get("mode_at_entry") or runtime_state.get("mode") or active_mode
         mode_at_exit = runtime_state.get("mode_at_exit") or mode_at_entry
         _increment_reason(mode_plan_counts, active_mode, 1)
@@ -1995,14 +2112,27 @@ def simulate_grid_replay(
         open_orders = remaining
 
         for side, level_index, fill_qty in newly_filled:
+            next_idx, skip_applied, skip_fallback = _resolve_replenish_level_index(
+                side,
+                level_index=level_index,
+                n_levels=n_levels,
+                directional_state=directional_state,
+                directional_skip_one_enabled=directional_skip_one_enabled,
+            )
+            if skip_applied:
+                directional_skip_one_applied_total = int(directional_skip_one_applied_total + 1)
+            if skip_fallback:
+                directional_skip_one_fallback_adjacent_total = int(
+                    directional_skip_one_fallback_adjacent_total + 1
+                )
+            if next_idx is None:
+                continue
             if side == "buy":
-                if level_index + 1 <= n_levels:
-                    sell_px = float(levels[level_index + 1])
-                    open_orders.append(OrderSim("sell", sell_px, fill_qty, level_index + 1))
+                sell_px = float(levels[next_idx])
+                open_orders.append(OrderSim("sell", sell_px, fill_qty, int(next_idx)))
             else:
-                if level_index - 1 >= 0 and level_index - 1 <= n_levels:
-                    buy_px = float(levels[level_index - 1])
-                    open_orders.append(OrderSim("buy", buy_px, fill_qty, level_index - 1))
+                buy_px = float(levels[next_idx])
+                open_orders.append(OrderSim("buy", buy_px, fill_qty, int(next_idx)))
 
         curve.append(
             {
@@ -2110,6 +2240,12 @@ def simulate_grid_replay(
         "selected_plan_snapshots": selected_plan_snapshots,
         "false_start_count": int(false_start_count),
         "false_start_rate": float(false_start_count / seed_count) if seed_count > 0 else 0.0,
+        "directional_state_counts": {k: int(v) for k, v in directional_state_counts.items()},
+        "directional_skip_one_enabled_bars": int(directional_skip_one_enabled_bars),
+        "directional_skip_one_applied_total": int(directional_skip_one_applied_total),
+        "directional_skip_one_fallback_adjacent_total": int(
+            directional_skip_one_fallback_adjacent_total
+        ),
         "chaos_profile_enabled": bool(chaos_cfg is not None),
         "chaos_profile_id": chaos_cfg.profile_id if chaos_cfg is not None else None,
         "chaos_profile_name": chaos_cfg.name if chaos_cfg is not None else None,

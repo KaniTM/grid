@@ -1224,33 +1224,33 @@ Generated: 2026-02-28 11:54:37 UTC
 - No functional gap is required to keep baseline behavior. Treat this as maintenance + extension guidance.
 
 #### M306 - Directional skip-one rule (simulator-inspired)
-`Status`: NOT_IMPLEMENTED
+`Status`: DONE
 `Source`: NEW_PLAN
-`Coverage`: old=N | new=Y | code=N
+`Coverage`: old=N | new=Y | code=Y
 
 `Purpose`
-- Directional skip-one rule (simulator-inspired) exists to enforce this contract: Directional skip-one rule is not present in current simulator/executor logic.
+- Directional skip-one rule (simulator-inspired) exists to enforce this contract: refill placement should optionally skip one rung in the active directional bias so simulator and executor behave the same.
 
 `Current Implementation`
-- Implemented behavior today: Directional skip-one rule is not present in current simulator/executor logic.
-- Coverage note: Implement simulator/executor directional skip-one rung rule and parity tests.
+- Implemented behavior today:
+  1. Directional state source is `signals.os_dev_state` with fallbacks to `runtime_state.os_dev_state` and `signals_snapshot.os_dev_state`.
+  2. Toggle source is `grid.directional_skip_one.enabled` (default enabled when absent).
+  3. If directional state is bullish (`> 0`) and a buy rung fills, replenish at `level_index + 2` instead of `+1`.
+  4. If directional state is bearish (`< 0`) and a sell rung fills, replenish at `level_index - 2` instead of `-1`.
+  5. If skip target is out of bounds, fallback to adjacent rung (`+1` / `-1`); if still invalid, no replenish is placed.
+  6. Simulator and executor both track directional-skip counters for runtime diagnostics.
 
 `Evidence Anchors`
-- Code: `freqtrade/user_data/scripts/grid_simulator_v1.py:1229`
-- Tests: None listed.
+- Code: `freqtrade/user_data/scripts/grid_simulator_v1.py:405`, `freqtrade/user_data/scripts/grid_simulator_v1.py:435`, `freqtrade/user_data/scripts/grid_simulator_v1.py:2123`
+- Code: `freqtrade/user_data/scripts/grid_executor_v1.py:397`, `freqtrade/user_data/scripts/grid_executor_v1.py:427`, `freqtrade/user_data/scripts/grid_executor_v1.py:2396`
+- Tests: `freqtrade/user_data/tests/test_chaos_replay_harness.py:66`, `freqtrade/user_data/tests/test_chaos_replay_harness.py:109`
+- Tests: `freqtrade/user_data/tests/test_executor_hardening.py:392`
 
 `Canonical Codes`
 - None explicitly mapped in current card.
 
-`Implementation Playbook`
-1. Define an explicit contract (inputs, outputs, config keys, canonical codes) before coding.
-2. Implement primary behavior in `freqtrade/user_data/scripts/grid_simulator_v1.py` (or the owning module from evidence anchors).
-3. Integrate with strategy -> executor/simulator flow so behavior affects runtime decisions.
-4. Wire canonical codes (`none` where applicable) and update decision/event logs.
-5. Create dedicated tests plus regression coverage. Target gap: Implement simulator/executor directional skip-one rung rule and parity tests.
-
 `Gap / Action`
-- Implement simulator/executor directional skip-one rung rule and parity tests.
+- No remaining functional gap for `M306`; move to checkpoint `C1` validation.
 
 #### M307 - Next-rung ghost lines (UI only)
 `Status`: NOT_IMPLEMENTED
@@ -2803,7 +2803,7 @@ Generated: 2026-02-28 11:54:37 UTC
 ## 5) Coverage Map (Old Plan vs New Plan vs Code)
 - This replaces the dense matrix with status-sorted readable lists. Each feature card above still contains exact old/new/code coverage.
 
-### DONE Modules (75)
+### DONE Modules (76)
 - `M001` Parameter Inertia + Epoch Replan Policy | phase=Phase A — Governance / Handoff / Stability | old=N new=Y code=Y
 - `M002` Atomic Brain→Executor Handoff + Idempotency Contract | phase=Phase A — Governance / Handoff / Stability | old=Y new=Y code=Y
 - `M003` Global Start Stability Score (k-of-n) | phase=Phase A — Governance / Handoff / Stability | old=N new=Y code=Y
@@ -2843,6 +2843,7 @@ Generated: 2026-02-28 11:54:37 UTC
 - `M303` START Entry Filter Aggregator | phase=Phase D — Grid / Entry / Exit | old=Y new=Y code=Y
 - `M304` Deterministic TP/SL Selection (nearest conservative wins) | phase=Phase D — Grid / Entry / Exit | old=Y new=Y code=Y
 - `M305` Fill Detection / Rung Cross Engine (`Touch` / `Reverse`) | phase=Phase D — Grid / Entry / Exit | old=Y new=Y code=Y
+- `M306` Directional skip-one rule (simulator-inspired) | phase=Phase D — Grid / Entry / Exit | old=N new=Y code=Y
 - `M401` STOP Trigger Framework | phase=Phase E — STOP / Protections / Eventing | old=Y new=Y code=Y
 - `M403` Cooldown + Min Runtime + Anti-Flap | phase=Phase E — STOP / Protections / Eventing | old=Y new=Y code=Y
 - `M404` Protections Layer (cooldown + drawdown guard + future protections) | phase=Phase E — STOP / Protections / Eventing | old=Y new=Y code=Y
@@ -2890,8 +2891,7 @@ Generated: 2026-02-28 11:54:37 UTC
 - `M801` MTF POC Confluence (D/W, M advisory) + POC-cross before START | phase=Phase F — Microstructure Modules | old=Y new=Y code=Y
 - `M807` VAH/VAL Approximation via Quantiles (fallback/optional) | phase=Phase F — Microstructure Modules | old=N new=Y code=Y
 
-### NOT_IMPLEMENTED Modules (6)
-- `M306` Directional skip-one rule (simulator-inspired) | phase=Phase D — Grid / Entry / Exit | old=N new=Y code=N
+### NOT_IMPLEMENTED Modules (5)
 - `M307` Next-rung ghost lines (UI only) | phase=Phase D — Grid / Entry / Exit | old=N new=Y code=N
 - `M903` CVD Spike + Passive Absorption (Insights style) | phase=Phase F — Microstructure Modules | old=Y new=Y code=N
 - `M904` CVD Divergence Oscillator Strong Score (advisory) | phase=Phase F — Microstructure Modules | old=Y new=Y code=N
@@ -3289,8 +3289,8 @@ Generated: 2026-02-28 11:54:37 UTC
 - Acceptance: severity-ranked findings list and fix queue. `Completed`: 2026-02-28.
 4. `P0-4` Baseline frozen metrics snapshot before behavior changes (`C0`). `Status`: DONE (`docs/C0_BASELINE_SNAPSHOT.md`).
 - Acceptance: regression + backtest + walkforward snapshot stored as comparison baseline. `Completed`: 2026-02-28.
-5. `P0-5` Implement `M306` Directional skip-one rule.
-- Acceptance: simulator/executor parity + deterministic tests.
+5. `P0-5` Implement `M306` Directional skip-one rule. `Status`: DONE.
+- Acceptance: simulator/executor parity + deterministic tests. `Completed`: 2026-02-28.
 6. `P0-6` Checkpoint `C1` after `M306`.
 - Acceptance: rerun regression + backtest + walkforward; produce delta report vs `C0`; run focused review.
 7. `P0-7` Align `M402` reclaim baseline policy (4h vs 8h) across docs/config/tests.
@@ -3325,7 +3325,7 @@ Generated: 2026-02-28 11:54:37 UTC
 1. `P0-3` high-severity fixes (`F-001`, `F-002`) implemented with tests. `Status`: DONE (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
 2. Close `INVESTIGATE` setup from `P0-1` (`RF-002`, `RF-003`, `RF-004`, `RF-023`, `RF-024`) by defining checkpoint experiments.
 3. Resolve known `C0` red gates (regression compile gate + regression recency assertion) before `C1`. `Status`: DONE (`docs/C0_RED_GATES_CLOSURE.md`).
-4. Implement `P0-5` (`M306`) and move to checkpoint `C1`.
+4. Execute checkpoint `C1` (`P0-6`) after completed `M306`.
 
 ## 13) Milestone Log (2026-02-28)
 ### ML-001 — Canonical Docker Runtime Wiring
@@ -3439,6 +3439,22 @@ Generated: 2026-02-28 11:54:37 UTC
 - `freqtrade/user_data/scripts/user_regression_suite.py:302`
 - `freqtrade/user_data/baselines/gatefix_20260228T201012Z/logs/regression.log:1`
 
+### ML-008 — `M306` Directional Skip-One Implementation
+`Status`: DONE
+
+`What Was Locked`
+1. Added shared directional-skip replenish contract for simulator and executor.
+2. Wired directional source (`os_dev_state`) + config toggle (`grid.directional_skip_one.enabled`).
+3. Added deterministic replay + executor parity tests (bullish, bearish, disabled paths).
+
+`Evidence Anchors`
+- `freqtrade/user_data/scripts/grid_simulator_v1.py:405`
+- `freqtrade/user_data/scripts/grid_simulator_v1.py:2123`
+- `freqtrade/user_data/scripts/grid_executor_v1.py:397`
+- `freqtrade/user_data/scripts/grid_executor_v1.py:2396`
+- `freqtrade/user_data/tests/test_chaos_replay_harness.py:66`
+- `freqtrade/user_data/tests/test_executor_hardening.py:392`
+
 ## 14) Next Step (Low-Cost) + Plan
 `Next Logical Step`
 - `P0-1` is complete (`docs/REMOVED_FEATURE_RELEVANCE_LEDGER.md`).
@@ -3447,13 +3463,14 @@ Generated: 2026-02-28 11:54:37 UTC
 - `P0-4` is complete (`docs/C0_BASELINE_SNAPSHOT.md`).
 - High-severity fix batch (`F-001`, `F-002`) is complete.
 - `C0` red gates are closed (`docs/C0_RED_GATES_CLOSURE.md`).
-- Next step: execute `P0-5` (`M306`) and move to checkpoint `C1`.
+- `P0-5` (`M306`) is complete with simulator/executor parity tests.
+- Next step: execute checkpoint `C1` (`P0-6`) artifacts and delta report.
 
 `Execution Plan`
-1. Implement `M306` directional skip-one rule in simulator + executor parity paths.
-2. Add/extend deterministic tests for rung-skip behavior and parity invariants.
-3. Run targeted regression checks and freeze `C1` artifacts (`regression`, `backtest`, `walkforward` delta vs `C0`).
-4. Publish `C1` delta summary and proceed to `P0-7` only if acceptance is green.
+1. Run `regression` on the current branch and capture tagged logs under `freqtrade/user_data/baselines/`.
+2. Run `backtest` and `walkforward` with the same timerange/pair used in `C0`.
+3. Produce `C1` delta summary versus `C0` for PnL, drawdown, fills, and action/stop distributions.
+4. Proceed to `P0-7` (`M402`) only if `C1` acceptance is green.
 
 `Acceptance`
 - `M306` behavior is implemented with simulator/executor parity evidence and passing tests.
