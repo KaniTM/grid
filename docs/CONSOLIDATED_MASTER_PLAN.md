@@ -3291,8 +3291,8 @@ Generated: 2026-02-28 11:54:37 UTC
 - Acceptance: regression + backtest + walkforward snapshot stored as comparison baseline. `Completed`: 2026-02-28.
 5. `P0-5` Implement `M306` Directional skip-one rule. `Status`: DONE.
 - Acceptance: simulator/executor parity + deterministic tests. `Completed`: 2026-02-28.
-6. `P0-6` Checkpoint `C1` after `M306`.
-- Acceptance: rerun regression + backtest + walkforward; produce delta report vs `C0`; run focused review.
+6. `P0-6` Checkpoint `C1` after `M306`. `Status`: PARTIAL (`docs/C1_CHECKPOINT_DELTA.md`).
+- Acceptance: rerun regression + backtest + walkforward; produce delta report vs `C0`; run focused review. `Current`: NOT_GREEN (regression gate still failing on missing recent plan snapshots).
 7. `P0-7` Align `M402` reclaim baseline policy (4h vs 8h) across docs/config/tests.
 - Acceptance: one canonical baseline value and synchronized assertions.
 8. `P0-8` Checkpoint `C2` after `M402`.
@@ -3325,7 +3325,7 @@ Generated: 2026-02-28 11:54:37 UTC
 1. `P0-3` high-severity fixes (`F-001`, `F-002`) implemented with tests. `Status`: DONE (`docs/P0_3_BASELINE_CODE_REVIEW.md`).
 2. Close `INVESTIGATE` setup from `P0-1` (`RF-002`, `RF-003`, `RF-004`, `RF-023`, `RF-024`) by defining checkpoint experiments.
 3. Resolve known `C0` red gates (regression compile gate + regression recency assertion) before `C1`. `Status`: DONE (`docs/C0_RED_GATES_CLOSURE.md`).
-4. Execute checkpoint `C1` (`P0-6`) after completed `M306`.
+4. Close regression plan-history coverage gate, then rerun checkpoint `C1` to GREEN.
 
 ## 13) Milestone Log (2026-02-28)
 ### ML-001 — Canonical Docker Runtime Wiring
@@ -3455,6 +3455,20 @@ Generated: 2026-02-28 11:54:37 UTC
 - `freqtrade/user_data/tests/test_chaos_replay_harness.py:66`
 - `freqtrade/user_data/tests/test_executor_hardening.py:392`
 
+### ML-009 — `C1` Checkpoint Execution (`P0-6`)
+`Status`: PARTIAL (NOT_GREEN)
+
+`What Was Locked`
+1. Executed full `C1` checkpoint scope against `C0`-matched timerange/pair.
+2. Froze machine-readable snapshot and delta manifest.
+3. Confirmed behavior metrics parity vs `C0`; regression gate remains red.
+
+`Evidence Anchors`
+- `docs/C1_CHECKPOINT_DELTA.md:1`
+- `freqtrade/user_data/baselines/c1_20260228T221054Z/metrics/c1_snapshot.json:1`
+- `freqtrade/user_data/baselines/c1_20260228T221054Z/logs/regression.log:1`
+- `freqtrade/user_data/baselines/c1_20260228T221054Z/logs/walkforward.log:1`
+
 ## 14) Next Step (Low-Cost) + Plan
 `Next Logical Step`
 - `P0-1` is complete (`docs/REMOVED_FEATURE_RELEVANCE_LEDGER.md`).
@@ -3464,14 +3478,15 @@ Generated: 2026-02-28 11:54:37 UTC
 - High-severity fix batch (`F-001`, `F-002`) is complete.
 - `C0` red gates are closed (`docs/C0_RED_GATES_CLOSURE.md`).
 - `P0-5` (`M306`) is complete with simulator/executor parity tests.
-- Next step: execute checkpoint `C1` (`P0-6`) artifacts and delta report.
+- `P0-6` (`C1`) executed; outcome is NOT_GREEN (`docs/C1_CHECKPOINT_DELTA.md`).
+- Next step: close regression plan-history coverage gate and rerun `C1` to GREEN.
 
 `Execution Plan`
-1. Run `regression` on the current branch and capture tagged logs under `freqtrade/user_data/baselines/`.
-2. Run `backtest` and `walkforward` with the same timerange/pair used in `C0`.
-3. Produce `C1` delta summary versus `C0` for PnL, drawdown, fills, and action/stop distributions.
-4. Proceed to `P0-7` (`M402`) only if `C1` acceptance is green.
+1. Resolve `user_regression_suite.py` recent-plan-history prerequisite (no recent plan snapshot assertion).
+2. Rerun checkpoint `C1` full scope (`regression`, `backtest`, `walkforward`, direct behavior regression).
+3. Refresh `C1 vs C0` delta manifest and verify all required gates are green.
+4. Proceed to `P0-7` (`M402`) only after `C1` is GREEN.
 
 `Acceptance`
 - `M306` behavior is implemented with simulator/executor parity evidence and passing tests.
-- `C1` checkpoint artifacts include delta comparison against fixed `C0` baseline.
+- `C1` checkpoint artifacts include delta comparison against fixed `C0` baseline and green regression gates.
